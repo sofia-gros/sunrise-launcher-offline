@@ -23,12 +23,17 @@ pub const SIGNATURE_V2: &str = "SHA256SUMS.v2.sig";
 
 /// The repository whose releases this build installs and checks: Sunrise's.
 pub const REPOSITORY: &str = "sunrise-org/sunrise";
-/// The launcher's own repository: its releases are signed for [`launcher_message`], with [`REPOSITORY`]'s key.
-pub const LAUNCHER_REPOSITORY: &str = "sunrise-org/sunrise-launcher";
+/// The launcher's own repository: this fork's. Its releases are signed for [`launcher_message`], with the fork's own key ([`trusted_launcher_keys`]).
+pub const LAUNCHER_REPOSITORY: &str = "sofia-gros/sunrise-launcher-offline";
 
 /// Each trusted repository and its keys file: one base64 Ed25519 key per line, as `release-keys.txt` lists them.
-const REPOSITORIES: &[(&str, &str)] =
-    &[(REPOSITORY, include_str!("../keys/sunrise-org-sunrise.txt"))];
+const REPOSITORIES: &[(&str, &str)] = &[
+    (REPOSITORY, include_str!("../keys/sunrise-org-sunrise.txt")),
+    (
+        LAUNCHER_REPOSITORY,
+        include_str!("../keys/sofia-gros-sunrise-launcher-offline.txt"),
+    ),
+];
 
 /// An Ed25519 public key.
 pub type PublicKey = [u8; 32];
@@ -45,9 +50,12 @@ pub fn trusted_keys_for(repository: &str) -> Vec<PublicKey> {
     parse_keys(repository_keys(repository)).unwrap_or_default()
 }
 
-/// The keys a launcher release is signed with: [`REPOSITORY`]'s, one key for both kinds, kept apart by [`launcher_message`]'s prefix.
+/// The keys a launcher release is signed with: this fork's own, for [`LAUNCHER_REPOSITORY`]'s
+/// releases only. The game repository's key is deliberately not trusted here: keeping it
+/// would let an upstream launcher release replace this fork's build, OFFLINE_PLAY included.
+/// Game releases keep trusting [`REPOSITORY`]'s key through [`trusted_keys`], unchanged.
 pub fn trusted_launcher_keys() -> Vec<PublicKey> {
-    trusted_keys_for(REPOSITORY)
+    trusted_keys_for(LAUNCHER_REPOSITORY)
 }
 
 /// The version in a launcher release tag, exactly `vX.Y.Z` (no leading zeros), or None: discovery, URLs and signatures take tags only through this.
@@ -612,13 +620,18 @@ impl SigningKey {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn only_the_game_repositorys_keys_are_trusted_and_unknown_repositories_fail_closed() {
+    fn only_the_known_repositories_keys_are_trusted_and_unknown_repositories_fail_closed() {
         let game = parse_keys("r53xb3cuafGxZSicLz06KC+xXp9NJdPH8snNmXo5pAc=").unwrap();
         assert_eq!(trusted_keys_for(REPOSITORY), game);
         assert_eq!(trusted_keys(), game);
+        // The launcher's own repository is this fork's, with the fork's key.
+        let fork = parse_keys("tat5oclX8aVGOmKT1evZSdfvGxbj9w3kgbv/7ujNafc=").unwrap();
+        assert_eq!(trusted_keys_for(LAUNCHER_REPOSITORY), fork);
         for repository in [
             "horizon-rust/horizon",
             "arismoko/horizon",
+            // Upstream's launcher repository included: it has no keys of its own here.
+            "sunrise-org/sunrise-launcher",
             "unknown/sunrise",
             "",
         ] {
@@ -643,9 +656,16 @@ mod tests {
     }
 
     #[test]
-    fn launcher_releases_trust_the_game_repositorys_key() {
-        assert_eq!(trusted_launcher_keys(), trusted_keys_for(REPOSITORY));
-        assert!(!trusted_launcher_keys().is_empty());
+    fn launcher_releases_trust_the_forks_own_key_not_the_game_repositorys() {
+        let fork = parse_keys("tat5oclX8aVGOmKT1evZSdfvGxbj9w3kgbv/7ujNafc=").unwrap();
+        assert_eq!(trusted_launcher_keys(), fork);
+        assert_eq!(
+            trusted_launcher_keys(),
+            trusted_keys_for(LAUNCHER_REPOSITORY)
+        );
+        // The game repository's key must not pass for a launcher release: an upstream
+        // launcher release signed with it would otherwise replace this fork's build.
+        assert!(!trusted_launcher_keys().contains(&trusted_keys()[0]));
     }
 
     #[test]
