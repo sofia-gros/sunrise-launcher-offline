@@ -285,6 +285,12 @@ impl Launcher {
                     self.play_detail = None;
                     self.accounts = Accounts::load();
                     self.load_auth_statuses(false);
+                    if result.as_ref().is_err() {
+                        // A failed first play may still have installed the build it then
+                        // failed to prepare: refresh the installed list here too, not only
+                        // on success, so Home stops offering to install what is on disk.
+                        self.refresh_installed();
+                    }
                     match *result {
                         Ok(game) => {
                             self.client_error = game.notice;
