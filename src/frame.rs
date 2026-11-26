@@ -449,7 +449,10 @@ impl Launcher {
         if self.refuse_pack_play(kind) {
             return;
         }
-        if intent.account.is_none() && !sunrise_launcher::developer_offline::selected() {
+        if intent.account.is_none()
+            && !sunrise_launcher::developer_offline::selected()
+            && !self.settings.dev_offline
+        {
             self.sign_in_to_play();
             self.ui.after_sign_in = Some(intent);
             return;

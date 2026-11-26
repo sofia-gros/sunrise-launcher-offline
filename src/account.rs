@@ -1844,6 +1844,33 @@ pub struct Accounts {
     pub accounts: Vec<Account>,
     /// The UUID of the account the game starts with; none: the first one.
     pub selected: Option<String>,
+    /// Offline names the player keeps, to switch between (`--name`): no account, no session.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offline: Vec<String>,
+    /// The offline name that plays when no account is selected; none: the name the game made
+    /// up (`sunrise-player.txt`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline_selected: Option<String>,
+}
+
+/// Who plays, as the quick switch lists them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Player {
+    /// A Microsoft account, by UUID.
+    Microsoft(String),
+    /// An offline name.
+    Offline(String),
+    /// Offline as the name the game made up.
+    GameName,
+}
+
+const OFFLINE_NEEDS_OWNER: &str =
+    "Offline names need a Microsoft account that owns Minecraft: Java Edition in the launcher.";
+
+/// Whether `name` can be an offline name: 3 to 16 letters, digits or `_`, as account names are.
+pub fn valid_offline_name(name: &str) -> bool {
+    (3..=16).contains(&name.chars().count())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// The secrets an account keeps in `store`, if it still has them there.
@@ -2008,6 +2035,113 @@ impl Accounts {
         }
         self.selected = Some(uuid.to_string());
         Ok(())
+    }
+
+    /// Who plays now.
+    pub fn player(&self) -> Player {
+        match (self.selected(), &self.offline_selected) {
+            (Some(a), _) => Player::Microsoft(a.uuid.clone()),
+            (None, Some(name)) => Player::Offline(name.clone()),
+            (None, None) => Player::GameName,
+        }
+    }
+
+    /// Plays as `who`: an account, an offline name (kept, only beside an account that owns
+    /// the game), or the game's own name. `offline_without_owner` (this fork's
+    /// `backend::OFFLINE_PLAY`, through `Settings::dev_offline`) lets an offline name play
+    /// without an account that owns the game.
+    pub fn play_as_player(
+        &mut self,
+        store: &dyn SecretStore,
+        who: Player,
+        offline_without_owner: bool,
+    ) -> Result<(), String> {
+        match who {
+            Player::Microsoft(uuid) => self.play_as(&uuid),
+            Player::Offline(name) => {
+                if !offline_without_owner && !self.has_owner(store) {
+                    return Err(OFFLINE_NEEDS_OWNER.into());
+                }
+                let name = self.add_offline(&name)?;
+                self.selected = None;
+                self.offline_selected = Some(name);
+                Ok(())
+            }
+            Player::GameName => {
+                self.selected = None;
+                self.offline_selected = None;
+                Ok(())
+            }
+        }
+    }
+
+    /// Keeps an offline name (once, in any case); returns it as kept.
+    fn add_offline(&mut self, name: &str) -> Result<String, String> {
+        let name = name.trim();
+        if !valid_offline_name(name) {
+            return Err(format!(
+                "{name}: an offline name is 3 to 16 letters, digits or _"
+            ));
+        }
+        if let Some(kept) = self.offline.iter().find(|n| n.eq_ignore_ascii_case(name)) {
+            return Ok(kept.clone());
+        }
+        self.offline.push(name.to_string());
+        Ok(name.to_string())
+    }
+
+    /// Forgets an offline name; if it was playing, the game's own name plays. (A name's own
+    /// skin is a later step: offline names keep no look yet.)
+    pub fn remove_offline(&mut self, name: &str) -> Result<(), String> {
+        let before = self.offline.len();
+        self.offline.retain(|n| !n.eq_ignore_ascii_case(name));
+        if self.offline.len() == before {
+            return Err(format!("No offline name {name}."));
+        }
+        if self
+            .offline_selected
+            .as_ref()
+            .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        {
+            self.offline_selected = None;
+        }
+        Ok(())
+    }
+
+    /// The game's `--name` for this run: the offline name, when one plays.
+    pub fn name_arg(&self) -> Option<&str> {
+        match self.selected() {
+            Some(_) => None,
+            None => self.offline_selected.as_deref(),
+        }
+    }
+
+    /// Switches who plays to `who`, on disk: the list as it is saved now with that player
+    /// chosen, saved again. The window keeps what this returns.
+    pub fn switch_player(who: Player, offline_without_owner: bool) -> Result<Self, String> {
+        Self::switch_player_in(&Self::path(), store(), who, offline_without_owner)
+    }
+    pub(crate) fn switch_player_in(
+        path: &Path,
+        store: &dyn SecretStore,
+        who: Player,
+        offline_without_owner: bool,
+    ) -> Result<Self, String> {
+        let mut accounts = Self::load_from(path);
+        accounts.play_as_player(store, who, offline_without_owner)?;
+        accounts.save_to(path)?;
+        Ok(accounts)
+    }
+
+    /// Forgets the offline name `name`, on disk, and returns the saved list.
+    pub fn forget_offline(name: &str) -> Result<Self, String> {
+        Self::forget_offline_in(&Self::path(), name)
+    }
+    pub(crate) fn forget_offline_in(path: &Path, name: &str) -> Result<Self, String> {
+        let mut accounts = Self::load_from(path);
+        accounts.remove_offline(name)?;
+        accounts.save_to(path)?;
+        Ok(accounts)
     }
 
     /// Switches who plays to `uuid`, on disk: the list as it is saved now with that account
@@ -2282,16 +2416,38 @@ pub fn launch(
 /// The game never starts without that account's session. When the services can't be asked, it
 /// gets the stored Minecraft token if that is still good for five minutes (the game's own
 /// `expired()` margin is one); otherwise this refuses with what the check said.
+///
+/// `offline_without_owner` (this fork's `backend::OFFLINE_PLAY`) is the one way past the
+/// gate: no owner is no refusal, and the game starts offline, without a session and without
+/// an `owner`. Downloads never come through here: they call [`launch`] itself, so the flag
+/// never opens a download.
 pub fn launch_for_game(
     ep: &Endpoints,
     client_id: Option<&str>,
     store: &dyn SecretStore,
     accounts: &mut Accounts,
+    offline_without_owner: bool,
 ) -> Result<Launch, NoOwner> {
-    if accounts.selected().is_none() {
+    // An offline name plays: no account is picked for it, and it gets no session. (With no
+    // account selected, `launch` sets no session either: no account is the one that plays.)
+    let offline_name = offline_without_owner
+        && accounts.selected().is_none()
+        && accounts.offline_selected.is_some();
+    if accounts.selected().is_none() && !offline_name {
         accounts.selected = accounts.accounts.first().map(|a| a.uuid.clone());
     }
-    let mut pass = launch(ep, client_id, store, accounts)?;
+    let mut pass = match launch(ep, client_id, store, accounts) {
+        Ok(pass) => pass,
+        Err(refused) => {
+            if offline_without_owner {
+                return Ok(Launch::default());
+            }
+            return Err(refused);
+        }
+    };
+    if offline_name {
+        return Ok(pass);
+    }
     let stored = accounts
         .selected()
         .and_then(|a| Some((a.clone(), secrets_in(store, &a.uuid)?)))
@@ -2299,6 +2455,9 @@ pub fn launch_for_game(
     if let Some((account, secrets)) = stored {
         if pass.session.is_none() {
             if secrets.sign_in_required || secrets.minecraft_expires_at <= now() + 300 {
+                if offline_without_owner {
+                    return Ok(Launch::default());
+                }
                 return Err(NoOwner {
                     keyring: pass.offline,
                 });
@@ -2307,6 +2466,8 @@ pub fn launch_for_game(
             pass.offline = None;
         }
         Ok(pass)
+    } else if offline_without_owner {
+        Ok(Launch::default())
     } else {
         // Why that account can't play (it doesn't own the game, signed out, an unread keyring).
         Err(NoOwner {
@@ -2571,6 +2732,9 @@ pub struct GameSession {
     pub file: Option<PathBuf>,
     /// Why the account plays offline this time, if it does.
     pub offline: Option<String>,
+    /// The offline name that plays (`--name`); none while an account plays, or while the
+    /// game's own made-up name does.
+    pub name: Option<String>,
 }
 
 impl GameSession {
@@ -2578,6 +2742,9 @@ impl GameSession {
     pub fn apply(self, cmd: &mut std::process::Command) -> Option<String> {
         if let Some(file) = self.file {
             cmd.arg("--session-file").arg(file);
+        }
+        if let Some(name) = self.name {
+            cmd.arg("--name").arg(name);
         }
         if let Some(reason) = &self.offline {
             cmd.env("SUNRISE_OFFLINE_REASON", reason);
@@ -2587,26 +2754,34 @@ impl GameSession {
 }
 
 /// The owner gate for the game about to start, then the selected account's session in a file
-/// for it.
-pub fn session_for_game(game_home: &Path) -> Result<GameSession, NoOwner> {
+/// for it. `offline_without_owner`: see [`launch_for_game`].
+pub fn session_for_game(
+    game_home: &Path,
+    offline_without_owner: bool,
+) -> Result<GameSession, NoOwner> {
     let mut accounts = Accounts::load();
     let pass = launch_for_game(
         &Endpoints::live(),
         client_id().as_deref(),
         store(),
         &mut accounts,
+        offline_without_owner,
     )?;
     if let Err(e) = accounts.save_renewed() {
         crate::elog!("Sunrise: the accounts are not saved: {e}");
     }
-    Ok(session_file(game_home, pass))
+    Ok(session_file(game_home, pass, &accounts))
 }
 
 /// [`session_for_game`] for the account that was selected when Play was accepted, `accepted`:
 /// installing, preparing and building can take minutes, and whoever is selected when they end
 /// must not be the one who plays. Which account is selected now is not touched. An account
 /// signed out meanwhile doesn't play, and no session file is written for it.
-pub fn session_for_game_accepted(game_home: &Path, accepted: &str) -> Result<GameSession, NoOwner> {
+pub fn session_for_game_accepted(
+    game_home: &Path,
+    accepted: &str,
+    offline_without_owner: bool,
+) -> Result<GameSession, NoOwner> {
     let mut accounts = Accounts::load();
     let pass = launch_accepted(
         &Endpoints::live(),
@@ -2614,11 +2789,12 @@ pub fn session_for_game_accepted(game_home: &Path, accepted: &str) -> Result<Gam
         store(),
         &mut accounts,
         accepted,
+        offline_without_owner,
     )?;
     if let Err(e) = accounts.save_renewed() {
         crate::elog!("Sunrise: the accounts are not saved: {e}");
     }
-    Ok(session_file(game_home, pass))
+    Ok(session_file(game_home, pass, &accounts))
 }
 
 fn launch_accepted(
@@ -2627,10 +2803,11 @@ fn launch_accepted(
     store: &dyn SecretStore,
     accounts: &mut Accounts,
     accepted: &str,
+    offline_without_owner: bool,
 ) -> Result<Launch, NoOwner> {
     check_launch_account(accounts, accepted)?;
     let chosen = accounts.selected.replace(accepted.to_owned());
-    let pass = launch_for_game(ep, client_id, store, accounts);
+    let pass = launch_for_game(ep, client_id, store, accounts, offline_without_owner);
     accounts.selected = chosen;
     pass
 }
@@ -2666,7 +2843,7 @@ pub fn session_for_game_as(game_home: &Path, who: &str) -> Result<GameSession, S
     if let Err(e) = accounts.save_renewed() {
         crate::elog!("Sunrise: the accounts are not saved: {e}");
     }
-    Ok(session_file(game_home, pass?))
+    Ok(session_file(game_home, pass?, &accounts))
 }
 
 /// The owner gate as `who`, on `accounts`, which keeps its choice of player.
@@ -2678,17 +2855,25 @@ fn launch_as(
     who: &str,
 ) -> Result<Launch, String> {
     let chosen = accounts.selected.clone();
-    let pass = accounts
-        .play_as(who)
-        .and_then(|()| launch_for_game(ep, client_id, store, accounts).map_err(|e| e.to_string()));
+    let pass = accounts.play_as(who).and_then(|()| {
+        // `play --account` names a signed-in account: the gate stays strict for it.
+        launch_for_game(ep, client_id, store, accounts, false).map_err(|e| e.to_string())
+    });
     accounts.selected = chosen;
     pass
 }
 
 /// The game's session files for a launch that passed the gate.
-fn session_file(game_home: &Path, pass: Launch) -> GameSession {
+fn session_file(game_home: &Path, pass: Launch, accounts: &Accounts) -> GameSession {
     let mut out = GameSession {
         offline: pass.offline,
+        // The offline name that plays, if one does: the game is told it as `--name`. Only
+        // beside no session: an account's launch already carries who plays in its file.
+        name: if pass.session.is_none() {
+            accounts.name_arg().map(str::to_owned)
+        } else {
+            None
+        },
         ..GameSession::default()
     };
     if let Some((account, secrets)) = pass.session {
