@@ -42,6 +42,7 @@ fn switch(
             },
             confirm_publisher_change: None,
             pin_dir: None,
+            recover_held: false,
         },
         || index,
         &fetch_fixture,
@@ -410,6 +411,7 @@ fn capture_fixture() {
                         },
                         confirm_publisher_change: None,
                         pin_dir: None,
+                        recover_held: false,
                     },
                     || Ok(Arc::new(held.clone())),
                     &fetch_fixture,
@@ -424,6 +426,255 @@ fn capture_fixture() {
                 serde_json::to_vec_pretty(&shown).unwrap(),
             )
             .unwrap();
+        },
+    );
+}
+
+/// The fixture's catalogue on both builds, with `id`'s releases marked as not fitting `not`.
+fn index_without(fixture: &Fixture, id: &str, not: &[&str]) -> Arc<index_v2::Index> {
+    let mut index = (*fixture.index_for(NEXT)).clone();
+    for project in index.projects.iter_mut().filter(|p| p.mod_id == id) {
+        for release in &mut project.releases {
+            release.fits.retain(|build| !not.contains(&build.as_str()));
+            release
+                .does_not_fit
+                .extend(not.iter().map(|build| build.to_string()));
+        }
+    }
+    Arc::new(index)
+}
+
+/// The catalogue on both builds with each (mod, builds) marked as not fitting those builds.
+fn index_marking(fixture: &Fixture, marks: &[(&str, &[&str])]) -> Arc<index_v2::Index> {
+    let mut index = (*fixture.index_for(NEXT)).clone();
+    for (id, not) in marks {
+        for project in index.projects.iter_mut().filter(|p| p.mod_id == *id) {
+            for release in &mut project.releases {
+                release.fits.retain(|build| !not.contains(&build.as_str()));
+                release
+                    .does_not_fit
+                    .extend(not.iter().map(|build| build.to_string()));
+            }
+        }
+    }
+    Arc::new(index)
+}
+
+/// A switch kept on `tag` under `policy`, exactly as the window runs it: held-off mods come
+/// back as the policy says (`recover_held`), and the policy answers its question first. When it
+/// leaves the question to the player, the player keeps the change with mods turned off.
+fn switch_to(
+    fixture: &Fixture,
+    tag: &str,
+    policy: SwitchPolicy,
+    index: Arc<index_v2::Index>,
+) -> Result<Switched, String> {
+    switch_choosing(fixture, tag, Some(BuildChoice::Keep), policy, index)
+}
+
+/// [`switch_to`] saving `choice` about following.
+fn switch_choosing(
+    fixture: &Fixture,
+    tag: &str,
+    choice: Option<BuildChoice>,
+    policy: SwitchPolicy,
+    index: Arc<index_v2::Index>,
+) -> Result<Switched, String> {
+    v2::switch_profile_build_v2_with(
+        &fixture.instance,
+        install_target(&fixture.instance).unwrap(),
+        tag,
+        choice,
+        v2::V2SwitchHooks {
+            switch: SwitchHooks {
+                cancellation: &native_mods::Cancellation::default(),
+                progress: &|_| {},
+                approve: &|question| Ok(policy.answer(question).unwrap_or(SwitchDecision::TurnOff)),
+                at_cutoff: &|| Ok(()),
+            },
+            confirm_publisher_change: None,
+            pin_dir: None,
+            recover_held: policy.recover_held(),
+        },
+        || Ok(index),
+        &fetch_fixture,
+        &verify_fixture,
+    )
+}
+
+#[test]
+fn homes_switch_brings_back_a_held_mod_and_leaves_one_the_player_turned_off() {
+    Fixture::run(
+        concat!(
+            module_path!(),
+            "::homes_switch_brings_back_a_held_mod_and_leaves_one_the_player_turned_off"
+        ),
+        |mut fixture| {
+            fixture.project("wayfinder", "Wayfinder", V2Kind::Mod);
+            fixture.release("wayfinder", "1.0.0", "", &[]);
+            fixture.project("lantern", "Lanterns", V2Kind::Mod);
+            fixture.release("lantern", "1.0.0", "", &[(AMBER, EARLIER_BLOCK)]);
+            fixture.install(&["wayfinder", "lantern"]);
+            // The player turns Lanterns off themselves.
+            mod_list::set_enabled(fixture.home(), "lantern", false).unwrap();
+            next_build();
+            // Wayfinder has no release for the next build: the switch holds it off.
+            let index = index_without(&fixture, "wayfinder", &[NEXT]);
+            let Switched::Changed(active) =
+                switch_to(&fixture, NEXT, SwitchPolicy::Ask, index.clone()).unwrap()
+            else {
+                panic!("expected the switch to the next build")
+            };
+            let held: Vec<_> = active.holds().map(|hold| hold.id().to_owned()).collect();
+            assert_eq!(held, ["wayfinder"]);
+            assert!(!mod_list::is_enabled(fixture.home(), "wayfinder"));
+
+            // Home's question counts the held mod as wanted, not the one turned off.
+            let fit =
+                mods_fit_by_build_v2(&index, fixture.home(), &[NEXT.to_owned(), BUILD.to_owned()])
+                    .unwrap();
+            assert_eq!(
+                fit[0].1,
+                [Blocker {
+                    name: "Wayfinder".into(),
+                    issue: FitIssue::NoRelease
+                }]
+            );
+            assert!(fit[1].1.is_empty(), "{fit:?}");
+
+            // The verdict changes before Home's switch publishes: it stops, nothing changes.
+            let changed = index_without(&fixture, "wayfinder", &[NEXT, BUILD]);
+            let before = fixture.snapshot(&[]);
+            let outcome = switch_to(&fixture, BUILD, SwitchPolicy::KeepEveryMod, changed);
+            assert!(
+                matches!(outcome, Ok(Switched::Stayed)) || outcome.is_err(),
+                "{:?}",
+                outcome.map(|_| ())
+            );
+            assert_eq!(fixture.snapshot(&[]), before, "no change was published");
+            assert!(!mod_list::is_enabled(fixture.home(), "wayfinder"));
+
+            // With the verdict as Home saw it, the switch brings Wayfinder back on, keeps
+            // Lanterns off, and keeps the build.
+            let Switched::Changed(active) =
+                // Lanterns, turned off by the player, has no release for the fixture's build: it is
+                // held again, which is no omission of a wanted mod (review of #616).
+                switch_to(
+                    &fixture,
+                    BUILD,
+                    SwitchPolicy::KeepEveryMod,
+                    index_marking(&fixture, &[("wayfinder", &[NEXT][..]), ("lantern", &[BUILD][..])]),
+                )
+                .unwrap()
+            else {
+                panic!("expected Home's switch to the build the mods have releases for")
+            };
+            assert_eq!(active.base(), BUILD);
+            let held: Vec<_> = active.holds().map(|hold| hold.id().to_owned()).collect();
+            assert_eq!(
+                held,
+                ["lantern"],
+                "only the mod the player turned off is held"
+            );
+            assert!(mod_list::is_enabled(fixture.home(), "wayfinder"));
+            assert!(
+                !mod_list::is_enabled(fixture.home(), "lantern"),
+                "a mod the player turned off stays off"
+            );
+            assert_eq!(saved_pin(&fixture).as_deref(), Some(BUILD));
+        },
+    );
+}
+
+/// The fixture's profile on the next build with Wayfinder held off, as an ordinary switch
+/// leaves it when Wayfinder has no release there. The profile goes on following its channel.
+fn on_next_with_wayfinder_held(fixture: &mut Fixture) -> Arc<index_v2::Index> {
+    fixture.project("wayfinder", "Wayfinder", V2Kind::Mod);
+    fixture.release("wayfinder", "1.0.0", "", &[]);
+    fixture.install(&["wayfinder"]);
+    next_build();
+    let index = index_without(fixture, "wayfinder", &[NEXT]);
+    let Switched::Changed(active) =
+        switch_choosing(fixture, NEXT, None, SwitchPolicy::Ask, index.clone()).unwrap()
+    else {
+        panic!("expected the ordinary switch to the next build")
+    };
+    let held: Vec<_> = active.holds().map(|hold| hold.id().to_owned()).collect();
+    assert_eq!(held, ["wayfinder"]);
+    index
+}
+
+/// Home worked out its switch for a profile on another build; an ordinary switch then moved
+/// the profile to that same build with Wayfinder held off. Home's switch there saves nothing,
+/// so the profile isn't pinned to a build without a mod it wants (review of #616).
+#[test]
+fn homes_switch_to_the_build_the_profile_is_already_on_saves_nothing() {
+    Fixture::run(
+        concat!(
+            module_path!(),
+            "::homes_switch_to_the_build_the_profile_is_already_on_saves_nothing"
+        ),
+        |mut fixture| {
+            let index = on_next_with_wayfinder_held(&mut fixture);
+            let pin = saved_pin(&fixture);
+            assert_ne!(
+                pin.as_deref(),
+                Some(NEXT),
+                "the ordinary switch kept no pin"
+            );
+            let before = fixture.snapshot(&[]);
+            let outcome = switch_to(&fixture, NEXT, SwitchPolicy::KeepEveryMod, index);
+            assert!(
+                outcome.is_err(),
+                "Home's switch refuses a build the profile is already on"
+            );
+            assert_eq!(saved_pin(&fixture), pin, "no pin was saved");
+            assert_eq!(fixture.snapshot(&[]), before, "nothing changed");
+            assert!(!mod_list::is_enabled(fixture.home(), "wayfinder"));
+        },
+    );
+}
+
+/// Wayfinder, held off and still wanted, is withdrawn from the registry between Home's check
+/// and its switch. The switch would remove it: Home's switch counts it as a wanted mod left
+/// out and stops before any change (review of #616).
+#[test]
+fn homes_switch_stops_when_a_held_off_wanted_mod_would_be_removed() {
+    Fixture::run(
+        concat!(
+            module_path!(),
+            "::homes_switch_stops_when_a_held_off_wanted_mod_would_be_removed"
+        ),
+        |mut fixture| {
+            on_next_with_wayfinder_held(&mut fixture);
+            let mut withdrawn = (*index_without(&fixture, "wayfinder", &[NEXT])).clone();
+            let project = withdrawn
+                .projects
+                .iter()
+                .find(|project| project.mod_id == "wayfinder")
+                .unwrap()
+                .id
+                .clone();
+            withdrawn.revoked.push(index_v2::Revoked {
+                project,
+                sha256: None,
+                reason: "Withdrawn by its publisher".into(),
+                date: "2026-11-27".into(),
+            });
+            let before = fixture.snapshot(&[]);
+            let outcome = switch_to(
+                &fixture,
+                BUILD,
+                SwitchPolicy::KeepEveryMod,
+                Arc::new(withdrawn),
+            );
+            assert!(
+                matches!(outcome, Ok(Switched::Stayed)),
+                "{:?}",
+                outcome.map(|_| ())
+            );
+            assert_eq!(fixture.snapshot(&[]), before, "Wayfinder was not removed");
+            assert_eq!(played_base(&fixture), NEXT);
         },
     );
 }

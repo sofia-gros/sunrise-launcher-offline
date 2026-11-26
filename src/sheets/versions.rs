@@ -3,7 +3,8 @@
 //! One list, drawn only where it is on screen: what is installed first (the build kept or played
 //! leading), then every build that can be downloaded, by channel and month, newest first. The
 //! field narrows it by date, name or commit. A row only chooses; confirming starts the
-//! staged switch. Download and Prepare do not change the playing build.
+//! staged switch, which downloads and prepares the build first when it needs that. Download and
+//! Prepare are offered only for the build the profile is on already.
 use super::*;
 use crate::line_edit::{self, LineEdit};
 use crate::paint::palette;
@@ -16,11 +17,53 @@ use sunrise_launcher::{backend::Release, browser::sunrise::BuildChoice, instance
 
 /// The height of every line of the list, headings included.
 const LINE_H: f32 = 40.;
-
 struct FitPreview {
     home: PathBuf,
     tag: String,
-    checked: Arc<OnceLock<bool>>,
+    /// The inventory Home had read when it was asked: a change of mods, pins or holds asks
+    /// again.
+    inventory: u64,
+    asked: Instant,
+    /// What keeps the profile's wanted mods from this build; the inner None when the index or
+    /// the mods couldn't be read, which is asked again after a while.
+    checked: Arc<OnceLock<Option<Vec<sunrise_launcher::browser::sunrise::Blocker>>>>,
+}
+
+/// A failed preview is asked again after this long, a good one after the longer: the signed
+/// index changes on its own.
+const PREVIEW_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+const PREVIEW_RECHECK: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// The picker's sentence on what a build leaves out, by what is known of each mod.
+fn preview_plan(blockers: &[sunrise_launcher::browser::sunrise::Blocker]) -> String {
+    use sunrise_launcher::browser::sunrise::FitIssue;
+    if blockers.is_empty() {
+        return tr("Every mod in this profile has a release for this build.").into();
+    }
+    let of = |issue: FitIssue| {
+        blockers
+            .iter()
+            .filter(|blocker| blocker.issue == issue)
+            .map(|blocker| blocker.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    [
+        (FitIssue::NoRelease, "No release for this build: {mods}."),
+        (FitIssue::Unproved, "Not marked for this build yet: {mods}."),
+        (
+            FitIssue::NotFromRegistry,
+            "Not from the registry, so not checked: {mods}.",
+        ),
+        (FitIssue::Withdrawn, "Withdrawn from the registry: {mods}."),
+    ]
+    .into_iter()
+    .filter_map(|(issue, text)| {
+        let mods = of(issue);
+        (!mods.is_empty()).then(|| trf(text, &[("mods", &mods)]))
+    })
+    .collect::<Vec<_>>()
+    .join(" ")
 }
 
 #[derive(Default)]
@@ -88,12 +131,20 @@ fn confirm_label(tag: &str, current: Option<&str>) -> String {
     }
 }
 
+/// What the sheet offers for the picked build. Another build the profile can switch to is
+/// chosen in one press, which downloads and prepares it first when it needs that: a pick that
+/// only downloaded left the profile on its old build, still "the latest" (a player's report,
+/// 2026-11-26). The build the profile plays (`current`) is downloaded or prepared when it isn't
+/// ready, as keeping it only saves the choice, and kept once it is.
 fn version_action(
     installed: bool,
     prepared: impl FnOnce() -> bool,
     can_switch: bool,
+    current: bool,
 ) -> Option<VersionAction> {
-    if !installed {
+    if can_switch && !current {
+        Some(VersionAction::Choose)
+    } else if !installed {
         Some(VersionAction::Download)
     } else if !prepared() {
         Some(VersionAction::Prepare)
@@ -276,6 +327,36 @@ impl Launcher {
             instance.channel,
             self.ui.sheets.versions.find.text(),
         )
+    }
+
+    /// Every build `instance` could switch to besides `plays` (the picker's list), to find one
+    /// its mods have releases for: the profile's channel first, then the others, each newest
+    /// first. All are checked, so "no build has every mod" is true of the whole list.
+    pub(crate) fn switch_candidates(
+        &self,
+        instance: &instances::Instance,
+        plays: Option<&str>,
+    ) -> Vec<String> {
+        let releases: &[Release] = match &self.releases {
+            Load::Ready(rows) => rows,
+            _ => &[],
+        };
+        let mut tags: Vec<String> = lines(releases, &self.installed, plays, instance.channel, "")
+            .into_iter()
+            // The build the profile plays isn't known here without reading its pointer: the
+            // caller drops it (`plays` only places the list as the picker does).
+            .filter_map(|line| match line {
+                Line::Build(b) => Some(b.tag),
+                _ => None,
+            })
+            .collect();
+        let elsewhere = |tag: &str| channel_build(tag).map(|(c, _)| c) != Some(instance.channel);
+        tags.sort_by(|a, b| {
+            elsewhere(a)
+                .cmp(&elsewhere(b))
+                .then_with(|| sunrise_launcher::backend::compare_game_versions(b, a))
+        });
+        tags
     }
 
     /// How tall the list of `lines` is drawn: as tall as what it lists, up to the room the
@@ -480,41 +561,63 @@ impl Launcher {
         });
         let idle = !self.launch_busy() && self.client.is_none();
         let mut cache_action = None;
-        let mut plan = None;
+        let mut plan: Option<SharedString> = None;
         let mut keep_tag = None;
+        let mut ready_note = None;
         if let Some(tag) = pick.as_ref() {
+            let installed = self.installed.contains(tag);
             match version_action(
-                self.installed.contains(tag),
+                installed,
                 || backend::is_prepared(tag),
                 !(is_pack || already_kept && Some(tag.as_str()) == current),
+                Some(tag.as_str()) == current,
             ) {
                 Some(VersionAction::Choose) => {
-                    if idle {
+                    let ready = installed && backend::is_prepared(tag);
+                    if idle && (installed || self.release_to_install(tag).is_some()) {
                         keep_tag = Some(tag.clone());
                     }
+                    if !ready {
+                        ready_note = Some(if installed {
+                            tr("Switching prepares this build first.")
+                        } else {
+                            tr("Switching downloads and prepares this build first.")
+                        });
+                    }
                     if Some(tag.as_str()) != current {
+                        let inventory = self.ui.home.mods.revision();
+                        let now = Instant::now();
                         let request = &mut self.ui.sheets.versions.preview;
-                        if request
-                            .as_ref()
-                            .is_none_or(|preview| preview.home != home || preview.tag != *tag)
-                        {
+                        if request.as_ref().is_none_or(|preview| {
+                            let age = now - preview.asked;
+                            preview.home != home
+                                || preview.tag != *tag
+                                || preview.inventory != inventory
+                                || match preview.checked.get() {
+                                    Some(None) => age > PREVIEW_RETRY,
+                                    Some(Some(_)) => age > PREVIEW_RECHECK,
+                                    None => false,
+                                }
+                        }) {
                             let checked = Arc::new(OnceLock::new());
                             *request = Some(FitPreview {
                                 home: home.clone(),
                                 tag: tag.clone(),
+                                inventory,
+                                asked: now,
                                 checked: checked.clone(),
                             });
                             let target = tag.clone();
                             let work = cx.background_executor().spawn(async move {
-                                sunrise_launcher::browser::sunrise::v2::index().is_ok_and(
-                                    |catalog| {
-                                        sunrise_launcher::browser::sunrise::checked_switch_fit_v2(
+                                sunrise_launcher::browser::sunrise::v2::index()
+                                    .ok()
+                                    .and_then(|catalog| {
+                                        sunrise_launcher::browser::sunrise::switch_fit_blockers_v2(
                                             &catalog.index,
                                             &home,
                                             &target,
                                         )
-                                    },
-                                )
+                                    })
                             });
                             cx.spawn(async move |this, cx| {
                                 let _ = checked.set(work.await);
@@ -523,16 +626,21 @@ impl Launcher {
                             .detach();
                         }
                         plan = Some(
-                            if request.as_ref().and_then(|p| p.checked.get()) == Some(&true) {
-                                tr("Every mod in this profile has a release for this build.")
-                            } else {
-                                tr("The mod changes aren't known until Sunrise checks this build.")
-                            },
+                            match request.as_ref().and_then(|p| p.checked.get()) {
+                                // Which mods this build leaves out and why, so the pick is the
+                                // player's.
+                                Some(Some(blockers)) => preview_plan(blockers),
+                                _ => tr(
+                                    "The mod changes aren't known until Sunrise checks this build.",
+                                )
+                                .to_string(),
+                            }
+                            .into(),
                         );
                     }
                 }
                 Some(VersionAction::Prepare) => {
-                    plan = Some(tr("Prepare this build before switching. Your profile stays on its current build."));
+                    plan = Some(tr("Prepare this build before switching. Your profile stays on its current build.").into());
                     let target = tag.clone();
                     let b = button("alt-versions-prepare", tr("Prepare"));
                     cache_action = Some(if idle {
@@ -548,7 +656,8 @@ impl Launcher {
                     if let Some(release) = self.release_to_install(tag) {
                         plan = Some(tr(
                             "Download this build first. Your profile stays on its current build.",
-                        ));
+                        )
+                        .into());
                         let b = button("alt-versions-download", tr("Download"));
                         cache_action = Some(if idle {
                             b.on_click(cx.listener(move |this, _, _, cx| {
@@ -621,6 +730,7 @@ impl Launcher {
                     .then(|| muted(tr("This profile stays on this build until you change it."))),
             )
             .children(plan.map(muted))
+            .children(ready_note.map(muted))
             .children(self.prepare_error.as_ref().map(|e| muted(e.clone())))
             .children(
                 self.ui
@@ -912,18 +1022,57 @@ mod tests {
 
     #[test]
     fn the_current_unready_build_can_be_downloaded_or_prepared_but_never_kept() {
+        // A kept profile (no switch to offer) and a following one alike: keeping the build it
+        // plays only saves the choice, so an unready one is readied first (review of #616).
+        for can_switch in [false, true] {
+            assert_eq!(
+                version_action(false, || unreachable!(), can_switch, true),
+                Some(VersionAction::Download)
+            );
+            assert_eq!(
+                version_action(true, || false, can_switch, true),
+                Some(VersionAction::Prepare)
+            );
+        }
+        assert_eq!(version_action(true, || true, false, true), None);
         assert_eq!(
-            version_action(false, || unreachable!(), false),
-            Some(VersionAction::Download)
-        );
-        assert_eq!(
-            version_action(true, || false, false),
-            Some(VersionAction::Prepare)
-        );
-        assert_eq!(version_action(true, || true, false), None);
-        assert_eq!(
-            version_action(true, || true, true),
+            version_action(true, || true, true, true),
             Some(VersionAction::Choose)
+        );
+    }
+
+    /// Another picked build is switched to in one press however far it is from ready: a pick
+    /// that only downloaded left the profile on its old build (a player's report, 2026-11-26).
+    #[test]
+    fn a_picked_build_is_switched_to_in_one_press_even_before_it_is_downloaded() {
+        assert_eq!(
+            version_action(false, || unreachable!(), true, false),
+            Some(VersionAction::Choose)
+        );
+        assert_eq!(
+            version_action(true, || unreachable!(), true, false),
+            Some(VersionAction::Choose)
+        );
+    }
+
+    #[test]
+    fn the_preview_says_what_is_known_of_each_mod() {
+        use sunrise_launcher::browser::sunrise::{Blocker, FitIssue};
+        let blocker = |name: &str, issue| Blocker {
+            name: name.into(),
+            issue,
+        };
+        assert_eq!(
+            preview_plan(&[]),
+            "Every mod in this profile has a release for this build."
+        );
+        assert_eq!(
+            preview_plan(&[
+                blocker("Wayfinder", FitIssue::NoRelease),
+                blocker("Minimap", FitIssue::Unproved),
+                blocker("Lanterns", FitIssue::Unproved),
+            ]),
+            "No release for this build: Wayfinder. Not marked for this build yet: Minimap, Lanterns."
         );
     }
 

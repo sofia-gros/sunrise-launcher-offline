@@ -48,7 +48,8 @@ mod switch_v2;
 #[cfg(all(test, debug_assertions, unix))]
 pub(crate) use switch_v2::switch_profile_build_v2_with;
 pub use switch_v2::{
-    checked_switch_fit_v2, switch_build_v2, switch_profile_build_v2, V2SwitchHooks,
+    checked_switch_fit_v2, mods_fit_by_build_v2, switch_build_v2, switch_fit_blockers_v2,
+    switch_profile_build_v2, Blocker, FitIssue, V2SwitchHooks,
 };
 
 /// Maximum accepted `.sigstore.json` attestation bundle size (1 MiB).

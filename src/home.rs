@@ -41,6 +41,8 @@ pub(crate) struct HomeState {
     hero: Rc<Cell<Option<Bounds<gpui::Pixels>>>>,
     /// What the selected profile has installed.
     pub(crate) mods: crate::home_mods::Inventory,
+    /// Which build the profile's mods need, when its own leaves some out.
+    pub(crate) fit: crate::home_fit::ModsFit,
     tabs: tabs::Tabs,
 }
 
@@ -293,6 +295,7 @@ impl Launcher {
             Some((time, last)) => format!("{time}  ·  {last}"),
             None => tr("Not played yet").to_string(),
         };
+        let fit = self.mods_fit(cx);
         let p = palette();
         let scenery = self.settings.scenery();
         let text = rgb(if scenery { p.hero.text } else { p.text });
@@ -330,10 +333,13 @@ impl Launcher {
             )
             .child({
                 // A newer build takes the played line's place, with its button, until the game is
-                // updated; then the played line comes back (Isloka, 2026-11-26).
+                // updated; then the played line comes back (Isloka, 2026-11-26). Before it, the
+                // build the profile's mods have releases for, when its own leaves some out:
+                // updating would not bring those back. When no build has them all, Update game
+                // stays (a newer build may bring some back) with a way to see which builds fit.
                 let offer = self.launch_facts().view().offer;
-                // One height for the played line and the offer with its button, so Play never
-                // moves when the offer comes or goes.
+                // One line at one height whatever it says, so Play never moves when the offer or
+                // an answer comes or goes.
                 let line = div()
                     .mt(px(if compact { 5. } else { 10. }))
                     .h(px(tokens::CONTROL))
@@ -344,8 +350,51 @@ impl Launcher {
                     .gap(px(12.))
                     .text_size(px(tokens::BODY))
                     .text_color(text);
-                match offer {
-                    Some(offer) => line
+                let said = |text: String| div().min_w_0().truncate().child(text);
+                // The details are written when they are asked for, from the shared answer: a frame
+                // copies nothing of it.
+                let blocked = match fit.as_deref() {
+                    Some(crate::home_fit::Fit::Blocked { .. }) => {
+                        let answer = fit.clone();
+                        Some(
+                            crate::frame::button("home-fit-details", tr("Which builds fit"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(crate::home_fit::Fit::Blocked { checked, builds }) =
+                                        answer.as_deref()
+                                    {
+                                        let details =
+                                            crate::home_fit::blocked_details(*checked, builds);
+                                        this.open_info(tr("Which builds fit").into(), details);
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    }
+                    _ => None,
+                };
+                match (fit.as_deref(), offer) {
+                    (Some(crate::home_fit::Fit::Needs(tag)), _) => {
+                        let tag = tag.clone();
+                        let build = crate::sheets::build_name(&tag);
+                        line.child(
+                            crate::frame::button(
+                                "home-fit-switch",
+                                trf("Switch to {build}", &[("build", &build)]),
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    // Kept, not followed, with every wanted mod or not at all.
+                                    this.begin_mods_switch(tag.clone());
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                        .child(said(trf(
+                            "Your mods have releases for {build}",
+                            &[("build", &build)],
+                        )))
+                    }
+                    (_, Some(offer)) => line
                         .child(
                             crate::frame::button(
                                 "alt-update",
@@ -356,8 +405,14 @@ impl Launcher {
                                 cx.notify();
                             })),
                         )
-                        .child(div().min_w_0().truncate().child(offer)),
-                    None => line.child(div().min_w_0().truncate().child(played)),
+                        .child(said(offer))
+                        .children(blocked),
+                    (Some(crate::home_fit::Fit::Blocked { .. }), None) => line
+                        .child(said(
+                            tr("No build has a release of every mod you use").into(),
+                        ))
+                        .children(blocked),
+                    (None, None) => line.child(said(played)),
                 }
             });
         let receipt =

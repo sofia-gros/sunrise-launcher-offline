@@ -29,15 +29,17 @@ pub use source::{
     SourceProof, SourceRequest,
 };
 pub use switch::{
-    save_build_choice, BuildChoice, SwitchDecision, SwitchHooks, SwitchQuestion, Switched,
+    save_build_choice, BuildChoice, SwitchDecision, SwitchHooks, SwitchPolicy, SwitchQuestion,
+    Switched,
 };
 pub use v2::{
     checked_switch_fit_v2, classify_v2_ownership, install_registry_v2, inventory_v2,
-    plan_v2_install, plan_v2_update, revoked_for_package, switch_build_v2, switch_profile_build_v2,
-    switch_provider_v2, turn_off_revoked_v2, update_registry_v2, InstalledV2Mod, PlannedV2Release,
-    ProviderCandidate, ProviderChoiceNeeded, ProviderConflict, ProviderSwitchPreview,
-    PublisherChangeQuestion, V2AffectedDependent, V2Hooks, V2InstallOptions, V2Ownership, V2Plan,
-    V2ProviderSwitchHooks, V2SwitchHooks,
+    mods_fit_by_build_v2, plan_v2_install, plan_v2_update, revoked_for_package, switch_build_v2,
+    switch_fit_blockers_v2, switch_profile_build_v2, switch_provider_v2, turn_off_revoked_v2,
+    update_registry_v2, Blocker, FitIssue, InstalledV2Mod, PlannedV2Release, ProviderCandidate,
+    ProviderChoiceNeeded, ProviderConflict, ProviderSwitchPreview, PublisherChangeQuestion,
+    V2AffectedDependent, V2Hooks, V2InstallOptions, V2Ownership, V2Plan, V2ProviderSwitchHooks,
+    V2SwitchHooks,
 };
 
 // Advisory only. Never use these in place of a fresh, admitted worker proof. Key by the
