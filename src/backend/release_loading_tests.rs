@@ -306,14 +306,19 @@ fn each_platform_download_is_bound_to_the_fork_not_the_provider_url() {
         let games = parse_releases(&game_list, &[Some(game_asset)], is_game_tag);
         let launchers = parse_launcher_releases(&launcher_list, Some(launcher_asset));
         for (parsed, repository, tag, expected) in [
-            (games, "sunrise", "26.3-0.1.0", game),
-            (launchers, "sunrise-launcher", "v1.0.9", launcher),
+            (games, "sunrise-org/sunrise", "26.3-0.1.0", game),
+            (
+                launchers,
+                "sofia-gros/sunrise-launcher-offline",
+                "v1.0.9",
+                launcher,
+            ),
         ] {
             assert_eq!(parsed.len(), 1);
             assert_eq!(
                 parsed[0].asset,
                 Some((
-                    format!("https://github.com/sunrise-org/{repository}/releases/download/{tag}/{expected}"),
+                    format!("https://github.com/{repository}/releases/download/{tag}/{expected}"),
                     9
                 ))
             );

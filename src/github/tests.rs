@@ -91,8 +91,8 @@ fn mirror_serves_only_sunrises_repositories() {
     );
     // The launcher's own repository only in a development build: a shipped launcher learns of its own updates from GitHub.
     assert_eq!(
-        mirror_url_with("https://api.github.com/repos/sunrise-org/sunrise-launcher/releases?per_page=100", base).as_deref(),
-        cfg!(debug_assertions).then_some("https://mcp.example/github/public/repos/sunrise-org/sunrise-launcher/releases?per_page=100")
+        mirror_url_with("https://api.github.com/repos/sofia-gros/sunrise-launcher-offline/releases?per_page=100", base).as_deref(),
+        cfg!(debug_assertions).then_some("https://mcp.example/github/public/repos/sofia-gros/sunrise-launcher-offline/releases?per_page=100")
     );
     assert_eq!(
         mirror_url_with("https://api.github.com/repos/someone/mod/commits/abc", base),
@@ -489,7 +489,7 @@ fn a_manual_launcher_check_revalidates_even_a_fresh_release_list() {
 #[test]
 fn the_launchers_releases_are_never_kept_from_the_mirror() {
     const LAUNCHER: &str =
-        "https://api.github.com/repos/sunrise-org/sunrise-launcher/releases?per_page=100";
+        "https://api.github.com/repos/sofia-gros/sunrise-launcher-offline/releases?per_page=100";
     let cache = scratch("launcher-mirror");
     let mirrored = |_: &str| fresh(list("v9.9.9"), None);
     let got = json_with(LAUNCHER, &cache, T0, |_, _| Answer::RateLimited, mirrored);
