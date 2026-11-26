@@ -1,3 +1,14 @@
+> [!WARNING]
+> **Unofficial fork.** This repository is not in any way affiliated with the Sunrise project, Microsoft or Mojang. It is not an official Minecraft product, and it is not approved by or associated with Mojang or Microsoft.
+>
+> **What this fork does:** it enables **OFFLINE_PLAY** — playing from **YOUR OWN** Minecraft assets under an offline name, without Microsoft profile authentication. The goal of this fork is to return local account play with your own legally obtained game resources. This launcher ships no Minecraft files.
+>
+> **Downloading still needs an owner account.** Downloading the game and the Mojang assets through this launcher still requires signing in with an account that owns Minecraft: Java Edition. You need your own legally obtained copy of the game; this fork does not provide one.
+>
+> **Limits of offline names:** an offline name works for single-player, LAN play and offline-mode servers. Online-mode servers, Realms and other authenticated services still require a legitimate Microsoft account that owns the game.
+
+The remainder of this README is the upstream Sunrise launcher README, unmodified.
+
 # Sunrise launcher
 
 The launcher for [Sunrise](https://github.com/sunrise-org/sunrise): it installs, prepares and starts Sunrise builds, and
