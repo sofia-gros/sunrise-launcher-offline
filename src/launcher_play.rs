@@ -116,8 +116,14 @@ fn continue_after_assets(
         Ok(None)
     } else {
         match accepted {
-            Some(uuid) => account::session_for_game_accepted(&backend::game_home(), uuid),
-            None => Err(account::NoOwner::default()),
+            Some(uuid) => account::session_for_game_accepted(
+                &backend::game_home(),
+                uuid,
+                backend::OFFLINE_PLAY,
+            ),
+            // No account was accepted: this fork starts the game offline, as the offline
+            // name that plays (or the game's own name), instead of refusing.
+            None => account::session_for_game(&backend::game_home(), backend::OFFLINE_PLAY),
         }
         .map(Some)
     };
@@ -874,7 +880,10 @@ mod tests {
             events.try_recv().unwrap(),
             Msg::PlayStep(backend::PlayStep::SignIn)
         ));
-        assert!(matches!(events.try_recv().unwrap(), Msg::Session(Err(_)))); // Only sign-in stops this fixture.
+        // This fork (`backend::OFFLINE_PLAY`): sign-in does not stop this fixture either —
+        // the session arrives with no account behind it, and play goes on from there.
+        // (Upstream, the session was the one thing that stopped it.)
+        assert!(matches!(events.try_recv().unwrap(), Msg::Session(Ok(_))));
         assert_eq!(std::fs::read_to_string(ledger).unwrap(), old);
         assert_eq!(std::fs::read(active).unwrap(), bytes);
         assert_eq!(std::fs::read(game_journal).unwrap(), b"separate journal");

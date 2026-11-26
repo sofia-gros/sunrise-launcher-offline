@@ -132,6 +132,15 @@ pub struct Started {
 }
 
 impl Client<'_> {
+    /// This fork's offline play: no account was accepted for this Play, and the kept
+    /// accounts start the game without one — an offline name plays, or the game's own
+    /// name does (`backend::OFFLINE_PLAY`).
+    fn offline_play(&self) -> bool {
+        self.accepted_account.is_none()
+            && crate::backend::OFFLINE_PLAY
+            && account::Accounts::load().selected().is_none()
+    }
+
     pub fn start(
         self,
         choose: impl FnOnce() -> Result<FirstBuild, String>,
@@ -166,7 +175,10 @@ impl Client<'_> {
         if self.instance.kind == instances::Kind::Pack {
             return Err(unsettled!().into());
         }
-        if self.accepted_account.is_none() && !developer_offline::requested() {
+        if self.accepted_account.is_none()
+            && !developer_offline::requested()
+            && !self.offline_play()
+        {
             return Err(StartError::Account(NoOwner::default()));
         }
         if self.instance.kind == instances::Kind::Default && self.instance.incarnation.is_none() {
@@ -195,7 +207,10 @@ impl Client<'_> {
             None
         };
         let check_build = |tag: &str, variant: Option<&BoundVariant>| {
-            if self.accepted_account.is_none() && !developer_offline::enabled(tag) {
+            if self.accepted_account.is_none()
+                && !developer_offline::enabled(tag)
+                && !self.offline_play()
+            {
                 return Err(StartError::Account(NoOwner::default()));
             }
             backend::managed_game_architecture_launch_error(tag, variant)
@@ -215,6 +230,7 @@ impl Client<'_> {
         )?;
         let tag = active.executable();
         let offline = !self.explicit_account && developer_offline::enabled(tag);
+        let offline_play = !offline && self.offline_play();
         let mut cmd = backend::client_with_resources(tag, &active.resource_path());
         instances::apply(&mut cmd, self.instance)?;
         let vars = self.instance.vars();
@@ -225,6 +241,24 @@ impl Client<'_> {
             developer_offline::require_capability(tag)?;
             developer_offline::mark(&mut cmd);
             notice = Some(crate::i18n::tr(developer_offline::NOTICE).into());
+            None
+        } else if offline_play {
+            // No session file and no developer mark: the game starts as the offline name
+            // (`--name`, from the session's `apply`), and LAN play and offline servers
+            // stay open to it. No account plays, so `plays` stays none; the session is
+            // applied here, not in the spawn closure.
+            let session =
+                account::session_for_game(&backend::game_home(), crate::backend::OFFLINE_PLAY)
+                    .map_err(StartError::Account)?;
+            session_file = session.file.clone();
+            notice = if let Some(reason) = session.apply(&mut cmd) {
+                Some(crate::i18n::trf(
+                    "Playing offline: {reason}",
+                    &[("reason", &reason)],
+                ))
+            } else {
+                account::take_unsaved()
+            };
             None
         } else {
             Some(
@@ -252,9 +286,12 @@ impl Client<'_> {
                     // This also stops Play when the account was signed out meanwhile.
                     if let Some(uuid) = plays {
                         progress(Progress::SignIn);
-                        let session =
-                            account::session_for_game_accepted(&backend::game_home(), uuid)
-                                .map_err(StartError::Account)?;
+                        let session = account::session_for_game_accepted(
+                            &backend::game_home(),
+                            uuid,
+                            crate::backend::OFFLINE_PLAY,
+                        )
+                        .map_err(StartError::Account)?;
                         session_file = session.file.clone();
                         if let Some(why) = session.apply(cmd) {
                             return Err(why.into());
@@ -276,7 +313,7 @@ impl Client<'_> {
                     executable: tag.into(),
                     notice,
                     registry_notices,
-                    owner: !offline,
+                    owner: !offline && !offline_play,
                 })
             }
             Err(error) => {

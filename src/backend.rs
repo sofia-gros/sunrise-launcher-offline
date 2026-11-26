@@ -20,6 +20,12 @@ pub fn issues_url() -> String {
     format!("https://github.com/{GAME_REPO}/issues")
 }
 pub const README_URL: &str = "https://github.com/sunrise-org/sunrise-launcher/blob/main/README.md";
+/// This fork: the game starts without a Microsoft account that owns it, in the window and on
+/// the command line. Offline names play with no owner at all
+/// (`account::Accounts::play_as_player`, `account::launch_for_game`), and `Settings` load with
+/// `dev_offline` set to this. Downloads still need an owner, so the game itself comes from
+/// the player's own install.
+pub const OFFLINE_PLAY: bool = true;
 /// This launcher's version: the release workflow sets `SUNRISE_LAUNCHER_VERSION` from the
 /// tag it builds (no version-bump commits); other builds say Cargo.toml's.
 pub const VERSION: &str = version_or(option_env!("SUNRISE_LAUNCHER_VERSION"));
@@ -5560,6 +5566,13 @@ pub struct Settings {
     /// Show names alongside game profiles in the sidebar. Starts collapsed.
     #[serde(default)]
     pub sidebar_expanded: bool,
+    /// Developer options (hidden in upstream): offline names play without an account that
+    /// owns the game, in the window only (`account::Accounts::play_as_player`,
+    /// `account::launch_for_game`). Never a download: the game still comes from the player's
+    /// own install. This fork's [`OFFLINE_PLAY`] sets it on every load
+    /// (`parse`), so in this fork it is always on; absent from the file while off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dev_offline: bool,
 }
 
 impl Settings {
@@ -5672,6 +5685,9 @@ impl Settings {
             }
         }
         let mut settings: Self = serde_json::from_value(value).unwrap_or_default();
+        // This fork: offline play works without a Microsoft account, in the window and the
+        // CLI, so the developer option that carries it is on whatever the file says.
+        settings.dev_offline = OFFLINE_PLAY;
         if !accent_saved {
             settings.accent =
                 crate::themes::starting_accent(settings.theme.as_deref(), &settings.theme_accents);

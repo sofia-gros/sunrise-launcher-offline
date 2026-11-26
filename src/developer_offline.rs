@@ -230,12 +230,16 @@ mod tests {
     }
 
     #[test]
-    fn account_gate_is_preserved_without_opt_in_and_for_signed_lineage() {
+    fn play_passes_the_account_gate_without_an_account_in_this_fork() {
         if let Ok(tag) = std::env::var("OFFLINE_GATE_TEST_TAG") {
             assert!(!enabled(&tag));
+            // This fork (`backend::OFFLINE_PLAY`): no account is no refusal, whatever the
+            // build's lineage. Play gets past the account gate and stops later — here at
+            // the unprepared scratch game — never with the sign-in refusal. (Upstream,
+            // this fence asserted the opposite: the gate itself refused.)
             let error = crate::backend::client_as(&tag, None).unwrap_err();
             assert!(
-                error.contains(crate::i18n::tr(crate::backend::SIGN_IN_HINT)),
+                !error.contains(crate::i18n::tr(crate::backend::SIGN_IN_HINT)),
                 "{error}"
             );
             return;
@@ -256,7 +260,7 @@ mod tests {
             )
             .unwrap();
             let mut child = Command::new(std::env::current_exe().unwrap());
-            child.args(["--exact", "developer_offline::tests::account_gate_is_preserved_without_opt_in_and_for_signed_lineage", "--nocapture"])
+            child.args(["--exact", "developer_offline::tests::play_passes_the_account_gate_without_an_account_in_this_fork", "--nocapture"])
                 .env("OFFLINE_GATE_TEST_TAG", tag)
                 .env("SUNRISE_LAUNCHER_HOME", root.path())
                 .env("SUNRISE_HOME", root.path().join("game"))

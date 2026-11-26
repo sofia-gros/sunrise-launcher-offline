@@ -185,6 +185,8 @@ pub fn current(account: &str) -> Result<Arc<PlayerKey>, String> {
             super::client_id().as_deref(),
             super::store(),
             &mut accounts,
+            // A profile key needs the account's real session: the gate stays strict.
+            false,
         )
         .map_err(|_| super::NEEDS_OWNER.to_string())?;
         let _ = accounts.save_renewed();

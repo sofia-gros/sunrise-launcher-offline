@@ -264,6 +264,7 @@ impl Launcher {
         self.args_focused = self.args_focus.is_focused(window);
         self.proxy_focused = self.proxy_focus.is_focused(window);
         self.corners_focused = self.corners_focus.is_focused(window);
+        self.offline_focused = self.offline_focus.is_focused(window);
         let section = self.ui.settings.section;
         let scroll = crate::frame::scrolls("settings");
         let mut nav = div()
@@ -703,6 +704,73 @@ impl Launcher {
                 button("alt-add-account", tr("Sign in with Microsoft")).on_click(cx.listener(
                     |this, _: &ClickEvent, _, cx| {
                         this.sign_in_to_play();
+                        cx.notify();
+                    },
+                )),
+            ),
+        ));
+        // This fork: offline names play without a Microsoft account at all (OFFLINE_PLAY).
+        rows.push(row(
+            tr("Offline names"),
+            tr("Play without a Microsoft account. The game still comes from your own install."),
+            div(),
+        ));
+        for (i, name) in self.accounts.offline.clone().into_iter().enumerate() {
+            let plays = self.accounts.selected.is_none()
+                && self.accounts.offline_selected.as_deref() == Some(name.as_str());
+            let mut actions = div().flex().items_center().gap(px(6.));
+            if !plays {
+                let who = name.clone();
+                actions = actions.child(
+                    button(ElementId::named_usize("alt-offline-play", i), tr("Play as")).on_click(
+                        cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.play_as_player(account::Player::Offline(who.clone()));
+                            cx.notify();
+                        }),
+                    ),
+                );
+            }
+            let gone = name.clone();
+            actions = actions.child(
+                button(
+                    ElementId::named_usize("alt-offline-remove", i),
+                    tr("Remove"),
+                )
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.forget_offline_name(&gone);
+                    cx.notify();
+                })),
+            );
+            rows.push(row(
+                name,
+                tr(if plays {
+                    "Plays when you press Play"
+                } else {
+                    "Offline name"
+                }),
+                actions,
+            ));
+        }
+        let field = self
+            .settings_field(
+                "alt-offline-name",
+                self.offline_focus.clone(),
+                self.offline_focused,
+                &self.offline_input,
+                "Builder_1",
+                |this| &mut this.offline_input,
+                |_| {},
+                cx,
+            )
+            .w(px(180.));
+        rows.push(row(
+            tr("Add an offline name"),
+            tr("3 to 16 letters, digits or _."),
+            div().flex().items_center().gap(px(6.)).child(field).child(
+                button("alt-offline-add", tr("Add")).on_click(cx.listener(
+                    |this, _: &ClickEvent, _, cx| {
+                        let name = this.offline_input.text().trim().to_string();
+                        this.add_offline_name(name);
                         cx.notify();
                     },
                 )),

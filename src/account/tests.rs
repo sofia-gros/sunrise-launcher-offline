@@ -800,12 +800,12 @@ fn the_game_plays_only_as_an_account_that_owns_it() {
     let store = MemoryStore::default();
     let (_, ep) = mock(|_| {});
     // No account: no game.
-    let refused = launch_for_game(&ep, Some("test-client"), &store, &mut Accounts::default());
+    let refused = launch_for_game(&ep, Some("test-client"), &store, &mut Accounts::default(), false);
     assert_eq!(refused.unwrap_err(), NoOwner::default());
     // An owner, none selected: it plays, with its session.
     let mut accounts = signed_in(&store, &secrets("mc-token", true));
     accounts.selected = None;
-    let pass = launch_for_game(&ep, Some("test-client"), &store, &mut accounts).unwrap();
+    let pass = launch_for_game(&ep, Some("test-client"), &store, &mut accounts, false).unwrap();
     assert_eq!(pass.session.unwrap().0.name, "Notch");
     assert_eq!(accounts.selected.as_deref(), Some(UUID));
     // Another account plays: Notch owning the game doesn't let it play under a name of its own.
@@ -816,15 +816,49 @@ fn the_game_plays_only_as_an_account_that_owns_it() {
         cape: None,
     });
     accounts.play_as("other").unwrap();
-    let refused = launch_for_game(&ep, Some("test-client"), &store, &mut accounts).unwrap_err();
+    let refused = launch_for_game(&ep, Some("test-client"), &store, &mut accounts, false).unwrap_err();
     assert!(refused
         .to_string()
         .starts_with("Alex is no longer signed in"));
     // The services say the account that plays doesn't own the game.
     let (_, ep) = mock(|m| m.owns_game = false);
     let mut accounts = signed_in(&store, &secrets("mc-token", true));
-    let refused = launch_for_game(&ep, Some("test-client"), &store, &mut accounts);
+    let refused = launch_for_game(&ep, Some("test-client"), &store, &mut accounts, false);
     assert_eq!(refused.unwrap_err(), NoOwner::default());
+}
+
+#[test]
+fn an_offline_name_plays_without_an_owner_only_with_the_forks_pass() {
+    let store = MemoryStore::default();
+    let (_, ep) = mock(|_| {});
+    // A kept offline name, no account at all: the strict gate refuses, the pass starts the
+    // game with no session and no account picked for it.
+    let mut accounts = Accounts::default();
+    accounts
+        .play_as_player(&store, Player::Offline("Builder_1".into()), true)
+        .unwrap();
+    assert_eq!(accounts.player(), Player::Offline("Builder_1".into()));
+    let refused = launch_for_game(
+        &ep,
+        Some("test-client"),
+        &store,
+        &mut accounts.clone(),
+        false,
+    );
+    assert_eq!(refused.unwrap_err(), NoOwner::default());
+    let pass = launch_for_game(&ep, Some("test-client"), &store, &mut accounts, true).unwrap();
+    assert!(pass.session.is_none() && pass.owner.is_none());
+    assert_eq!(
+        accounts.selected, None,
+        "no account is picked for an offline name"
+    );
+    assert_eq!(accounts.name_arg(), Some("Builder_1"));
+    // Without the pass, choosing an offline name beside no owner is refused at the switch.
+    let mut fresh = Accounts::default();
+    assert!(fresh
+        .play_as_player(&store, Player::Offline("Builder_1".into()), false)
+        .is_err());
+    assert!(fresh.offline.is_empty());
 }
 
 /// Secrets whose Minecraft token has `left` seconds to live.
@@ -842,7 +876,7 @@ fn a_failed_refresh_of_an_expired_token_stops_play() {
         let mut accounts = signed_in(&store, &secrets);
         for refused in [503, 401] {
             let (_, ep) = mock(|m| m.refresh_refused = Some(refused));
-            let outcome = launch_accepted(&ep, Some("test-client"), &store, &mut accounts, UUID);
+            let outcome = launch_accepted(&ep, Some("test-client"), &store, &mut accounts, UUID, false);
             // A refusal is no pass, and only a pass is turned into a session file.
             let why = outcome.expect_err("an expired token is no session").keyring;
             assert!(why.is_some_and(|why| !why.is_empty()));
@@ -850,7 +884,7 @@ fn a_failed_refresh_of_an_expired_token_stops_play() {
     }
     // Offline too: the answer is the one the check produced.
     let mut accounts = signed_in(&store, &expiring_in(0));
-    let refused = launch_for_game(&offline(), Some("test-client"), &store, &mut accounts);
+    let refused = launch_for_game(&offline(), Some("test-client"), &store, &mut accounts, false);
     assert!(refused
         .unwrap_err()
         .keyring
@@ -863,14 +897,14 @@ fn a_failed_refresh_with_a_token_good_for_five_minutes_plays_with_the_stored_tok
     let store = MemoryStore::default();
     let mut accounts = signed_in(&store, &expiring_in(1800));
     let (_, ep) = mock(|m| m.refresh_refused = Some(503));
-    let pass = launch_for_game(&ep, Some("test-client"), &store, &mut accounts).unwrap();
+    let pass = launch_for_game(&ep, Some("test-client"), &store, &mut accounts, false).unwrap();
     let (account, secrets) = pass.session.unwrap();
     assert_eq!(account.uuid, UUID);
     assert_eq!(secrets.minecraft_token, "mc-token");
     assert!(pass.offline.is_none());
     // Not for a token inside the five minutes.
     let mut accounts = signed_in(&store, &expiring_in(299));
-    assert!(launch_for_game(&ep, Some("test-client"), &store, &mut accounts).is_err());
+    assert!(launch_for_game(&ep, Some("test-client"), &store, &mut accounts, false).is_err());
     // Nor once Microsoft has said the sign-in is over.
     let mut accounts = signed_in(
         &store,
@@ -879,7 +913,7 @@ fn a_failed_refresh_with_a_token_good_for_five_minutes_plays_with_the_stored_tok
             ..expiring_in(1800)
         },
     );
-    let refused = launch_for_game(&ep, Some("test-client"), &store, &mut accounts);
+    let refused = launch_for_game(&ep, Some("test-client"), &store, &mut accounts, false);
     assert_eq!(refused.unwrap_err().keyring.as_deref(), Some(SIGN_IN_AGAIN));
 }
 
@@ -888,16 +922,16 @@ fn an_entitlements_timeout_with_a_valid_token_plays_with_the_stored_token() {
     let store = MemoryStore::default();
     let mut accounts = signed_in(&store, &secrets("mc-token", true));
     let (_, ep) = mock(|m| m.entitlements_refused = Some(503));
-    let pass = launch_for_game(&ep, Some("test-client"), &store, &mut accounts).unwrap();
+    let pass = launch_for_game(&ep, Some("test-client"), &store, &mut accounts, false).unwrap();
     assert_eq!(pass.session.unwrap().1.minecraft_token, "mc-token");
     assert!(pass.offline.is_none());
     // The services unreachable altogether: the same.
-    let pass = launch_for_game(&offline(), Some("test-client"), &store, &mut accounts).unwrap();
+    let pass = launch_for_game(&offline(), Some("test-client"), &store, &mut accounts, false).unwrap();
     assert!(pass.session.is_some() && pass.offline.is_none());
 }
 
 #[test]
-fn retired_account_and_settings_fields_are_ignored_on_load_without_deleting_files() {
+fn offline_names_survive_a_load_and_retired_fields_stay_retired() {
     let dir = std::env::temp_dir().join(format!("sunrise-retired-fields-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("skins")).unwrap();
@@ -915,23 +949,38 @@ fn retired_account_and_settings_fields_are_ignored_on_load_without_deleting_file
     let mut accounts = Accounts::load_from(&path);
     assert_eq!(accounts.accounts, vec![notch()]);
     assert!(accounts.selected().is_none());
+    // This fork keeps offline names: they load, and the one chosen plays.
+    assert_eq!(accounts.offline, ["Builder_1"]);
+    assert_eq!(accounts.player(), Player::Offline("Builder_1".into()));
     let (_, ep) = mock(|_| {});
-    let pass = launch_for_game(&ep, Some("test-client"), &store, &mut accounts).unwrap();
+    let pass = launch_for_game(&ep, Some("test-client"), &store, &mut accounts, false).unwrap();
     assert_eq!(pass.session.unwrap().0.uuid, UUID);
     accounts.save_to(&path).unwrap();
     let saved: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    // The names are written back; `looks` stays retired (offline names keep no look yet),
+    // and no file is deleted either way.
     assert_eq!(
         saved,
-        serde_json::json!({ "accounts": accounts.accounts, "selected": UUID })
+        serde_json::json!({
+            "accounts": accounts.accounts,
+            "selected": UUID,
+            "offline": ["Builder_1"],
+            "offline_selected": "Builder_1",
+        })
     );
     assert!(skin_file.is_file());
-    // Retired settings fields are ignored on load and not written back.
+    // Retired settings fields are ignored on load and not written back — except
+    // `dev_offline`, which this fork's OFFLINE_PLAY switches on at every load.
     let settings = crate::backend::Settings::parse(
         r#"{"dev_offline": true, "welcomed": true, "corners": 12, "keep_versions": 3}"#,
     );
     let saved = serde_json::to_value(&settings).unwrap();
-    assert!(saved.get("dev_offline").is_none(), "{saved}");
+    assert_eq!(
+        saved.get("dev_offline"),
+        Some(&serde_json::json!(crate::backend::OFFLINE_PLAY)),
+        "{saved}"
+    );
     assert!(saved.get("welcomed").is_none(), "{saved}");
     assert!(saved.get("corners").is_none(), "{saved}");
     assert_eq!(saved["keep_versions"], 3);
@@ -1359,6 +1408,7 @@ fn a_switch_is_saved_and_survives_a_restart() {
             named("c3", "Cinder"),
         ],
         selected: Some("a1".into()),
+        ..Accounts::default()
     }
     .save_to(&path)
     .unwrap();
@@ -2678,17 +2728,17 @@ fn play_starts_as_the_account_it_was_pressed_for_whoever_is_selected_since() {
     // Reading whoever is selected at sign-in, as Play did, answers for Alex.
     let mut as_selected = accounts.clone();
     assert!(
-        launch_for_game(&offline(), Some("test-client"), &store, &mut as_selected).is_err(),
+        launch_for_game(&offline(), Some("test-client"), &store, &mut as_selected, false).is_err(),
         "the selected account is Alex, who can't play"
     );
     // The accepted account plays, and the switcher's choice stays.
     let pass =
-        launch_accepted(&offline(), Some("test-client"), &store, &mut accounts, UUID).unwrap();
+        launch_accepted(&offline(), Some("test-client"), &store, &mut accounts, UUID, false).unwrap();
     assert!(pass.session.is_some() && pass.offline.is_none());
     assert_eq!(accounts.selected.as_deref(), Some(alex));
     // Signed out before the game started: nobody plays in its place.
     accounts.remove(&store, UUID).unwrap();
-    let gone = launch_accepted(&offline(), Some("test-client"), &store, &mut accounts, UUID);
+    let gone = launch_accepted(&offline(), Some("test-client"), &store, &mut accounts, UUID, false);
     assert!(gone.unwrap_err().keyring.unwrap().contains("signed out"));
     assert_eq!(accounts.selected.as_deref(), Some(alex));
 }
@@ -3530,6 +3580,7 @@ fn accounts_can_be_reordered_and_persist_to_disk() {
             },
         ],
         selected: Some("b".into()),
+        ..Accounts::default()
     };
     accounts.save_to(&path).unwrap();
 

@@ -353,6 +353,10 @@ struct Launcher {
     corners_focused: bool,
     corners_focus: FocusHandle,
     corners_slider: slider::Slider,
+    /// Settings › Account › Offline names: the name being typed, its focus state and handle.
+    offline_input: line_edit::LineEdit,
+    offline_focused: bool,
+    offline_focus: FocusHandle,
     /// Opt-in data collection: the player's answer and Settings' section (`collection`).
     collection: collection::Collection,
     /// How many play Sunrise now, while the server answers ("N playing now" on the Play page).

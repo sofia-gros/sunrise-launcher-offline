@@ -65,6 +65,10 @@ pub(crate) fn rows(
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Action {
     PlayAs(String),
+    /// Play as an offline name (this fork: no account needed).
+    PlayAsOffline(String),
+    /// Play offline as the name the game made up.
+    PlayAsGameName,
     Add,
     Manage,
     Settings,
@@ -123,10 +127,19 @@ impl Launcher {
             )
     }
 
+    /// The face for a player with no account (an offline name, or the game's own name).
+    fn face_offline(&self) -> Div {
+        div()
+            .flex_none()
+            .rounded(crate::tokens::r(crate::tokens::R_SMALL))
+            .overflow_hidden()
+            .child(self.profile_heads.draw(None, FACE, self.scale, &self.theme))
+    }
+
     /// The top bar's account control: the chip, or Microsoft's sign-in button when nobody is
     /// signed in.
     pub(crate) fn account_chip(&mut self, compact: bool, cx: &mut Context<Self>) -> Stateful<Div> {
-        if self.accounts.accounts.is_empty() {
+        if self.accounts.accounts.is_empty() && self.accounts.offline.is_empty() {
             let p = palette();
             let label = tr("Sign in with Microsoft");
             let icon_only = compact && self.bar_width() < 750.;
@@ -162,7 +175,10 @@ impl Launcher {
         }
         let open = self.ui.sheet == Some(Sheet::AccountMenu);
         let who = self.accounts.selected();
-        let name = who.map_or_else(|| tr("Choose who plays").to_string(), |a| a.name.clone());
+        let name = match self.accounts.player() {
+            account::Player::Offline(name) => name,
+            _ => who.map_or_else(|| tr("Choose who plays").to_string(), |a| a.name.clone()),
+        };
         let face = match who {
             Some(account) => self.face(&account.uuid),
             // Accounts are here, but the one that played signed out: none is picked yet.
@@ -226,13 +242,19 @@ impl Launcher {
     /// Does what a row of the menu says.
     pub(crate) fn account_action(&mut self, action: Action) {
         // Who plays is settled while a game starts: the menu stays, and says so.
-        if matches!(action, Action::PlayAs(_) | Action::Add) && self.account_locked() {
+        if matches!(
+            action,
+            Action::PlayAs(_) | Action::PlayAsOffline(_) | Action::PlayAsGameName | Action::Add
+        ) && self.account_locked()
+        {
             self.say_account_locked();
             return;
         }
         self.ui.sheet = sheet_after(&action);
         match action {
             Action::PlayAs(uuid) => self.play_as(&uuid),
+            Action::PlayAsOffline(name) => self.play_as_player(account::Player::Offline(name)),
+            Action::PlayAsGameName => self.play_as_player(account::Player::GameName),
             Action::Add => {
                 // A sign-in a Play left behind would start the game when this one ends.
                 self.cancel_sign_in();
@@ -303,6 +325,87 @@ impl Launcher {
                     }))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.account_action(Action::PlayAs(uuid.clone()));
+                        cx.notify();
+                    })),
+            );
+        }
+        // This fork's offline names, and the game's own name, are "Play as" rows too.
+        let player = self.accounts.player();
+        for (n, name) in self.accounts.offline.clone().into_iter().enumerate() {
+            let plays = player == account::Player::Offline(name.clone());
+            let gone = name.clone();
+            list = list.child(
+                div()
+                    .id(ElementId::named_usize("account-menu-offline", n))
+                    .reach()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .min_h(px(tokens::ACTION))
+                    .py(px(4.))
+                    .px(px(8.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(palette().hover)))
+                    .child(self.face_offline())
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(name),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(tokens::SMALL))
+                                    .text_color(rgb(palette().muted))
+                                    .child(tr("Offline name")),
+                            ),
+                    )
+                    .children(plays.then(|| {
+                        crate::glass_ui::icon("tick-02", 16., rgb(palette().accent_ink).into())
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.account_action(Action::PlayAsOffline(gone.clone()));
+                        cx.notify();
+                    })),
+            );
+        }
+        if !self.accounts.offline.is_empty() {
+            let plays = player == account::Player::GameName;
+            list = list.child(
+                div()
+                    .id("account-menu-game-name")
+                    .reach()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .min_h(px(tokens::ACTION))
+                    .py(px(4.))
+                    .px(px(8.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(palette().hover)))
+                    .child(self.face_offline())
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            div()
+                                .truncate()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(tr("The game's own name")),
+                        ),
+                    )
+                    .children(plays.then(|| {
+                        crate::glass_ui::icon("tick-02", 16., rgb(palette().accent_ink).into())
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.account_action(Action::PlayAsGameName);
                         cx.notify();
                     })),
             );
@@ -437,6 +540,7 @@ mod tests {
                 account("c3", "Cinder"),
             ],
             selected: selected.map(Into::into),
+            ..Accounts::default()
         }
     }
 

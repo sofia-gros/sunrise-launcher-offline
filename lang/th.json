@@ -1950,5 +1950,11 @@
   "Sealing the game files": "Sealing the game files",
   "Checking the game files: {done} of {total}": "Checking the game files: {done} of {total}",
   "Sealing the game files: {done} of {total}": "Sealing the game files: {done} of {total}",
-  "Downloading Minecraft's files: {done} of {total}": "Downloading Minecraft's files: {done} of {total}"
+  "Downloading Minecraft's files: {done} of {total}": "Downloading Minecraft's files: {done} of {total}",
+  "Offline name": "Offline name",
+  "Offline names": "Offline names",
+  "Add an offline name": "Add an offline name",
+  "The game's own name": "The game's own name",
+  "Play without a Microsoft account. The game still comes from your own install.": "Play without a Microsoft account. The game still comes from your own install.",
+  "3 to 16 letters, digits or _.": "3 to 16 letters, digits or _."
 }
