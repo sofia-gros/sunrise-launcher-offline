@@ -1,0 +1,7 @@
+# The public key this fork's launcher releases are signed with
+# (sofia-gros/sunrise-launcher-offline): one base64 Ed25519 key per line. The launcher
+# builds these in and refuses a launcher update no key here signed. Game releases keep
+# Sunrise's own key (sunrise-org-sunrise.txt); this file is only for the launcher's own
+# updates, so an upstream launcher release can never replace this fork's build.
+# The private key exists only as the fork maintainer's release key, never in this repo.
+tat5oclX8aVGOmKT1evZSdfvGxbj9w3kgbv/7ujNafc=
