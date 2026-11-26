@@ -171,22 +171,46 @@ pub fn launch(
 /// The owner gate before the game starts: [`launch`], where the account that plays (the selected
 /// one, else the first) must own the game itself, by the services' answer or, when they can't be
 /// asked, its last one. Never another account's ownership for a name of its own.
+///
+/// `offline_without_owner` (this fork's `backend::OFFLINE_PLAY`) is the one way past the
+/// gate: no owner is no refusal, and the game starts offline, without a session and without
+/// an `owner`. Downloads never come through here: they call [`launch`] itself, so the flag
+/// never opens a download.
 pub fn launch_for_game(
     ep: &Endpoints,
     client_id: Option<&str>,
     store: &dyn SecretStore,
     accounts: &mut Accounts,
+    offline_without_owner: bool,
 ) -> Result<Launch, NoOwner> {
-    if accounts.selected().is_none() {
+    // An offline name plays: no account is picked for it, and it gets no session. (With no
+    // account selected, `launch` sets no session either: no account is the one that plays.)
+    let offline_name = offline_without_owner
+        && accounts.selected().is_none()
+        && accounts.offline_selected.is_some();
+    if accounts.selected().is_none() && !offline_name {
         accounts.selected = accounts.accounts.first().map(|a| a.uuid.clone());
     }
-    let pass = launch(ep, client_id, store, accounts)?;
+    let pass = match launch(ep, client_id, store, accounts) {
+        Ok(pass) => pass,
+        Err(refused) => {
+            if offline_without_owner {
+                return Ok(Launch::default());
+            }
+            return Err(refused);
+        }
+    };
+    if offline_name {
+        return Ok(pass);
+    }
     let owns = accounts
         .selected()
         .and_then(|a| secrets_in(store, &a.uuid))
         .is_some_and(|s| s.owns);
     if owns {
         Ok(pass)
+    } else if offline_without_owner {
+        Ok(Launch::default())
     } else {
         // Why that account can't play (it doesn't own the game, signed out, an unread keyring).
         Err(NoOwner {
@@ -344,6 +368,9 @@ pub struct GameSession {
     pub file: Option<PathBuf>,
     /// Why the account plays offline this time, if it does.
     pub offline: Option<String>,
+    /// The offline name that plays (`--name`); none while an account plays, or while the
+    /// game's own made-up name does.
+    pub name: Option<String>,
 }
 
 impl GameSession {
@@ -351,6 +378,9 @@ impl GameSession {
     pub fn apply(self, cmd: &mut std::process::Command) -> Option<String> {
         if let Some(file) = self.file {
             cmd.arg("--session-file").arg(file);
+        }
+        if let Some(name) = self.name {
+            cmd.arg("--name").arg(name);
         }
         if let Some(reason) = &self.offline {
             cmd.env("SUNRISE_OFFLINE_REASON", reason);
@@ -360,26 +390,34 @@ impl GameSession {
 }
 
 /// The owner gate for the game about to start, then the selected account's session in a file
-/// for it.
-pub fn session_for_game(game_home: &Path) -> Result<GameSession, NoOwner> {
+/// for it. `offline_without_owner`: see [`launch_for_game`].
+pub fn session_for_game(
+    game_home: &Path,
+    offline_without_owner: bool,
+) -> Result<GameSession, NoOwner> {
     let mut accounts = Accounts::load();
     let pass = launch_for_game(
         &Endpoints::live(),
         client_id().as_deref(),
         store(),
         &mut accounts,
+        offline_without_owner,
     )?;
     if let Err(e) = accounts.save_renewed() {
         eprintln!("Sunrise: the accounts are not saved: {e}");
     }
-    Ok(session_file(game_home, pass))
+    Ok(session_file(game_home, pass, &accounts))
 }
 
 /// [`session_for_game`] for the account that was selected when Play was accepted, `accepted`:
 /// installing, preparing and building can take minutes, and whoever is selected when they end
 /// must not be the one who plays. Which account is selected now is not touched. An account
 /// signed out meanwhile doesn't play, and no session file is written for it.
-pub fn session_for_game_accepted(game_home: &Path, accepted: &str) -> Result<GameSession, NoOwner> {
+pub fn session_for_game_accepted(
+    game_home: &Path,
+    accepted: &str,
+    offline_without_owner: bool,
+) -> Result<GameSession, NoOwner> {
     let mut accounts = Accounts::load();
     let pass = launch_accepted(
         &Endpoints::live(),
@@ -387,11 +425,12 @@ pub fn session_for_game_accepted(game_home: &Path, accepted: &str) -> Result<Gam
         store(),
         &mut accounts,
         accepted,
+        offline_without_owner,
     )?;
     if let Err(e) = accounts.save_renewed() {
         eprintln!("Sunrise: the accounts are not saved: {e}");
     }
-    Ok(session_file(game_home, pass))
+    Ok(session_file(game_home, pass, &accounts))
 }
 
 pub(super) fn launch_accepted(
@@ -400,10 +439,11 @@ pub(super) fn launch_accepted(
     store: &dyn SecretStore,
     accounts: &mut Accounts,
     accepted: &str,
+    offline_without_owner: bool,
 ) -> Result<Launch, NoOwner> {
     check_launch_account(accounts, accepted)?;
     let chosen = accounts.selected.replace(accepted.to_owned());
-    let pass = launch_for_game(ep, client_id, store, accounts);
+    let pass = launch_for_game(ep, client_id, store, accounts, offline_without_owner);
     accounts.selected = chosen;
     pass
 }
@@ -439,7 +479,7 @@ pub fn session_for_game_as(game_home: &Path, who: &str) -> Result<GameSession, S
     if let Err(e) = accounts.save_renewed() {
         eprintln!("Sunrise: the accounts are not saved: {e}");
     }
-    Ok(session_file(game_home, pass?))
+    Ok(session_file(game_home, pass?, &accounts))
 }
 
 /// The owner gate as `who`, on `accounts`, which keeps its choice of player.
@@ -451,17 +491,25 @@ pub(super) fn launch_as(
     who: &str,
 ) -> Result<Launch, String> {
     let chosen = accounts.selected.clone();
-    let pass = accounts
-        .play_as(who)
-        .and_then(|()| launch_for_game(ep, client_id, store, accounts).map_err(|e| e.to_string()));
+    let pass = accounts.play_as(who).and_then(|()| {
+        // `play --account` names a signed-in account: the gate stays strict for it.
+        launch_for_game(ep, client_id, store, accounts, false).map_err(|e| e.to_string())
+    });
     accounts.selected = chosen;
     pass
 }
 
 /// The game's session files for a launch that passed the gate.
-fn session_file(game_home: &Path, pass: Launch) -> GameSession {
+fn session_file(game_home: &Path, pass: Launch, accounts: &Accounts) -> GameSession {
     let mut out = GameSession {
         offline: pass.offline,
+        // The offline name that plays, if one does: the game is told it as `--name`. Only
+        // beside no session: an account's launch already carries who plays in its file.
+        name: if pass.session.is_none() {
+            accounts.name_arg().map(str::to_owned)
+        } else {
+            None
+        },
         ..GameSession::default()
     };
     if let Some((account, secrets)) = pass.session {

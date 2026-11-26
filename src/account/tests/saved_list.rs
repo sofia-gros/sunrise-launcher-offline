@@ -3,7 +3,7 @@
 use super::*;
 
 #[test]
-fn retired_account_and_settings_fields_are_ignored_on_load_without_deleting_files() {
+fn offline_names_survive_a_load_and_retired_fields_stay_retired() {
     let dir = std::env::temp_dir().join(format!("sunrise-retired-fields-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("skins")).unwrap();
@@ -21,23 +21,38 @@ fn retired_account_and_settings_fields_are_ignored_on_load_without_deleting_file
     let mut accounts = Accounts::load_from(&path);
     assert_eq!(accounts.accounts, vec![notch()]);
     assert!(accounts.selected().is_none());
+    // This fork keeps offline names: they load, and the one chosen plays.
+    assert_eq!(accounts.offline, ["Builder_1"]);
+    assert_eq!(accounts.player(), Player::Offline("Builder_1".into()));
     let (_, ep) = mock(|_| {});
-    let pass = launch_for_game(&ep, Some("test-client"), &store, &mut accounts).unwrap();
+    let pass = launch_for_game(&ep, Some("test-client"), &store, &mut accounts, false).unwrap();
     assert_eq!(pass.session.unwrap().0.uuid, UUID);
     accounts.save_to(&path).unwrap();
     let saved: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    // The names are written back; `looks` stays retired (offline names keep no look yet),
+    // and no file is deleted either way.
     assert_eq!(
         saved,
-        serde_json::json!({ "accounts": accounts.accounts, "selected": UUID })
+        serde_json::json!({
+            "accounts": accounts.accounts,
+            "selected": UUID,
+            "offline": ["Builder_1"],
+            "offline_selected": "Builder_1",
+        })
     );
     assert!(skin_file.is_file());
-    // Retired settings fields are ignored on load and not written back.
+    // Retired settings fields are ignored on load and not written back — except
+    // `dev_offline`, which this fork's OFFLINE_PLAY switches on at every load.
     let settings = crate::backend::Settings::parse(
         r#"{"dev_offline": true, "welcomed": true, "corners": 12, "keep_versions": 3}"#,
     );
     let saved = serde_json::to_value(&settings).unwrap();
-    assert!(saved.get("dev_offline").is_none(), "{saved}");
+    assert_eq!(
+        saved.get("dev_offline"),
+        Some(&serde_json::json!(crate::backend::OFFLINE_PLAY)),
+        "{saved}"
+    );
     assert!(saved.get("welcomed").is_none(), "{saved}");
     assert!(saved.get("corners").is_none(), "{saved}");
     assert_eq!(saved["keep_versions"], 3);
@@ -63,6 +78,7 @@ fn a_switch_is_saved_and_survives_a_restart() {
             named("c3", "Cinder"),
         ],
         selected: Some("a1".into()),
+        ..Accounts::default()
     }
     .save_to(&path)
     .unwrap();
@@ -182,6 +198,7 @@ fn accounts_can_be_reordered_and_persist_to_disk() {
             },
         ],
         selected: Some("b".into()),
+        ..Accounts::default()
     };
     accounts.save_to(&path).unwrap();
 

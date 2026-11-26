@@ -235,6 +235,13 @@ pub struct Settings {
     /// Show names alongside game profiles in the sidebar. Starts collapsed.
     #[serde(default)]
     pub sidebar_expanded: bool,
+    /// Developer options (hidden in upstream): offline names play without an account that
+    /// owns the game, in the window only (`account::Accounts::play_as_player`,
+    /// `account::launch_for_game`). Never a download: the game still comes from the player's
+    /// own install. This fork's [`OFFLINE_PLAY`](super::OFFLINE_PLAY) sets it on every load
+    /// (`parse`), so in this fork it is always on; absent from the file while off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dev_offline: bool,
 }
 
 impl Settings {
@@ -410,6 +417,9 @@ impl Settings {
             }
         }
         let mut settings: Self = serde_json::from_value(value).unwrap_or_default();
+        // This fork: offline play works without a Microsoft account, in the window and the
+        // CLI, so the developer option that carries it is on whatever the file says.
+        settings.dev_offline = super::OFFLINE_PLAY;
         if !accent_saved {
             settings.accent =
                 crate::themes::starting_accent(settings.theme.as_deref(), &settings.theme_accents);

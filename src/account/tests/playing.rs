@@ -160,12 +160,18 @@ fn the_game_plays_only_as_an_account_that_owns_it() {
     let store = MemoryStore::default();
     let (_, ep) = mock(|_| {});
     // No account: no game.
-    let refused = launch_for_game(&ep, Some("test-client"), &store, &mut Accounts::default());
+    let refused = launch_for_game(
+        &ep,
+        Some("test-client"),
+        &store,
+        &mut Accounts::default(),
+        false,
+    );
     assert_eq!(refused.unwrap_err(), NoOwner::default());
     // An owner, none selected: it plays, with its session.
     let mut accounts = signed_in(&store, &secrets("mc-token", true));
     accounts.selected = None;
-    let pass = launch_for_game(&ep, Some("test-client"), &store, &mut accounts).unwrap();
+    let pass = launch_for_game(&ep, Some("test-client"), &store, &mut accounts, false).unwrap();
     assert_eq!(pass.session.unwrap().0.name, "Notch");
     assert_eq!(accounts.selected.as_deref(), Some(UUID));
     // Another account plays: Notch owning the game doesn't let it play under a name of its own.
@@ -176,15 +182,50 @@ fn the_game_plays_only_as_an_account_that_owns_it() {
         cape: None,
     });
     accounts.play_as("other").unwrap();
-    let refused = launch_for_game(&ep, Some("test-client"), &store, &mut accounts).unwrap_err();
+    let refused =
+        launch_for_game(&ep, Some("test-client"), &store, &mut accounts, false).unwrap_err();
     assert!(refused
         .to_string()
         .starts_with("Alex is no longer signed in"));
     // The services say the account that plays doesn't own the game.
     let (_, ep) = mock(|m| m.owns_game = false);
     let mut accounts = signed_in(&store, &secrets("mc-token", true));
-    let refused = launch_for_game(&ep, Some("test-client"), &store, &mut accounts);
+    let refused = launch_for_game(&ep, Some("test-client"), &store, &mut accounts, false);
     assert_eq!(refused.unwrap_err(), NoOwner::default());
+}
+
+#[test]
+fn an_offline_name_plays_without_an_owner_only_with_the_forks_pass() {
+    let store = MemoryStore::default();
+    let (_, ep) = mock(|_| {});
+    // A kept offline name, no account at all: the strict gate refuses, the pass starts the
+    // game with no session and no account picked for it.
+    let mut accounts = Accounts::default();
+    accounts
+        .play_as_player(&store, Player::Offline("Builder_1".into()), true)
+        .unwrap();
+    assert_eq!(accounts.player(), Player::Offline("Builder_1".into()));
+    let refused = launch_for_game(
+        &ep,
+        Some("test-client"),
+        &store,
+        &mut accounts.clone(),
+        false,
+    );
+    assert_eq!(refused.unwrap_err(), NoOwner::default());
+    let pass = launch_for_game(&ep, Some("test-client"), &store, &mut accounts, true).unwrap();
+    assert!(pass.session.is_none() && pass.owner.is_none());
+    assert_eq!(
+        accounts.selected, None,
+        "no account is picked for an offline name"
+    );
+    assert_eq!(accounts.name_arg(), Some("Builder_1"));
+    // Without the pass, choosing an offline name beside no owner is refused at the switch.
+    let mut fresh = Accounts::default();
+    assert!(fresh
+        .play_as_player(&store, Player::Offline("Builder_1".into()), false)
+        .is_err());
+    assert!(fresh.offline.is_empty());
 }
 
 #[test]
@@ -373,17 +414,38 @@ fn play_starts_as_the_account_it_was_pressed_for_whoever_is_selected_since() {
     // Reading whoever is selected at sign-in, as Play did, answers for Alex.
     let mut as_selected = accounts.clone();
     assert!(
-        launch_for_game(&offline(), Some("test-client"), &store, &mut as_selected).is_err(),
+        launch_for_game(
+            &offline(),
+            Some("test-client"),
+            &store,
+            &mut as_selected,
+            false
+        )
+        .is_err(),
         "the selected account is Alex, who can't play"
     );
     // The accepted account plays, and the switcher's choice stays.
-    let pass =
-        launch_accepted(&offline(), Some("test-client"), &store, &mut accounts, UUID).unwrap();
+    let pass = launch_accepted(
+        &offline(),
+        Some("test-client"),
+        &store,
+        &mut accounts,
+        UUID,
+        false,
+    )
+    .unwrap();
     assert!(pass.offline.is_some());
     assert_eq!(accounts.selected.as_deref(), Some(alex));
     // Signed out before the game started: nobody plays in its place.
     accounts.remove(&store, UUID).unwrap();
-    let gone = launch_accepted(&offline(), Some("test-client"), &store, &mut accounts, UUID);
+    let gone = launch_accepted(
+        &offline(),
+        Some("test-client"),
+        &store,
+        &mut accounts,
+        UUID,
+        false,
+    );
     assert!(gone.unwrap_err().keyring.unwrap().contains("signed out"));
     assert_eq!(accounts.selected.as_deref(), Some(alex));
 }

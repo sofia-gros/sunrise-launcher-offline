@@ -304,6 +304,7 @@ impl Launcher {
         self.args_focused = self.args_focus.is_focused(window);
         self.proxy_focused = self.proxy_focus.is_focused(window);
         self.corners_focused = self.corners_focus.is_focused(window);
+        self.offline_focused = self.offline_focus.is_focused(window);
         let was_typing_limit = self.cache_focused;
         self.cache_focused = self.cache_focus.is_focused(window);
         if was_typing_limit && !self.cache_focused {

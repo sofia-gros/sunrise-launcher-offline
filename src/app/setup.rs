@@ -147,6 +147,9 @@ impl Launcher {
             corners_focused: false,
             corners_slider: crate::slider::Slider::default(),
             corners_focus: cx.focus_handle().tab_index(0).tab_stop(true),
+            offline_input: line_edit::LineEdit::new(String::new(), 16, 20),
+            offline_focused: false,
+            offline_focus: cx.focus_handle().tab_index(0).tab_stop(true),
             cache_input: line_edit::LineEdit::new(
                 crate::settings::cache_limit_text(settings.cache_limit_gib),
                 5,

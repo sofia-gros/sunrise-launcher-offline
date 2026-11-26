@@ -358,6 +358,10 @@ struct Launcher {
     corners_focused: bool,
     corners_focus: FocusHandle,
     corners_slider: slider::Slider,
+    /// Settings › Account › Offline names: the name being typed, its focus state and handle.
+    offline_input: line_edit::LineEdit,
+    offline_focused: bool,
+    offline_focus: FocusHandle,
     /// Settings › Storage › Keep at most, typed in GB: applied when the field is left, as a
     /// smaller limit clears downloads at once.
     cache_input: line_edit::LineEdit,

@@ -7,6 +7,33 @@ pub struct Accounts {
     pub accounts: Vec<Account>,
     /// The UUID of the account the game starts with; none: the first one.
     pub selected: Option<String>,
+    /// Offline names the player keeps, to switch between (`--name`): no account, no session.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offline: Vec<String>,
+    /// The offline name that plays when no account is selected; none: the name the game made
+    /// up (`sunrise-player.txt`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline_selected: Option<String>,
+}
+
+/// Who plays, as the quick switch lists them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Player {
+    /// A Microsoft account, by UUID.
+    Microsoft(String),
+    /// An offline name.
+    Offline(String),
+    /// Offline as the name the game made up.
+    GameName,
+}
+
+const OFFLINE_NEEDS_OWNER: &str =
+    "Offline names need a Microsoft account that owns Minecraft: Java Edition in the launcher.";
+
+/// Whether `name` can be an offline name: 3 to 16 letters, digits or `_`, as account names are.
+pub fn valid_offline_name(name: &str) -> bool {
+    (3..=16).contains(&name.chars().count())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// The secrets an account keeps in `store`, if it still has them there.
@@ -162,6 +189,113 @@ impl Accounts {
         }
         self.selected = Some(uuid.to_string());
         Ok(())
+    }
+
+    /// Who plays now.
+    pub fn player(&self) -> Player {
+        match (self.selected(), &self.offline_selected) {
+            (Some(a), _) => Player::Microsoft(a.uuid.clone()),
+            (None, Some(name)) => Player::Offline(name.clone()),
+            (None, None) => Player::GameName,
+        }
+    }
+
+    /// Plays as `who`: an account, an offline name (kept, only beside an account that owns
+    /// the game), or the game's own name. `offline_without_owner` (this fork's
+    /// `backend::OFFLINE_PLAY`, through `Settings::dev_offline`) lets an offline name play
+    /// without an account that owns the game.
+    pub fn play_as_player(
+        &mut self,
+        store: &dyn SecretStore,
+        who: Player,
+        offline_without_owner: bool,
+    ) -> Result<(), String> {
+        match who {
+            Player::Microsoft(uuid) => self.play_as(&uuid),
+            Player::Offline(name) => {
+                if !offline_without_owner && !self.has_owner(store) {
+                    return Err(OFFLINE_NEEDS_OWNER.into());
+                }
+                let name = self.add_offline(&name)?;
+                self.selected = None;
+                self.offline_selected = Some(name);
+                Ok(())
+            }
+            Player::GameName => {
+                self.selected = None;
+                self.offline_selected = None;
+                Ok(())
+            }
+        }
+    }
+
+    /// Keeps an offline name (once, in any case); returns it as kept.
+    fn add_offline(&mut self, name: &str) -> Result<String, String> {
+        let name = name.trim();
+        if !valid_offline_name(name) {
+            return Err(format!(
+                "{name}: an offline name is 3 to 16 letters, digits or _"
+            ));
+        }
+        if let Some(kept) = self.offline.iter().find(|n| n.eq_ignore_ascii_case(name)) {
+            return Ok(kept.clone());
+        }
+        self.offline.push(name.to_string());
+        Ok(name.to_string())
+    }
+
+    /// Forgets an offline name; if it was playing, the game's own name plays. (A name's own
+    /// skin is a later step: offline names keep no look yet.)
+    pub fn remove_offline(&mut self, name: &str) -> Result<(), String> {
+        let before = self.offline.len();
+        self.offline.retain(|n| !n.eq_ignore_ascii_case(name));
+        if self.offline.len() == before {
+            return Err(format!("No offline name {name}."));
+        }
+        if self
+            .offline_selected
+            .as_ref()
+            .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        {
+            self.offline_selected = None;
+        }
+        Ok(())
+    }
+
+    /// The game's `--name` for this run: the offline name, when one plays.
+    pub fn name_arg(&self) -> Option<&str> {
+        match self.selected() {
+            Some(_) => None,
+            None => self.offline_selected.as_deref(),
+        }
+    }
+
+    /// Switches who plays to `who`, on disk: the list as it is saved now with that player
+    /// chosen, saved again. The window keeps what this returns.
+    pub fn switch_player(who: Player, offline_without_owner: bool) -> Result<Self, String> {
+        Self::switch_player_in(&Self::path(), store(), who, offline_without_owner)
+    }
+    pub(crate) fn switch_player_in(
+        path: &Path,
+        store: &dyn SecretStore,
+        who: Player,
+        offline_without_owner: bool,
+    ) -> Result<Self, String> {
+        let mut accounts = Self::load_from(path);
+        accounts.play_as_player(store, who, offline_without_owner)?;
+        accounts.save_to(path)?;
+        Ok(accounts)
+    }
+
+    /// Forgets the offline name `name`, on disk, and returns the saved list.
+    pub fn forget_offline(name: &str) -> Result<Self, String> {
+        Self::forget_offline_in(&Self::path(), name)
+    }
+    pub(crate) fn forget_offline_in(path: &Path, name: &str) -> Result<Self, String> {
+        let mut accounts = Self::load_from(path);
+        accounts.remove_offline(name)?;
+        accounts.save_to(path)?;
+        Ok(accounts)
     }
 
     /// Switches who plays to `uuid`, on disk: the list as it is saved now with that account
