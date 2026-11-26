@@ -19,6 +19,17 @@ use sunrise_launcher::{
 
 use sunrise_launcher::browser::sunrise::sources::{self, Source, SourceCommit};
 
+/// Whether installs have a player to install for: an account or an offline name is
+/// who plays (`Accounts::player`), or the developer's offline mode is on — the same
+/// test Play uses (`launch_state`'s `play_has_player`), so who can play can also
+/// install the mods they play with. The game's own made-up name is nobody the
+/// launcher chose, so with nothing selected installs still ask for a sign-in.
+/// Nothing behind the install path checks a credential: the registry index and the
+/// packages are public downloads, so this test is the whole gate.
+pub(crate) fn install_has_player(accounts: &Accounts, developer_offline: bool) -> bool {
+    !matches!(accounts.player(), account::Player::GameName) || developer_offline
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) enum SourcePicks {
     One(Box<SourceCommit>),
@@ -1041,7 +1052,10 @@ impl Launcher {
     }
 
     pub(crate) fn github_target(&self) -> Result<GithubTarget, String> {
-        if self.accounts.selected().is_none() && !sunrise_launcher::developer_offline::selected() {
+        if !install_has_player(
+            &self.accounts,
+            sunrise_launcher::developer_offline::selected(),
+        ) {
             return Err(tr("Installs after you sign in").into());
         }
         if let Some(why) = self.mods_locked() {
@@ -1197,8 +1211,10 @@ impl Launcher {
             return Ok(());
         }
         if kind == Kind::InstallV2
-            && self.accounts.selected().is_none()
-            && !sunrise_launcher::developer_offline::selected()
+            && !install_has_player(
+                &self.accounts,
+                sunrise_launcher::developer_offline::selected(),
+            )
         {
             return Err(tr("Installs after you sign in").into());
         }
@@ -1736,6 +1752,32 @@ mod tests {
         let preparing = InstallProgress::Minecraft(PrepareStep::Prepare, None);
         assert_eq!(stage_label(preparing), "Preparing Minecraft's files…");
         assert_eq!(stage_fraction(preparing), None);
+    }
+
+    #[test]
+    fn an_offline_name_is_a_player_for_installs_and_nothing_selected_is_not() {
+        // No account at all, an offline name chosen: installs have a player.
+        let offline = Accounts {
+            offline: vec!["Builder_1".into()],
+            offline_selected: Some("Builder_1".into()),
+            ..Accounts::default()
+        };
+        assert!(install_has_player(&offline, false));
+        // A selected account is a player, as before.
+        let account = Accounts {
+            accounts: vec![account::Account {
+                uuid: "abc".into(),
+                name: "Ludo".into(),
+                skin: None,
+                cape: None,
+            }],
+            selected: Some("abc".into()),
+            ..Accounts::default()
+        };
+        assert!(install_has_player(&account, false));
+        // Nothing selected: only the developer's offline mode lets installs start.
+        assert!(!install_has_player(&Accounts::default(), false));
+        assert!(install_has_player(&Accounts::default(), true));
     }
 
     #[test]
