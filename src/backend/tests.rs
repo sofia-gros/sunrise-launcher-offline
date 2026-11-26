@@ -2794,12 +2794,23 @@ fn an_app_bundle_updates_in_place() {
     use std::os::unix::fs::PermissionsExt;
     let work = std::env::temp_dir().join(format!("sunrise-bundle-{}", std::process::id()));
     let _ = fs::remove_dir_all(&work);
+    fs::create_dir_all(&work).unwrap();
+    let source = work.join("true.c");
+    fs::write(&source, "int main(void) { return 0; }\n").unwrap();
     let make = |dir: &Path, version: &str| {
         let app = dir.join("Sunrise.app");
         fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
         fs::create_dir_all(app.join("Contents/Resources")).unwrap();
         let bin = app.join("Contents/MacOS").join(crate::identity::EXECUTABLE);
-        fs::copy("/usr/bin/true", &bin).unwrap();
+        // Built here, not a copy of /usr/bin/true: that is an arm64e system program, which
+        // macOS stops running once re-signed ad hoc below unless System Integrity Protection is off.
+        let built = Command::new("cc")
+            .arg(&source)
+            .arg("-o")
+            .arg(&bin)
+            .status()
+            .unwrap();
+        assert!(built.success());
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
         fs::write(app.join("Contents/Resources/version"), version).unwrap();
         fs::write(

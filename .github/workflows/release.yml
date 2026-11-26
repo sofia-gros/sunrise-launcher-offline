@@ -93,7 +93,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.decide.outputs.matrix) }}
-    runs-on: ${{ matrix.mac && 'macos-latest' || matrix.os }}
+    # BLACKSMITH_RELEASE=on (a repository variable; unset or anything else is off) builds each shipped platform on its
+    # Blacksmith machine (`blacksmith` in tools/launcher_build_matrix.py: the same images as GitHub's, Linux on the same
+    # Ubuntu 22.04 and so the same glibc). The jobs that attest, draft and publish stay on GitHub's runners.
+    runs-on: ${{ vars.BLACKSMITH_RELEASE == 'on' && matrix.blacksmith || (matrix.mac && 'macos-latest' || matrix.os) }}
     timeout-minutes: 40
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
@@ -131,6 +134,17 @@ jobs:
             echo "::notice::No Metal toolchain on this runner: GPUI compiles its shaders at run time"
             echo "LAUNCHER_FEATURES=gpui_platform/runtime_shaders" >> "$GITHUB_ENV"
           fi
+      - name: OpenSSL 3 for tools/ci/sign_release.sh
+        # Its test signs with `openssl pkeyutl -rawin`, which a Mac's own openssl (LibreSSL) lacks: the `openssl` on
+        # Blacksmith's macOS 15 PATH refused it (run 45747334584). Name Homebrew's OpenSSL 3 on every Mac.
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: |
+          brew list openssl@3 > /dev/null 2>&1 || brew install openssl@3
+          openssl="$(brew --prefix openssl@3)/bin/openssl"
+          "$openssl" version
+          echo "OPENSSL=$openssl" >> "$GITHUB_ENV"
       - name: Keep the tests away from this runner's own folders
         run: |
           for name in SUNRISE_HOME SUNRISE_LAUNCHER_HOME XDG_DATA_HOME XDG_CONFIG_HOME SUNRISE_LAUNCHER_TRASH SUNRISE_LAUNCHER_CLIPBOARD SUNRISE_LAUNCHER_DESKTOP; do
