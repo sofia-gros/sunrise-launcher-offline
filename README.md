@@ -3,6 +3,8 @@
 >
 > **What this fork does:** it enables **OFFLINE_PLAY** — playing from **YOUR OWN** Minecraft assets under an offline name, without Microsoft profile authentication. The goal of this fork is to return local account play with your own legally obtained game resources. This launcher ships no Minecraft files.
 >
+> **You must own a legitimate copy of Minecraft: Java Edition to use this launcher.**
+>
 > **Downloading still needs an owner account.** Downloading the game and the Mojang assets through this launcher still requires signing in with an account that owns Minecraft: Java Edition. You need your own legally obtained copy of the game; this fork does not provide one.
 >
 > **Limits of offline names:** an offline name works for single-player, LAN play and offline-mode servers. Online-mode servers, Realms and other authenticated services still require a legitimate Microsoft account that owns the game.
