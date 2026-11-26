@@ -48,7 +48,10 @@ impl Launcher {
     }
 
     pub(crate) fn github_target(&self) -> Result<GithubTarget, String> {
-        if self.accounts.selected().is_none() && !sunrise_launcher::developer_offline::selected() {
+        if !install_has_player(
+            &self.accounts,
+            sunrise_launcher::developer_offline::selected(),
+        ) {
             return Err(tr("Installs after you sign in").into());
         }
         if let Some(why) = self.mods_locked() {
@@ -167,8 +170,10 @@ impl Launcher {
             return Ok(());
         }
         if kind == Kind::InstallV2
-            && self.accounts.selected().is_none()
-            && !sunrise_launcher::developer_offline::selected()
+            && !install_has_player(
+                &self.accounts,
+                sunrise_launcher::developer_offline::selected(),
+            )
         {
             return Err(tr("Installs after you sign in").into());
         }

@@ -32,9 +32,9 @@ impl Launcher {
         let status = if pinned.is_some() {
             Some(tr("Stays on this build"))
         } else if plays.is_none() {
-            let signed_in = self.accounts.selected().is_some()
+            let has_player = !matches!(self.accounts.player(), account::Player::GameName)
                 || sunrise_launcher::developer_offline::selected();
-            Some(if signed_in {
+            Some(if has_player {
                 tr("Not installed yet")
             } else {
                 tr("Installs after you sign in")

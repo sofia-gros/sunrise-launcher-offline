@@ -26,6 +26,17 @@ mod source_queue;
 use cards::{failure_line, notice_failure};
 pub(crate) use cards::{stage_fraction, stage_label};
 
+/// Whether installs have a player to install for: an account or an offline name is
+/// who plays (`Accounts::player`), or the developer's offline mode is on — the same
+/// test Play uses (`launch_state`'s `play_has_player`), so who can play can also
+/// install the mods they play with. The game's own made-up name is nobody the
+/// launcher chose, so with nothing selected installs still ask for a sign-in.
+/// Nothing behind the install path checks a credential: the registry index and the
+/// packages are public downloads, so this test is the whole gate.
+pub(crate) fn install_has_player(accounts: &Accounts, developer_offline: bool) -> bool {
+    !matches!(accounts.player(), account::Player::GameName) || developer_offline
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) enum SourcePicks {
     One(Box<SourceCommit>),

@@ -15,6 +15,32 @@ fn a_build_preparation_names_its_step_and_counts_mojangs_files() {
 }
 
 #[test]
+fn an_offline_name_is_a_player_for_installs_and_nothing_selected_is_not() {
+    // No account at all, an offline name chosen: installs have a player.
+    let offline = Accounts {
+        offline: vec!["Builder_1".into()],
+        offline_selected: Some("Builder_1".into()),
+        ..Accounts::default()
+    };
+    assert!(install_has_player(&offline, false));
+    // A selected account is a player, as before.
+    let account = Accounts {
+        accounts: vec![account::Account {
+            uuid: "abc".into(),
+            name: "Ludo".into(),
+            skin: None,
+            cape: None,
+        }],
+        selected: Some("abc".into()),
+        ..Accounts::default()
+    };
+    assert!(install_has_player(&account, false));
+    // Nothing selected: only the developer's offline mode lets installs start.
+    assert!(!install_has_player(&Accounts::default(), false));
+    assert!(install_has_player(&Accounts::default(), true));
+}
+
+#[test]
 fn a_failed_install_says_why_in_a_dialog_not_on_the_card() {
     let root = homes();
     let installs = with_running(root.path());
