@@ -205,6 +205,32 @@ fn signed_out_play_is_disabled_and_only_its_tooltip_says_why() {
 }
 
 #[test]
+fn an_offline_name_is_a_player_for_play_and_nothing_selected_is_not() {
+    // No account at all, an offline name chosen: Play has a player.
+    let offline = Accounts {
+        offline: vec!["Builder_1".into()],
+        offline_selected: Some("Builder_1".into()),
+        ..Accounts::default()
+    };
+    assert!(play_has_player(&offline, false));
+    // A selected account is a player, as before.
+    let account = Accounts {
+        accounts: vec![account::Account {
+            uuid: "abc".into(),
+            name: "Ludo".into(),
+            skin: None,
+            cape: None,
+        }],
+        selected: Some("abc".into()),
+        ..Accounts::default()
+    };
+    assert!(play_has_player(&account, false));
+    // Nothing selected: only the developer's offline Play lets Play start.
+    assert!(!play_has_player(&Accounts::default(), false));
+    assert!(play_has_player(&Accounts::default(), true));
+}
+
+#[test]
 fn play_can_be_pressed_unless_something_is_under_way_or_the_data_is_lost() {
     assert!(idle().view().enabled);
     // Stop and the first install are presses too.

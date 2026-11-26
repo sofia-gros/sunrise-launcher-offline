@@ -28,7 +28,7 @@ pub(crate) struct Facts {
     pub registry_accepts_play: bool,
     /// The game runs.
     pub running: bool,
-    /// An account is selected, or the developer's offline Play is on.
+    /// An account or an offline name is selected, or the developer's offline Play is on.
     pub signed_in: bool,
     /// The selected profile has an installed build to play.
     pub installed: bool,
@@ -464,6 +464,14 @@ pub(crate) fn location_allows_action(located: bool, busy: bool) -> bool {
     located && !busy
 }
 
+/// Whether Play has a player to start as: an account or an offline name is who plays
+/// (`Accounts::player`), or the developer's offline Play is on. The game's own made-up
+/// name is nobody the launcher chose, so it does not count: with nothing selected,
+/// Play stays off.
+fn play_has_player(accounts: &Accounts, developer_offline: bool) -> bool {
+    !matches!(accounts.player(), account::Player::GameName) || developer_offline
+}
+
 impl Launcher {
     /// The selected profile's channel, when its last build failed because the build it stays on
     /// has no mod tools any more and another build is the way on (`sdk_cache::way_on`).
@@ -499,8 +507,10 @@ impl Launcher {
         let launch = self.ui.home.mods.launch();
         let held = self.held_update();
         Facts {
-            signed_in: self.accounts.selected().is_some()
-                || sunrise_launcher::developer_offline::selected(),
+            signed_in: play_has_player(
+                &self.accounts,
+                sunrise_launcher::developer_offline::selected(),
+            ),
             installed: active.and_then(|i| self.version_of(i)).is_some(),
             located: !self.location_unavailable,
             client_error: self.client_error.clone(),
