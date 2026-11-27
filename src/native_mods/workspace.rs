@@ -460,12 +460,13 @@ impl Workspace {
                     && file == mingw.join(name)
                     && regular_under(&mingw, &file).is_ok()
             };
-            let produced = (stamped && file.starts_with(&work))
-                || (!stamped
-                    && built.route == tool::CheckRoute::Prebuilt
-                    && file.starts_with(&joined_runtime));
-            let source = if dynamic
-                && ((produced && regular_under(&work, &file).is_ok())
+            let source = if stamped {
+                regular_under(&work, &file)?;
+                file.clone()
+            } else if dynamic
+                && ((built.route == tool::CheckRoute::Prebuilt
+                    && file.starts_with(&joined_runtime)
+                    && regular_under(&work, &file).is_ok())
                     || runtime()
                     || standard()
                     || gnu())

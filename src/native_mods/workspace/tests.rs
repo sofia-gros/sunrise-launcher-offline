@@ -882,6 +882,7 @@ fn a_persistent_build_binds_each_output_to_the_one_root_it_belongs_to() {
     let in_other_work = work.join("elsewhere/libelsewhere.so.1");
     let in_other_slot = build.join("native/w/another-slot/prebuilt-build/key/target/libother.so.1");
     let stamped_in_cargo = cargo.join("libgreeter.so");
+    let stamped_in_runtime = package.runtime.join("lib/libgreeter.so");
     let all = [
         &binary,
         &patch,
@@ -895,6 +896,7 @@ fn a_persistent_build_binds_each_output_to_the_one_root_it_belongs_to() {
         &in_other_work,
         &in_other_slot,
         &stamped_in_cargo,
+        &stamped_in_runtime,
     ];
     for file in all {
         fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -954,6 +956,7 @@ fn a_persistent_build_binds_each_output_to_the_one_root_it_belongs_to() {
         verify(&stamped_in_cargo, &[]).is_err(),
         "a stamped library is the SDK's output, from the work folder only"
     );
+    assert!(verify(&stamped_in_runtime, &[]).is_err());
     #[cfg(unix)]
     {
         use std::os::unix::fs::symlink;
