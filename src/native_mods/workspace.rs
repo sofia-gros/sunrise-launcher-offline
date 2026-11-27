@@ -61,6 +61,10 @@ static UNPROVED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default
 /// Even another slot must not use the shared Cargo home after an unproved compiler exit.
 static CARGO_HOME_UNPROVED: AtomicBool = AtomicBool::new(false);
 
+pub(super) fn cargo_home_unproved() -> bool {
+    CARGO_HOME_UNPROVED.load(Ordering::Relaxed)
+}
+
 /// Which game build a persistent work folder belongs to: its commit, the Rust target, the side
 /// and the Rust version. Never a mod set or a profile: Cargo's own fingerprints decide what a
 /// different set rebuilds, and every set on one game build shares the folder. The folder's name

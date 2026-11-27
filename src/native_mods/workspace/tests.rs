@@ -906,11 +906,94 @@ fn an_unproved_exit_skips_the_slot_in_memory_only_until_the_next_start() {
     assert!(!next.work().join("kept").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn native_lock_uses_workspace_cargo_home_after_unproved_stop() {
+    use super::super::{
+        lock_missing_manifests, CompileAttempt,
+        Target::{Client, Server},
+    };
+    use std::os::unix::fs::PermissionsExt;
+
+    if !in_child("native_lock_uses_workspace_cargo_home_after_unproved_stop") {
+        return;
+    }
+    let (dir, lease, build) = leased();
+    let native = build.join("native");
+    let program = dir.path().join("sdk");
+    fs::write(
+        &program,
+        r#"#!/bin/sh
+set -eu
+[ "$1" = native-lock ]
+read -r plan
+printf '%s\n' "$plan" > "$TMPDIR/lock-plan.json"
+printf '%s\n' "$CARGO_HOME" > "$TMPDIR/lock-cargo-home"
+mod_dir=$(printf '%s' "$plan" | sed -n 's/.*"mods":"\([^"]*\)".*/\1/p')
+printf 'version = 4\n' > "$mod_dir/Cargo.lock"
+printf '{"contract":2,"lock":"%s/Cargo.lock"}\n' "$mod_dir"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+    let rust = crate::rust_toolchain::Toolchain {
+        dir: dir.path().join("rust"),
+        host: crate::rust_toolchain::host().unwrap(),
+    };
+    let package = Package::at(dir.path());
+    let mut stopped = Workspace::new(&native).unwrap();
+    assert!(stopped.attach(&lease, key(Client)).unwrap());
+    stopped.allow_worker();
+    stopped.note_unproved();
+    assert!(cargo_home_unproved());
+
+    let mut another = Workspace::new(&native).unwrap();
+    assert!(another
+        .attach(&lease, key(Server).usable(false).unwrap())
+        .unwrap());
+    let compiled = another.path().join("mods.compile");
+    fs::create_dir_all(compiled.join("greeter")).unwrap();
+    let cancel = tool::Cancellation::default();
+    let attempt = CompileAttempt {
+        rust: &rust,
+        program: &program,
+        lease: &lease,
+        work_root: &native,
+        package: &package,
+        compiled: &compiled,
+        mod_ids: &["greeter"],
+        target: Server,
+        mixins_from_source: false,
+        cancellation: &cancel,
+        staging: None,
+    };
+    lock_missing_manifests(&attempt, &another).unwrap();
+    assert!(compiled.join("greeter/Cargo.lock").is_file());
+    let tmp = another.path().join("tmp");
+    let isolated_cargo = another.path().join("cargo");
+    let plan: serde_json::Value =
+        serde_json::from_slice(&fs::read(tmp.join("lock-plan.json")).unwrap()).unwrap();
+    assert_eq!(
+        plan["toolchain"]["cargo_home"],
+        serde_json::json!(isolated_cargo)
+    );
+    assert_eq!(
+        fs::read_to_string(tmp.join("lock-cargo-home"))
+            .unwrap()
+            .trim_end(),
+        isolated_cargo.to_str().unwrap()
+    );
+    assert_ne!(isolated_cargo, build.join("cargo"));
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "daily; build the launcher binary first"]
 fn persistent_sdk_process_uses_fresh_retry_tmp_and_isolates_cargo_after_stop() {
-    use super::super::Target::{Client, Server};
+    use super::super::{
+        run_compile_attempt, CompileAttempt, Failed,
+        Target::{Client, Server},
+    };
     use std::os::unix::fs::PermissionsExt;
 
     if !in_child("persistent_sdk_process_uses_fresh_retry_tmp_and_isolates_cargo_after_stop") {
@@ -921,8 +1004,16 @@ fn persistent_sdk_process_uses_fresh_retry_tmp_and_isolates_cargo_after_stop() {
     let program = dir.path().join("sdk");
     fs::write(&program, r#"#!/bin/sh
 set -eu
-[ "$1" = native-build ]
 read -r plan
+if [ "$1" = native-lock ]; then
+    printf '%s\n' "$plan" > "$TMPDIR/lock-plan.json"
+    printf '%s\n' "$CARGO_HOME" > "$TMPDIR/lock-cargo-home"
+    mod_dir=$(printf '%s' "$plan" | sed -n 's/.*"mods":"\([^"]*\)".*/\1/p')
+    printf 'version = 4\n' > "$mod_dir/Cargo.lock"
+    printf '{"contract":2,"lock":"%s/Cargo.lock"}\n' "$mod_dir"
+    exit 0
+fi
+[ "$1" = native-build ]
 printf '%s\n' "$plan" > "$TMPDIR/plan.json"
 printf '%s\n' "$CARGO_HOME" > "$TMPDIR/cargo-home"
 printf '%s\n' "$TMPDIR" > "$(dirname "$0")/last-tmp"
@@ -944,31 +1035,36 @@ printf '%s\n' '{"event":"built","route":"prebuilt-api","binary":"unused","librar
         dir: dir.path().join("rust"),
         host: crate::rust_toolchain::host().unwrap(),
     };
+    let package = Package::at(dir.path());
     let run = |stage: &mut Workspace,
+               compiled: &Path,
+               target: super::super::Target,
                cancel: &tool::Cancellation,
                on_mod: &dyn Fn(&str, usize, usize)| {
-        let work = stage.work();
-        let result = tool::build(
-            &rust,
-            &program,
-            tool::Plan {
-                work: &work,
-                workspace: stage,
-                package: tool::Package {
-                    runtime: dir.path(),
-                    api: dir.path(),
-                    engine: dir.path(),
-                },
-                mods: dir.path(),
-                server: false,
-                mixins_from_source: false,
-            },
+        let attempt = CompileAttempt {
+            rust: &rust,
+            program: &program,
+            lease: &lease,
+            work_root: &native,
+            package: &package,
+            compiled,
+            mod_ids: &["greeter"],
+            target,
+            mixins_from_source: false,
+            cancellation: cancel,
+            staging: None,
+        };
+        run_compile_attempt(
+            &attempt,
+            stage,
+            |_| Ok(()),
             on_mod,
-            cancel,
-            None,
-        );
-        stage.note_unproved();
-        result
+            |failure| Failed::Tool {
+                error: failure.error,
+                retryable: false,
+            },
+            |_, _| Ok(Vec::new()),
+        )
     };
     let assert_plan = |stage: &Workspace, tmp: &Path, cargo: &Path| {
         let plan: serde_json::Value =
@@ -982,23 +1078,35 @@ printf '%s\n' '{"event":"built","route":"prebuilt-api","binary":"unused","librar
             cargo.to_str().unwrap()
         );
     };
+    let assert_lock = |tmp: &Path, cargo: &Path| {
+        let plan: serde_json::Value =
+            serde_json::from_slice(&fs::read(tmp.join("lock-plan.json")).unwrap()).unwrap();
+        assert_eq!(plan["toolchain"]["cargo_home"], serde_json::json!(cargo));
+        assert_eq!(
+            fs::read_to_string(tmp.join("lock-cargo-home"))
+                .unwrap()
+                .trim_end(),
+            cargo.to_str().unwrap()
+        );
+    };
     let client = key(Client);
     fs::write(dir.path().join("slot"), client.as_str()).unwrap();
     let mut stage = Workspace::new(&native).unwrap();
     assert!(stage.attach(&lease, client.clone()).unwrap());
     fs::write(stage.work().join("warm"), b"stale").unwrap();
     assert!(stage.attach(&lease, client.clone()).unwrap());
+    let first_compiled = stage.path().join("mods.compile");
+    fs::create_dir_all(first_compiled.join("greeter")).unwrap();
     let cancellation = tool::Cancellation::default();
     let no_mod = |_: &str, _: usize, _: usize| unreachable!();
-    let failed = run(&mut stage, &cancellation, &no_mod).unwrap_err();
-    assert_eq!(failed.error, "stale work");
+    // Production orchestration locks the lockless mod, hits the warm-slot failure, retries cold
+    // automatically in a fresh retry tmp, and succeeds.
+    let (built, _) = run(&mut stage, &first_compiled, Client, &cancellation, &no_mod).unwrap();
+    assert_eq!(built.route, tool::CheckRoute::PrebuiltApi);
+    assert!(first_compiled.join("greeter/Cargo.lock").is_file());
     let first_tmp = stage.path().join("tmp");
+    assert_lock(&first_tmp, &build.join("cargo"));
     assert_plan(&stage, &first_tmp, &build.join("cargo"));
-    assert!(stage.retry_cold(&lease).unwrap());
-    assert_eq!(
-        run(&mut stage, &cancellation, &no_mod).unwrap().route,
-        tool::CheckRoute::PrebuiltApi
-    );
     let retry_tmp = fs::read_to_string(dir.path().join("last-tmp")).unwrap();
     let retry_tmp = Path::new(retry_tmp.trim_end());
     assert_ne!(first_tmp.as_path(), retry_tmp);
@@ -1010,19 +1118,36 @@ printf '%s\n' '{"event":"built","route":"prebuilt-api","binary":"unused","librar
     fs::write(stage.work().join("kept"), b"output").unwrap();
     assert!(stage.attach(&lease, client.clone()).unwrap());
     let stop = tool::Cancellation::default();
-    assert!(run(&mut stage, &stop, &|_, _, _| stop.stop()).is_err());
+    assert!(
+        run(&mut stage, &first_compiled, Client, &stop, &|_, _, _| stop
+            .stop())
+        .is_err()
+    );
     assert!(stop.is_stopped());
     assert!(client.usable(false).is_none());
     assert!(!stage.retry_cold(&lease).unwrap());
     assert!(stage.work().join("kept").is_file());
 
+    // After an unproved stop, both `native-lock` for a lockless mod and `native-build` must
+    // use the next workspace's isolated Cargo home rather than the shared `<build>/cargo`.
     fs::remove_file(dir.path().join("stop")).unwrap();
     let mut another = Workspace::new(&native).unwrap();
     assert!(another
         .attach(&lease, key(Server).usable(false).unwrap())
         .unwrap());
     assert_ne!(another.work(), stage.work());
-    run(&mut another, &cancellation, &no_mod).unwrap();
+    let another_compiled = another.path().join("mods.compile");
+    fs::create_dir_all(another_compiled.join("greeter")).unwrap();
+    run(
+        &mut another,
+        &another_compiled,
+        Server,
+        &cancellation,
+        &no_mod,
+    )
+    .unwrap();
+    assert!(another_compiled.join("greeter/Cargo.lock").is_file());
+    assert_lock(&another.path().join("tmp"), &another.path().join("cargo"));
     assert_plan(
         &another,
         &another.path().join("tmp"),
