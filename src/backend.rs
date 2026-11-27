@@ -8954,6 +8954,64 @@ pub fn {f}("
     }
 
     #[test]
+    fn unreadable_preparer_sources_log_no_paths_during_reuse() {
+        let Some(root) = std::env::var_os("SUNRISE_TEST_REUSE_LOG_ROOT") else {
+            let root = tempfile::tempdir().unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "backend::tests::unreadable_preparer_sources_log_no_paths_during_reuse",
+                    "--nocapture",
+                ])
+                .env("SUNRISE_TEST_REUSE_LOG_ROOT", root.path())
+                .env("SUNRISE_LAUNCHER_HOME", root.path())
+                .env("SUNRISE_HOME", root.path().join("home"))
+                .env("XDG_DATA_HOME", root.path().join("xdg-data"))
+                .env("XDG_CONFIG_HOME", root.path().join("xdg-config"))
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "child failed:\nstdout:\n{}\nstderr:\n{stderr}",
+                String::from_utf8_lossy(&output.stdout),
+            );
+            let disk_log = fs::read_to_string(root.path().join("logs/launcher.log")).unwrap();
+            for log in [stderr.as_ref(), disk_log.as_str()] {
+                assert_eq!(
+                    log.lines()
+                        .filter(
+                            |line| line.contains("Could not read a build's preparer source:")
+                                && line.contains("an error with no OS error code or HTTP status")
+                        )
+                        .count(),
+                    2,
+                    "missing preparer source diagnostics: {log}"
+                );
+                for word in ["Private", "Workspace", "ReuseSource", "ReuseTarget"] {
+                    assert!(!log.contains(word), "{word} leaked: {log}");
+                }
+            }
+            return;
+        };
+        let root = PathBuf::from(root);
+        crate::launcher_log::init(&root.join("logs"));
+        let workspace = root.join("Private Workspace");
+        let (from, to) = (workspace.join("ReuseSource"), workspace.join("ReuseTarget"));
+        for build in [&from, &to] {
+            let lib = build.join(PREPARER_CRATE).join("src/lib.rs");
+            fs::create_dir_all(lib.parent().unwrap()).unwrap();
+            fs::write(lib, [0xff]).unwrap();
+            fs::write(
+                build.join("research-lock.json"),
+                r#"{"minecraft":{"version":"26.3","client_sha1":"c","server_sha1":"s"}}"#,
+            )
+            .unwrap();
+        }
+        assert!(!resources_compatible(&from, &to, &resources_at(&from), &[]));
+    }
+
+    #[test]
     fn any_missing_extra_sends_the_store_refill_once_per_run() {
         use std::sync::atomic::AtomicBool;
         let lacks = |kinds: &[&str]| -> crate::preparer::Extras {
