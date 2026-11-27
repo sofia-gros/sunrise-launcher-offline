@@ -336,7 +336,7 @@ mod tests {
             assert!(!keys[..i].contains(&key));
             let mut eta = StageEta::default();
             let start = Instant::now();
-            let download_key = install_stage_key(InstallProgress::DownloadingBuild(0.));
+            let download_key = install_stage_key(InstallProgress::DownloadingBuild(Some(0.)));
             eta.update(download_key, Some(0.0), start);
             let ready = start + Duration::from_secs(3);
             eta.update(download_key, Some(0.25), ready);

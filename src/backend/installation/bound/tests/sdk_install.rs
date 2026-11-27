@@ -408,78 +408,98 @@ fn serve_sdk_files(
 fn player_archive_still_installs_when_the_index_is_listed() {
     isolated_case(
         "sdk_install::player_archive_still_installs_when_the_index_is_listed",
-        || {
-            let Some(asset) = ASSET else { return };
-            let release = game_releases(&[row(TAG, &[INDEX, asset])]).pop().unwrap();
-            let download = GameDownload::select(&release).unwrap();
-            assert_eq!(download.file, asset);
-            let bytes = if asset.ends_with(".zip") {
-                let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-                zip.start_file(CLIENT, zip::write::SimpleFileOptions::default())
-                    .unwrap();
-                zip.write_all(b"static client").unwrap();
-                zip.finish().unwrap().into_inner()
-            } else {
-                let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
-                    Vec::new(),
-                    flate2::Compression::fast(),
-                ));
-                let mut header = tar::Header::new_gnu();
-                header.set_size(13);
-                header.set_mode(0o755);
-                tar.append_data(&mut header, CLIENT, b"static client".as_slice())
-                    .unwrap();
-                tar.into_inner().unwrap().finish().unwrap()
-            };
-            let mirror = PathBuf::from(std::env::var_os(BASE_VAR).unwrap());
-            let (key, _) = SigningKey::generate().unwrap();
-            let keys = [key.public()];
-            let base = Base::from_env();
-            publish(
-                &mirror,
-                TAG,
-                TAG,
-                &key,
-                b"unused SDK index",
-                &[(asset, &bytes)],
-            );
-            let proof = download
-                .prove_with(TAG, &keys, |name| {
-                    base.release_file(TAG, TAG, name).map_err(|e| e.to_string())
-                })
-                .unwrap();
-            let (url, server) = serve_archive(asset, bytes);
-            let phases = std::cell::RefCell::new(Vec::new());
-            download
-                .publish_with(
-                    TAG,
-                    &proof,
-                    InstallIntent::Exact,
-                    crate::backend::installation::Transfer {
-                        stop: None,
-                        progress: |phase| phases.borrow_mut().push(phase),
-                    },
-                    |_, _| url.clone(),
-                    (&base, &keys),
-                )
-                .unwrap();
-            server.join().unwrap();
-            let phases = phases.into_inner();
-            let [download @ .., InstallPhase::Unpacking, InstallPhase::Finishing] =
-                phases.as_slice()
-            else {
-                panic!("expected transfer, extraction, then publication: {phases:?}");
-            };
-            assert!(download
-                .iter()
-                .all(|p| matches!(p, InstallPhase::Downloading(f) if (0.0..=1.0).contains(f))));
-            assert_eq!(download.last(), Some(&InstallPhase::Downloading(1.0)));
-            let game = version_dir(TAG);
-            assert_eq!(fs::read(game.join(CLIENT)).unwrap(), b"static client");
-            assert!(game.join(Artifact::ARCHIVE_RECEIPT).is_file());
-            assert!(!game.join(Artifact::SDK_RECEIPT).exists());
-        },
+        || signed_player_archive(true),
     );
+}
+
+#[test]
+fn signed_archive_without_a_length_reports_indeterminate_downloading() {
+    isolated_case(
+        "sdk_install::signed_archive_without_a_length_reports_indeterminate_downloading",
+        || signed_player_archive(false),
+    );
+}
+
+fn signed_player_archive(content_length: bool) {
+    let Some(asset) = ASSET else { return };
+    let mut catalog = row(TAG, &[INDEX, asset]);
+    if !content_length {
+        catalog["assets"][1]["size"] = serde_json::json!(0);
+    }
+    let release = game_releases(&[catalog]).pop().unwrap();
+    let download = GameDownload::select(&release).unwrap();
+    assert_eq!(download.file, asset);
+    let bytes = if asset.ends_with(".zip") {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file(CLIENT, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"static client").unwrap();
+        zip.finish().unwrap().into_inner()
+    } else {
+        let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(13);
+        header.set_mode(0o755);
+        tar.append_data(&mut header, CLIENT, b"static client".as_slice())
+            .unwrap();
+        tar.into_inner().unwrap().finish().unwrap()
+    };
+    let mirror = PathBuf::from(std::env::var_os(BASE_VAR).unwrap());
+    let (key, _) = SigningKey::generate().unwrap();
+    let keys = [key.public()];
+    let base = Base::from_env();
+    publish(
+        &mirror,
+        TAG,
+        TAG,
+        &key,
+        b"unused SDK index",
+        &[(asset, &bytes)],
+    );
+    let proof = download
+        .prove_with(TAG, &keys, |name| {
+            base.release_file(TAG, TAG, name).map_err(|e| e.to_string())
+        })
+        .unwrap();
+    if !content_length {
+        assert_eq!(download.size, 0);
+    }
+    let (url, server) = serve_archive(asset, bytes, content_length);
+    let phases = std::cell::RefCell::new(Vec::new());
+    download
+        .publish_with(
+            TAG,
+            &proof,
+            InstallIntent::Exact,
+            crate::backend::installation::Transfer {
+                stop: None,
+                progress: |phase| phases.borrow_mut().push(phase),
+            },
+            |_, _| url.clone(),
+            (&base, &keys),
+        )
+        .unwrap();
+    server.join().unwrap();
+    let phases = phases.into_inner();
+    let [download @ .., InstallPhase::Unpacking, InstallPhase::Finishing] = phases.as_slice()
+    else {
+        panic!("expected transfer, extraction, then publication: {phases:?}");
+    };
+    if content_length {
+        assert!(download
+            .iter()
+            .all(|p| matches!(p, InstallPhase::Downloading(f) if (0.0..=1.0).contains(f))));
+        assert_eq!(download.last(), Some(&InstallPhase::Downloading(1.0)));
+    } else {
+        assert_eq!(download, [InstallPhase::DownloadingUnknownLength]);
+    }
+    let game = version_dir(TAG);
+    assert_eq!(fs::read(game.join(CLIENT)).unwrap(), b"static client");
+    assert!(game.join(Artifact::ARCHIVE_RECEIPT).is_file());
+    assert!(!game.join(Artifact::SDK_RECEIPT).exists());
 }
 
 #[test]

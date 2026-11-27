@@ -86,7 +86,7 @@ pub enum InstallProgress {
     Waiting,
     Downloading(f32),
     /// The game build's own download, before its Minecraft files are prepared.
-    DownloadingBuild(f32),
+    DownloadingBuild(Option<f32>),
     /// A game build's preparation: the step under way and, while Mojang's files download, how
     /// many of how many are done.
     Minecraft(crate::backend::PrepareStep, Option<(usize, usize)>),
@@ -106,7 +106,8 @@ impl From<crate::backend::InstallPhase> for InstallProgress {
         use crate::backend::InstallPhase;
         match phase {
             InstallPhase::Checking => Self::CheckingBuild,
-            InstallPhase::Downloading(fraction) => Self::DownloadingBuild(fraction),
+            InstallPhase::Downloading(fraction) => Self::DownloadingBuild(Some(fraction)),
+            InstallPhase::DownloadingUnknownLength => Self::DownloadingBuild(None),
             InstallPhase::Unpacking => Self::UnpackingBuild,
             InstallPhase::Finishing => Self::FinishingBuild,
             InstallPhase::Preparing => Self::PreparingBuild,

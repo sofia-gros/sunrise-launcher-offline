@@ -1567,7 +1567,8 @@ pub(crate) fn stage_label(step: InstallProgress) -> String {
             "Downloading {percent}%",
             &[("percent", &format!("{:.0}", f * 100.))],
         ),
-        InstallProgress::DownloadingBuild(f) => trf(
+        InstallProgress::DownloadingBuild(None) => tr("Downloading the build…").into(),
+        InstallProgress::DownloadingBuild(Some(f)) => trf(
             "Downloading the build {percent}%",
             &[("percent", &format!("{:.0}", f.clamp(0., 1.) * 100.))],
         ),
@@ -1613,7 +1614,7 @@ pub(crate) fn stage_label(step: InstallProgress) -> String {
 
 pub(crate) fn stage_fraction(step: InstallProgress) -> Option<f32> {
     match step {
-        InstallProgress::DownloadingBuild(f) => Some(f.clamp(0., 1.)),
+        InstallProgress::DownloadingBuild(f) => f.map(|f| f.clamp(0., 1.)),
         InstallProgress::Downloading(f) | InstallProgress::Rust(f) => Some(f),
         InstallProgress::Minecraft(_, Some((done, total))) if total > 0 => {
             Some(done as f32 / total as f32)
@@ -1706,17 +1707,20 @@ mod tests {
             assert!(!stage_label(stage).contains('%'));
         }
         assert_eq!(
-            stage_fraction(InstallProgress::DownloadingBuild(0.25)),
+            stage_fraction(InstallProgress::DownloadingBuild(Some(0.25))),
             Some(0.25)
         );
         assert_eq!(
-            stage_fraction(InstallProgress::DownloadingBuild(-0.25)),
+            stage_fraction(InstallProgress::DownloadingBuild(Some(-0.25))),
             Some(0.)
         );
         assert_eq!(
-            stage_fraction(InstallProgress::DownloadingBuild(1.25)),
+            stage_fraction(InstallProgress::DownloadingBuild(Some(1.25))),
             Some(1.)
         );
+        let unknown = sunrise_launcher::backend::InstallPhase::DownloadingUnknownLength.into();
+        assert_eq!(stage_label(unknown), "Downloading the build…");
+        assert_eq!(stage_fraction(unknown), None);
         assert_ne!(InstallProgress::FinishingBuild, InstallProgress::Publishing);
     }
 
