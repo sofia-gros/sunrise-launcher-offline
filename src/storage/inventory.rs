@@ -1,4 +1,5 @@
 //! The CLI and Storage page share one fixed-path inventory.
+mod count;
 #[cfg(test)]
 #[path = "inventory_regressions.rs"]
 mod regressions;
@@ -20,7 +21,7 @@ const BUILD_CACHES: [BuildCache; 10] = [
     BuildCache::Scratch,
 ];
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct Row {
     pub category: Category,
     pub bytes: u64,
@@ -33,37 +34,85 @@ pub struct Row {
 }
 
 impl Row {
+    fn new(category: Category) -> Self {
+        Self {
+            category,
+            bytes: 0,
+            freed_bytes: 0,
+            remaining_bytes: 0,
+            private_compiler_bytes: 0,
+            kept: Vec::new(),
+        }
+    }
+
     pub fn clearable_bytes(&self) -> u64 {
         self.remaining_bytes
             .saturating_sub(self.private_compiler_bytes)
     }
+
+    /// Private compiler work counts toward the row but is never offered for clearing.
+    fn retain_compiler(&mut self, bytes: u64) {
+        self.private_compiler_bytes = bytes;
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.remaining_bytes = self.remaining_bytes.saturating_add(bytes);
+        self.kept.push(Kept { bytes, reason: crate::i18n::tr("Private compiler work was kept because the launcher couldn't prove all workers had stopped.").into() });
+    }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct Kept {
     pub bytes: u64,
     pub reason: String,
 }
 
-#[derive(Serialize)]
+/// The rows counted or cleared so far: all of them once it [`is_complete`](Self::is_complete).
+#[derive(Clone, Serialize)]
 pub struct Report {
     pub rows: Vec<Row>,
     pub total_bytes: u64,
+    /// The count or Clear this report came from, so a window can drop one it has cancelled.
+    #[serde(skip)]
+    origin: Option<Cancel>,
 }
 
 impl Report {
+    fn new(rows: Vec<Row>) -> Self {
+        Self {
+            total_bytes: rows
+                .iter()
+                .fold(0u64, |total, row| total.saturating_add(row.bytes)),
+            rows,
+            origin: None,
+        }
+    }
+
+    /// Whether every row is in: a count in progress hands over the rows it has finished.
+    pub fn is_complete(&self) -> bool {
+        self.rows.len() == Category::ALL.len()
+    }
+
+    pub fn tagged(mut self, origin: &Cancel) -> Self {
+        self.origin = Some(origin.clone());
+        self
+    }
+
+    pub fn is_from(&self, origin: &Cancel) -> bool {
+        self.origin.as_ref().is_some_and(|own| own.is(origin))
+    }
+
+    fn push(&mut self, row: Row) {
+        self.total_bytes = self.total_bytes.saturating_add(row.bytes);
+        self.rows.push(row);
+    }
+
     fn include_retained_compiler(&mut self, bytes: Option<u64>) {
         if let Some(bytes) = bytes {
-            let row = self
-                .rows
+            self.rows
                 .iter_mut()
                 .find(|r| r.category == Category::BuildFiles)
-                .expect("report contains Build files");
-            row.private_compiler_bytes = bytes;
-            row.bytes = row.bytes.saturating_add(bytes);
-            row.remaining_bytes = row.remaining_bytes.saturating_add(bytes);
+                .expect("report contains Build files")
+                .retain_compiler(bytes);
             self.total_bytes = self.total_bytes.saturating_add(bytes);
-            row.kept.push(Kept { bytes, reason: crate::i18n::tr("Private compiler work was kept because the launcher couldn't prove all workers had stopped.").into() });
         }
     }
 }
@@ -140,6 +189,8 @@ impl Entry {
 
     /// The lease integration changes this classification, not deletion code.
     fn access(&self) -> Result<Access, Error> {
+        #[cfg(test)]
+        ACCESS.with(|calls| calls.set(calls.get() + 1));
         match self.category {
             Category::RustCompiler => Ok(Access::BuildTools),
             // No game runs from kept mod libraries: a build copies them into its workspace.
@@ -170,6 +221,65 @@ impl Entry {
     }
 }
 
+/// A folder's entries for a report that holds no build lease, so a folder or entry can vanish
+/// while it is read: that one is skipped, as the size walk skips one. Every other failure, and
+/// every link check on what is found, still stands.
+fn children(folder: &Path) -> Result<Vec<fs::DirEntry>, Error> {
+    let entries = match fs::read_dir(folder) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut found = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => found.push(entry),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    #[cfg(test)]
+    LISTED.with(|hook| {
+        if let Some(hook) = &*hook.borrow() {
+            hook(folder);
+        }
+    });
+    Ok(found)
+}
+
+// Lets a test change the disk between a folder's listing and what is done with its entries.
+#[cfg(test)]
+thread_local! {
+    static LISTED: std::cell::RefCell<Option<Box<dyn Fn(&Path)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `Ok(None)` for a result that failed only because its entry vanished.
+fn present<T>(result: std::io::Result<T>) -> Result<Option<T>, Error> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Says how many runtime lease registry entries there are, on stderr, before a report starts.
+fn note_lease_registry() -> Result<(), Error> {
+    let registry_entries = match fs::read_dir(backend::data_dir().join("run-leases")) {
+        Ok(mut entries) => entries.try_fold(0usize, |count, entry| entry.map(|_| count + 1))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error.into()),
+    };
+    eprintln!(
+        "{}",
+        crate::i18n::trf(
+            "Runtime lease registry entries: {count}",
+            &[("count", &registry_entries.to_string())]
+        )
+    );
+    Ok(())
+}
+
 fn usage_stamp(name: &Path) -> bool {
     let name = name.as_os_str().to_string_lossy();
     name == ".last-used" || (name.starts_with('.') && name.ends_with(".last-used"))
@@ -186,11 +296,46 @@ fn add(
 }
 
 impl Storage {
+    /// What a report or Clear works on, found once: the fixed build-home units, the spare game
+    /// builds and each profile's caches, and detached trash beside any of them.
     fn entries(&self) -> Result<Vec<Entry>, Error> {
         #[cfg(test)]
         ENTRIES.with(|calls| calls.set(calls.get() + 1));
         let mut entries = Vec::new();
-        let build_root = Root::open(&self.root)?;
+        self.build_entries(&mut entries, &Root::open(&self.root)?)?;
+        let data = Root::open(&backend::data_dir())?;
+        // One read-only snapshot of the profiles says both which builds they play and where
+        // their folders are. An unreadable one proves neither, so it offers no spare build and
+        // no profile cache.
+        let profiles = instances::list_for_storage().ok();
+        if let Some(profiles) = &profiles {
+            spare_builds(&mut entries, &data, profiles)?;
+        }
+        // Interrupted removal deliberately loses completion. Keep the remaining unit
+        // visible for residual reporting and a safe retry, even though installed() omits it.
+        for child in children(&data.path.join("versions"))? {
+            if present(child.file_type())?.is_some_and(|kind| kind.is_dir())
+                && !child.path().join(".installed").is_file()
+                && !child.file_name().to_string_lossy().starts_with(".trash-")
+            {
+                entries.push(Entry::fixed(
+                    &data,
+                    &Path::new("versions").join(child.file_name()),
+                    Category::SpareGameBuilds,
+                )?);
+            }
+        }
+        for relative in ["cache/github", "mod-browser", "profile-heads"] {
+            add(&mut entries, &data, relative, Category::OtherCaches)?;
+        }
+        if let Some(profiles) = &profiles {
+            profile_caches(&mut entries, profiles)?;
+        }
+        self.detached_trash(&mut entries, &data)?;
+        Ok(entries)
+    }
+
+    fn build_entries(&self, entries: &mut Vec<Entry>, build_root: &Root) -> Result<(), Error> {
         for cache in BUILD_CACHES {
             if matches!(
                 cache,
@@ -203,25 +348,19 @@ impl Storage {
             ) {
                 let parent = self.root.join(cache.relative());
                 if checked(&parent, true)?.is_some() {
-                    for child in fs::read_dir(parent)? {
-                        let child = child?;
+                    for child in children(&parent)? {
                         if usage_stamp(Path::new(&child.file_name())) {
                             continue;
                         }
                         entries.push(Entry::fixed(
-                            &build_root,
+                            build_root,
                             &Path::new(cache.relative()).join(child.file_name()),
                             cache.category(),
                         )?);
                     }
                 }
             } else {
-                add(
-                    &mut entries,
-                    &build_root,
-                    cache.relative(),
-                    cache.category(),
-                )?;
+                add(entries, build_root, cache.relative(), cache.category())?;
             }
         }
         let build_files = Category::BuildFiles;
@@ -232,8 +371,8 @@ impl Storage {
             "catalog.partial",
         ] {
             add(
-                &mut entries,
-                &build_root,
+                entries,
+                build_root,
                 &format!("native/{name}"),
                 build_files,
             )?;
@@ -242,95 +381,41 @@ impl Storage {
         // deletion goes through Cache, which also acquires Cargo's locks.
         let target = self.root.join("native/target");
         if checked(&target, true)?.is_some() {
-            for child in fs::read_dir(&target)? {
-                let child = child?;
+            for child in children(&target)? {
                 if crate::cache_cleanup::reserved(Path::new(&child.file_name()))
                     || usage_stamp(Path::new(&child.file_name()))
                 {
                     continue;
                 }
                 let relative = Path::new("native/target").join(child.file_name());
-                checked(&child.path(), child.file_type()?.is_dir())?;
-                if child.file_type()?.is_dir() && child.file_name().to_string_lossy().contains('-')
-                {
+                let Some(kind) = present(child.file_type())? else {
+                    continue;
+                };
+                checked(&child.path(), kind.is_dir())?;
+                if kind.is_dir() && child.file_name().to_string_lossy().contains('-') {
                     // Cross-compilation target triples own independent profile units too.
-                    for profile in fs::read_dir(child.path())? {
-                        let profile = profile?;
+                    for profile in children(&child.path())? {
                         if crate::cache_cleanup::reserved(Path::new(&profile.file_name()))
                             || usage_stamp(Path::new(&profile.file_name()))
                         {
                             continue;
                         }
                         entries.push(Entry::fixed(
-                            &build_root,
+                            build_root,
                             &relative.join(profile.file_name()),
                             build_files,
                         )?);
                     }
                 } else {
-                    entries.push(Entry::fixed(&build_root, &relative, build_files)?);
+                    entries.push(Entry::fixed(build_root, &relative, build_files)?);
                 }
             }
         }
-        let data = Root::open(&backend::data_dir())?;
-        let played: HashSet<_> = instances::list()
-            .into_iter()
-            .filter_map(|instance| instance.resolve_version(None).ok())
-            .collect();
-        for version in backend::installed() {
-            if native_mods::is_native(&version)
-                && !played.contains(&version)
-                && native_mods::resource_dependent(&version).is_none()
-                && !backend::in_use(&version)
-            {
-                add(
-                    &mut entries,
-                    &data,
-                    &format!("versions/{version}"),
-                    Category::SpareGameBuilds,
-                )?;
-            }
-        }
-        // Interrupted removal deliberately loses completion. Keep the remaining unit
-        // visible for residual reporting and a safe retry, even though installed() omits it.
-        match fs::read_dir(data.path.join("versions")) {
-            Ok(children) => {
-                for child in children {
-                    let child = child?;
-                    if child.file_type()?.is_dir()
-                        && !child.path().join(".installed").is_file()
-                        && !child.file_name().to_string_lossy().starts_with(".trash-")
-                    {
-                        entries.push(Entry::fixed(
-                            &data,
-                            &Path::new("versions").join(child.file_name()),
-                            Category::SpareGameBuilds,
-                        )?);
-                    }
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        for relative in ["cache/github", "mod-browser", "profile-heads"] {
-            add(&mut entries, &data, relative, Category::OtherCaches)?;
-        }
-        for instance in instances::list() {
-            // A missing version cannot prove that the instance is idle. Keep its caches.
-            let Ok(version) = instance.resolve_version(None) else {
-                continue;
-            };
-            if backend::in_use(&version) {
-                continue;
-            }
-            let root = Root::open(&instance.home)?;
-            old_logs(&mut entries, &root)?;
-            unused_jars(&mut entries, &root)?;
-            for relative in [".sunrise-cache", "cache"] {
-                add(&mut entries, &root, relative, Category::OtherCaches)?;
-            }
-        }
-        // Detached trees can remain beside any managed cache after an interrupted removal.
+        Ok(())
+    }
+
+    /// Detached trees can remain beside any managed cache after an interrupted removal.
+    fn detached_trash(&self, entries: &mut Vec<Entry>, data: &Root) -> Result<(), Error> {
         let parents: HashSet<_> = entries
             .iter()
             .filter_map(|entry| entry.path.parent().map(Path::to_owned))
@@ -345,8 +430,7 @@ impl Storage {
             if root.directory.is_none() {
                 continue;
             }
-            for entry in fs::read_dir(&parent)? {
-                let entry = entry?;
+            for entry in children(&parent)? {
                 if entry.file_name().to_string_lossy().starts_with(".trash-") {
                     entries.push(Entry::fixed(
                         &root,
@@ -356,25 +440,25 @@ impl Storage {
                 }
             }
         }
-        Ok(entries)
+        Ok(())
     }
 
     /// Not deletion candidates: an unproved worker can still be writing to them.
     fn retained_compiler_bytes(
         &self,
         counted: &mut HashSet<(u64, u64)>,
+        cancel: &Cancel,
     ) -> Result<Option<u64>, Error> {
         let native = self.root.join("native");
         let mut bytes = None;
         if checked(&native, true)?.is_some() {
-            for entry in fs::read_dir(&native)? {
-                let entry = entry?;
+            for entry in children(&native)? {
                 if entry.file_name().to_str().is_some_and(|name| {
                     name.starts_with(native_mods::ATTEMPT_PREFIX)
                         || name.starts_with(native_mods::OLD_ATTEMPT_PREFIX)
                 }) {
                     // A changing or unreadable tree is still protected; zero means its size is unknown.
-                    let size = Tree::build(&entry.path()).map_or(0, |tree| tree.size(counted));
+                    let size = Tree::build_until(&entry.path(), cancel).map_or(0, |tree| tree.size(counted));
                     bytes = Some(bytes.unwrap_or(0u64).saturating_add(size));
                 }
             }
@@ -382,64 +466,30 @@ impl Storage {
         Ok(bytes)
     }
 
+    /// A read-only count, or a manual Clear of one row or all of them under the build lease.
     pub fn report(&self, clear: Option<Category>, all: bool) -> Result<Report, Error> {
-        let registry_entries = match fs::read_dir(backend::data_dir().join("run-leases")) {
-            Ok(mut entries) => entries.try_fold(0usize, |count, entry| entry.map(|_| count + 1))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-            Err(error) => return Err(error.into()),
-        };
-        eprintln!(
-            "{}",
-            crate::i18n::trf(
-                "Runtime lease registry entries: {count}",
-                &[("count", &registry_entries.to_string())]
-            )
-        );
-        let clearing = clear.is_some() || all;
-        // Only manual clear takes the native build lease; read-only reports never make Play wait.
-        let lease = if clearing {
-            let lease = self.build_lease()?;
-            // Also refuse an external Cargo holding a target lock before starting a cleanup.
-            lease.bytes()?;
-            use sunrise_launcher_smod::runtime_leases::{cleanup::Cleanup, Error as LeaseError};
-            match Cleanup::existing(&backend::data_dir()) {
-                Ok(cleanup) => {
-                    cleanup.collect_records()?;
-                }
-                Err(LeaseError::Busy) => {} // Other cache classes can still be reported/retained.
-                Err(LeaseError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-            Some(lease)
-        } else {
-            None
-        };
-        let entries = self.entries()?;
-        let mut report = self.apply_retaining(entries, clear, all, true, lease.as_ref())?;
-        report.include_retained_compiler(self.retained_compiler_bytes(&mut HashSet::new())?);
-        if !clearing {
-            for entry in self.entries()? {
-                if let Err(error) = entry.access().and_then(|access| access.check()) {
-                    // A refused unit already has its line.
-                    let bytes = match allocated_bytes(&entry.path) {
-                        Err(Error::Unsafe(_)) => 0,
-                        bytes => bytes?,
-                    };
-                    if bytes > 0 {
-                        report
-                            .rows
-                            .iter_mut()
-                            .find(|row| row.category == entry.category)
-                            .unwrap()
-                            .kept
-                            .push(Kept {
-                                bytes,
-                                reason: native_mods::cache_error(error),
-                            });
-                    }
-                }
-            }
+        if clear.is_none() && !all {
+            return self.report_counting(|_| {});
         }
+        note_lease_registry()?;
+        // Only manual clear takes the native build lease; read-only reports never make Play wait.
+        let lease = self.build_lease()?;
+        // Also refuse an external Cargo holding a target lock before starting a cleanup.
+        lease.bytes()?;
+        use sunrise_launcher_smod::runtime_leases::{cleanup::Cleanup, Error as LeaseError};
+        match Cleanup::existing(&backend::data_dir()) {
+            Ok(cleanup) => {
+                cleanup.collect_records()?;
+            }
+            Err(LeaseError::Busy) => {} // Other cache classes can still be reported/retained.
+            Err(LeaseError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let entries = self.entries()?;
+        let mut report = self.apply_retaining(entries, clear, all, true, Some(&lease))?;
+        report.include_retained_compiler(
+            self.retained_compiler_bytes(&mut HashSet::new(), &Cancel::default())?,
+        );
         Ok(report)
     }
 
@@ -493,19 +543,12 @@ impl Storage {
         // Validate every descendant before any deletion and deduplicate allocated blocks per row.
         let mut rows: Vec<_> = Category::ALL
             .into_iter()
-            .map(|category| Row {
-                category,
-                bytes: 0,
-                freed_bytes: 0,
-                remaining_bytes: 0,
-                private_compiler_bytes: 0,
-                kept: Vec::new(),
-            })
+            .map(Row::new)
             .collect();
         // Each folder is walked once, here: the walk validates every descendant and its sizes
         // serve the rows and the kept lines.
         let (entries, mut trees) = if retain {
-            refused(entries, &mut rows)?
+            refused(entries, &mut rows, &Cancel::default())?
         } else {
             let trees = entries
                 .iter()
@@ -565,12 +608,7 @@ impl Storage {
                 row.remaining_bytes = remaining;
             }
         }
-        Ok(Report {
-            total_bytes: rows
-                .iter()
-                .fold(0u64, |total, row| total.saturating_add(row.bytes)),
-            rows,
-        })
+        Ok(Report::new(rows))
     }
 }
 
@@ -588,11 +626,15 @@ fn allocated(entries: &[Entry], trees: &[Tree], category: Category) -> u64 {
 
 /// A unit holding a link or file the launcher does not expect is refused whole: it is neither
 /// counted nor cleared, and its row says so. The other units are not held up by it.
-fn refused(entries: Vec<Entry>, rows: &mut [Row]) -> Result<(Vec<Entry>, Vec<Tree>), Error> {
+fn refused(
+    entries: Vec<Entry>,
+    rows: &mut [Row],
+    cancel: &Cancel,
+) -> Result<(Vec<Entry>, Vec<Tree>), Error> {
     let mut sound = Vec::new();
     let mut trees = Vec::new();
     for entry in entries {
-        match Tree::build(&entry.path) {
+        match Tree::build_until(&entry.path, cancel) {
             Ok(tree) => {
                 sound.push(entry);
                 trees.push(tree);
@@ -612,6 +654,53 @@ fn refused(entries: Vec<Entry>, rows: &mut [Row]) -> Result<(Vec<Entry>, Vec<Tre
     Ok((sound, trees))
 }
 
+/// Native builds no profile plays and nothing is running or building from.
+fn spare_builds(
+    entries: &mut Vec<Entry>,
+    data: &Root,
+    profiles: &[instances::Instance],
+) -> Result<(), Error> {
+    let played: HashSet<_> = profiles
+        .iter()
+        .filter_map(|instance| instance.resolve_version(None).ok())
+        .collect();
+    for version in backend::installed() {
+        if native_mods::is_native(&version)
+            && !played.contains(&version)
+            && native_mods::resource_dependent(&version).is_none()
+            && !backend::in_use(&version)
+        {
+            add(
+                entries,
+                data,
+                &format!("versions/{version}"),
+                Category::SpareGameBuilds,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The caches, old logs and unused jars of every profile whose game is not running.
+fn profile_caches(entries: &mut Vec<Entry>, profiles: &[instances::Instance]) -> Result<(), Error> {
+    for instance in profiles {
+        // A missing version cannot prove that the instance is idle. Keep its caches.
+        let Ok(version) = instance.resolve_version(None) else {
+            continue;
+        };
+        if backend::in_use(&version) {
+            continue;
+        }
+        let root = Root::open(&instance.home)?;
+        old_logs(entries, &root)?;
+        unused_jars(entries, &root)?;
+        for relative in [".sunrise-cache", "cache"] {
+            add(entries, &root, relative, Category::OtherCaches)?;
+        }
+    }
+    Ok(())
+}
+
 fn old_logs(entries: &mut Vec<Entry>, home: &Root) -> Result<(), Error> {
     for directory in ["logs", "crash-reports"] {
         let folder = Entry::fixed(home, Path::new(directory), Category::OtherCaches)?.path;
@@ -619,8 +708,7 @@ fn old_logs(entries: &mut Vec<Entry>, home: &Root) -> Result<(), Error> {
             continue;
         }
         let mut files = Vec::new();
-        for entry in fs::read_dir(&folder)? {
-            let entry = entry?;
+        for entry in children(&folder)? {
             if crate::cache_cleanup::reserved(Path::new(&entry.file_name()))
                 || usage_stamp(Path::new(&entry.file_name()))
             {
@@ -675,8 +763,7 @@ fn unused_jars(entries: &mut Vec<Entry>, home: &Root) -> Result<(), Error> {
             );
         }
     }
-    for entry in fs::read_dir(folder)? {
-        let entry = entry?;
+    for entry in children(&folder)? {
         if !crate::cache_cleanup::reserved(Path::new(&entry.file_name()))
             && !usage_stamp(Path::new(&entry.file_name()))
             && !referenced.contains(&entry.path())
@@ -772,6 +859,31 @@ mod manual_tests {
         assert!(row(Category::RustCompiler).freed_bytes > 0);
         assert!(row(Category::RustCompiler).kept.is_empty());
         assert!(!good.exists());
+    }
+
+    /// #649: without the build lease, a folder can be detached between its parent's listing and
+    /// its own, which skips it instead of failing the report.
+    #[test]
+    fn a_cross_target_directory_that_vanishes_does_not_fail_a_read_only_report() {
+        let home = crate::storage::tests::Home::new();
+        let triple = home.0.join("native/target/x86_64-unknown-test");
+        home.seed("native/target/x86_64-unknown-test/debug/out");
+        home.seed("native/target/debug/kept");
+        let storage = Storage::at(&home.0).unwrap();
+        let vanishing = triple.clone();
+        LISTED.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |folder| {
+                if folder.ends_with("native/target") {
+                    let _ = fs::remove_dir_all(&vanishing);
+                }
+            }));
+        });
+        let report = storage.report(None, false);
+        LISTED.with(|hook| hook.borrow_mut().take());
+        let report = report.unwrap();
+        assert!(!triple.exists());
+        assert!(report.rows[0].bytes > 0, "the unit that stayed is counted");
+        assert!(children(&home.0.join("gone")).unwrap().is_empty());
     }
 
     #[test]

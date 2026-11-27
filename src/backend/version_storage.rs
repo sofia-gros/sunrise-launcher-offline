@@ -2,6 +2,7 @@
 use super::{in_use, installed, is_game_tag, play_installations, version_dir, Release, Settings};
 use crate::cache_cleanup::{self, Error};
 use crate::i18n::{tr, trf};
+use crate::storage::Cancel;
 use crate::{instances, native_mods, nightly};
 use std::{fs, path::Path};
 
@@ -71,6 +72,7 @@ fn old_downloads<'a>(
 }
 
 /// The row's reason to hide Remove. Deletion rechecks under the publication fence.
+#[derive(Clone)]
 pub enum InUse {
     Profile(String),
     Current,
@@ -79,9 +81,12 @@ pub enum InUse {
     ProfileReference,
 }
 
+/// An installed build. Listing one measures nothing: `bytes` stays `None`, "still counting",
+/// until [`measure`] reaches it.
+#[derive(Clone)]
 pub struct Build {
     pub tag: String,
-    pub bytes: u64,
+    pub bytes: Option<u64>,
     pub in_use: Option<InUse>,
     pub old_download: bool,
 }
@@ -144,7 +149,7 @@ pub fn inventory(releases: &[Release]) -> Vec<Build> {
             });
             Build {
                 tag: tag.clone(),
-                bytes: disk_use(&version_dir(tag)),
+                bytes: None,
                 in_use,
                 old_download: old.contains(&tag),
             }
@@ -152,17 +157,35 @@ pub fn inventory(releases: &[Release]) -> Vec<Build> {
         .collect()
 }
 
-fn disk_use(path: &Path) -> u64 {
+/// Fills in the sizes of `builds` one at a time, handing the rows to `filled` after each, and
+/// stops at once when `cancel` is set. A build cut short keeps no size.
+pub fn measure(builds: &mut [Build], cancel: &Cancel, mut filled: impl FnMut(&[Build])) {
+    let tags: Vec<String> = builds.iter().map(|build| build.tag.clone()).collect();
+    for (index, tag) in tags.iter().enumerate() {
+        let Some(bytes) = disk_use(&version_dir(tag), cancel) else {
+            return;
+        };
+        builds[index].bytes = Some(bytes);
+        filled(builds);
+    }
+}
+
+/// The bytes under `path`, or `None` when `cancel` was set before they were all added up.
+fn disk_use(path: &Path, cancel: &Cancel) -> Option<u64> {
+    if cancel.is_cancelled() {
+        return None;
+    }
     match path.symlink_metadata() {
         Ok(meta) if meta.is_dir() && !crate::native_cache::linked(&meta) => fs::read_dir(path)
             .into_iter()
             .flatten()
             .flatten()
-            .map(|entry| disk_use(&entry.path()))
-            .sum(),
-        Ok(meta) if meta.is_file() && !crate::native_cache::linked(&meta) => meta.len(),
+            .try_fold(0u64, |total, entry| {
+                Some(total.saturating_add(disk_use(&entry.path(), cancel)?))
+            }),
+        Ok(meta) if meta.is_file() && !crate::native_cache::linked(&meta) => Some(meta.len()),
         // Prepared resources may be linked. Do not count files outside this build.
-        _ => 0,
+        _ => Some(0),
     }
 }
 
@@ -412,6 +435,36 @@ mod tests {
                     [newly_pinned, pending]
                 );
                 assert_eq!(installed(), [newest, newly_pinned, pending]);
+            },
+        );
+    }
+
+    #[test]
+    fn sizes_fill_in_one_build_at_a_time_and_stop_when_cancelled() {
+        isolated(
+            "sizes_fill_in_one_build_at_a_time_and_stop_when_cancelled",
+            || {
+                for tag in ["26.3-0.1.9", "26.3-0.1.8"] {
+                    install(tag);
+                }
+                let mut builds = inventory(&[]);
+                assert!(
+                    builds.iter().all(|build| build.bytes.is_none()),
+                    "listing measures nothing"
+                );
+                let cancel = Cancel::default();
+                let mut handed_over = 0;
+                measure(&mut builds, &cancel, |_| {
+                    handed_over += 1;
+                    cancel.cancel();
+                });
+                assert_eq!(handed_over, 1);
+                assert_eq!(builds.iter().filter(|build| build.bytes.is_some()).count(), 1);
+                let mut builds = inventory(&[]);
+                measure(&mut builds, &Cancel::default(), |_| {});
+                assert!(builds
+                    .iter()
+                    .all(|build| build.bytes.is_some_and(|bytes| bytes >= 7)));
             },
         );
     }

@@ -93,6 +93,8 @@ pub(super) struct SettingsView {
     setup: bool,
     note: Option<String>,
     pub(crate) appearance: appearance::State,
+    /// The Storage page's count or Clear in flight (`glass_storage`).
+    pub(super) storage_work: Option<glass_storage::Work>,
 }
 
 /// A card of rows with a rule between them.
@@ -416,6 +418,8 @@ impl Launcher {
         if section == Section::Storage {
             self.refresh_open_storage_builds();
             self.refresh_storage(None, false);
+        } else {
+            self.stop_storage_work();
         }
     }
 
@@ -872,15 +876,14 @@ impl Launcher {
         );
 
         let busy = self.storage_pending;
+        // The total waits for every row; a row shows its own size as soon as it is counted.
         let total = self
             .storage_report
             .as_ref()
+            .filter(|report| report.is_complete())
             .map(|report| report.rows.iter().map(|r| r.remaining_bytes).sum::<u64>());
-        let nothing = busy
-            || self
-                .storage_report
-                .as_ref()
-                .is_none_or(|report| report.rows.iter().all(|row| row.clearable_bytes() == 0));
+        // Clear needs no size: a row not counted yet can be cleared like any other.
+        let offered = glass_storage::clear_offered(self.ui.settings.storage_work.as_ref());
         // Counting that failed is not still counting.
         let uncounted = if self.storage_error.is_some() && !busy {
             tr("Not counted")
@@ -910,13 +913,13 @@ impl Launcher {
                         },
                     )),
                 )
-                .child(if nothing {
-                    off(clear_all)
-                } else {
+                .child(if offered {
                     clear_all.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.storage_confirm = Some(None);
                         cx.notify();
                     }))
+                } else {
+                    off(clear_all)
                 }),
         )];
         // A problem no row owns is said once, quietly, under the total.
@@ -932,27 +935,17 @@ impl Launcher {
             );
         }
         if let Some(asked) = self.storage_confirm {
-            let bytes: u64 = self
+            // The size to free is offered only for rows that are counted.
+            let counted: Vec<_> = self
                 .storage_report
                 .iter()
                 .flat_map(|report| &report.rows)
                 .filter(|r| asked.is_none_or(|category| r.category == category))
-                .map(storage::Row::clearable_bytes)
-                .sum();
-            let size = storage::format_bytes(bytes);
-            let question = match asked {
-                None => trf(
-                    "Clear everything kept for reuse? Up to {size} is freed. Files a game or build is using stay.",
-                    &[("size", &size)],
-                ),
-                Some(category) => trf(
-                    "Clear {category}? Up to {size} is freed. Files a game or build is using stay.",
-                    &[
-                        ("category", tr(glass_storage::category_label(category))),
-                        ("size", &size),
-                    ],
-                ),
-            };
+                .collect();
+            let wanted = if asked.is_none() { Category::ALL.len() } else { 1 };
+            let bytes = (counted.len() == wanted)
+                .then(|| counted.iter().map(|r| r.clearable_bytes()).sum());
+            let question = glass_storage::clear_question(asked, bytes);
             cache.push(
                 div()
                     .flex()
@@ -986,7 +979,6 @@ impl Launcher {
                 || uncounted.to_string(),
                 |r| storage::format_bytes(r.remaining_bytes),
             );
-            let empty = busy || found.is_none_or(|r| r.clearable_bytes() == 0);
             let clear = button(ElementId::named_usize("alt-storage-clear", n), tr("Clear…"));
             let mut line = row(
                 trf(
@@ -997,13 +989,13 @@ impl Launcher {
                     ],
                 ),
                 tr(glass_storage::category_about(category)),
-                div().child(if empty {
-                    off(clear)
-                } else {
+                div().child(if offered {
                     clear.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.storage_confirm = Some(Some(category));
                         cx.notify();
                     }))
+                } else {
+                    off(clear)
                 }),
             );
             let kept: Vec<Div> = found

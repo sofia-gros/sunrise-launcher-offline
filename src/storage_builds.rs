@@ -14,6 +14,8 @@ use super::*;
 pub(super) struct View {
     rows: Option<Vec<Build>>,
     generation: u64,
+    /// Stops the worker still adding up sizes, when the page closes or a newer one starts.
+    cancel: Option<storage::Cancel>,
     pub(super) confirm: Option<Confirm>,
     remove_error: Option<String>,
     import_notice: Option<Result<String, String>>,
@@ -37,19 +39,37 @@ impl Launcher {
         }
         self.storage_builds.generation += 1;
         let generation = self.storage_builds.generation;
+        let cancel = storage::Cancel::default();
+        if let Some(previous) = self.storage_builds.cancel.replace(cancel.clone()) {
+            previous.cancel();
+        }
         let releases = self.game_releases().to_vec();
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let rows = version_storage::inventory(&releases);
-            let _ = tx.send(Msg::BuildInventory(generation, rows));
+            // The builds show at once, each still counting, and take their sizes one by one.
+            let mut rows = version_storage::inventory(&releases);
+            let _ = tx.send(Msg::BuildInventory(generation, rows.clone()));
+            version_storage::measure(&mut rows, &cancel, |rows| {
+                let _ = tx.send(Msg::BuildInventory(generation, rows.to_vec()));
+            });
         });
     }
 
+    pub(super) fn stop_storage_builds_count(&mut self) {
+        if let Some(cancel) = self.storage_builds.cancel.take() {
+            cancel.cancel();
+        }
+    }
+
+    /// Shown on Storage: count the builds' sizes and the rows. Anywhere else: stop counting.
     pub(super) fn refresh_open_storage_builds(&mut self) {
         if self.ui.page == frame::Page::Settings
             && self.ui.settings.section == settings::Section::Storage
         {
             self.refresh_storage_builds();
+            self.resume_storage_count();
+        } else {
+            self.stop_storage_work();
         }
     }
 
@@ -319,11 +339,13 @@ impl Launcher {
             .to_string()
         } else if rows.is_empty() {
             tr("No game builds installed").to_string()
-        } else {
+        } else if rows.iter().all(|b| b.bytes.is_some()) {
             trf(
                 "{size} on disk",
-                &[("size", &size(rows.iter().map(|b| b.bytes).sum()))],
+                &[("size", &size(rows.iter().filter_map(|b| b.bytes).sum()))],
             )
+        } else {
+            tr("Counting…").to_string()
         };
         let cleanup = (!bulk && !old.is_empty()).then(|| {
             let clean = button("storage-build-clean", tr("Clean up old builds…"));
@@ -348,7 +370,8 @@ impl Launcher {
             )));
         }
         if let Some(Confirm::Old(tags)) = &self.storage_builds.confirm {
-            let bytes = rows
+            // The sizes are offered once every one of them is counted; Remove never waits for them.
+            let bytes: Option<u64> = rows
                 .iter()
                 .filter(|b| tags.contains(&b.tag))
                 .map(|b| b.bytes)
@@ -362,10 +385,15 @@ impl Launcher {
                         &[("count", &tags.len().to_string())],
                     )
                 },
-                trf(
-                    "Frees up to {size}. Builds in use and your worlds and mods stay.",
-                    &[("size", &size(bytes))],
-                ),
+                match bytes {
+                    Some(bytes) => trf(
+                        "Frees up to {size}. Builds in use and your worlds and mods stay.",
+                        &[("size", &size(bytes))],
+                    ),
+                    None => {
+                        tr("Frees space. Builds in use and your worlds and mods stay.").to_string()
+                    }
+                },
                 tr(if tags.len() == 1 {
                     "Remove old build"
                 } else {
@@ -394,12 +422,15 @@ impl Launcher {
                 None if backend::dev_date(&build.tag).is_some() => tr("Dev").into(),
                 None => String::new(),
             };
+            let counted = build
+                .bytes
+                .map_or_else(|| tr("Counting…").to_string(), size);
             let subtitle = if detail.is_empty() {
-                size(build.bytes)
+                counted
             } else {
                 trf(
                     "{size} · {detail}",
-                    &[("size", &size(build.bytes)), ("detail", &detail)],
+                    &[("size", &counted), ("detail", &detail)],
                 )
             };
             let remove =
@@ -433,10 +464,13 @@ impl Launcher {
             if confirming {
                 card.push(self.storage_confirmation(
                     trf("Remove {build}?", &[("build", &name)]),
-                    trf(
-                        "Frees up to {size}. Your worlds and mods stay.",
-                        &[("size", &size(build.bytes))],
-                    ),
+                    match build.bytes {
+                        Some(bytes) => trf(
+                            "Frees up to {size}. Your worlds and mods stay.",
+                            &[("size", &size(bytes))],
+                        ),
+                        None => tr("Frees space. Your worlds and mods stay.").to_string(),
+                    },
                     tr("Remove build"),
                     cx,
                 ));

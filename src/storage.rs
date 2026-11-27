@@ -7,9 +7,31 @@ use cap_std::fs::Dir;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 mod inventory;
 pub use inventory::{Report, Row};
+
+/// Stops a count running on a worker: whoever started it keeps a clone and sets it when the
+/// count is no longer wanted. It is never reset, so each count gets its own.
+#[derive(Clone, Debug, Default)]
+pub struct Cancel(Arc<AtomicBool>);
+
+impl Cancel {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Whether both are the same token, not merely both unset.
+    pub fn is(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
 
 /// Shared with the launcher's existing server storage display.
 pub fn format_bytes(n: u64) -> String {
@@ -198,6 +220,13 @@ pub fn allocated_bytes(path: &Path) -> Result<u64, Error> {
 thread_local! {
     static ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ACCESS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many units have had their executable use classified on this thread.
+#[cfg(test)]
+pub(crate) fn access_calls() -> usize {
+    ACCESS.with(|calls| calls.get())
 }
 #[cfg(test)]
 pub(crate) fn walks() -> usize {
@@ -222,12 +251,25 @@ struct Node {
 
 impl Tree {
     pub(crate) fn build(path: &Path) -> Result<Self, Error> {
-        #[cfg(test)]
-        WALKS.with(|walks| walks.set(walks.get() + 1));
-        Self::node(path).map(Self)
+        Self::walk(path, None)
     }
 
-    fn node(path: &Path) -> Result<Option<Node>, Error> {
+    /// Stops descending once `cancel` is set. What it returns then is partial, so a caller that
+    /// sees the token set afterwards must discard the tree.
+    pub(crate) fn build_until(path: &Path, cancel: &Cancel) -> Result<Self, Error> {
+        Self::walk(path, Some(cancel))
+    }
+
+    fn walk(path: &Path, cancel: Option<&Cancel>) -> Result<Self, Error> {
+        #[cfg(test)]
+        WALKS.with(|walks| walks.set(walks.get() + 1));
+        Self::node(path, cancel).map(Self)
+    }
+
+    fn node(path: &Path, cancel: Option<&Cancel>) -> Result<Option<Node>, Error> {
+        if cancel.is_some_and(Cancel::is_cancelled) {
+            return Ok(None);
+        }
         let meta = match fs::symlink_metadata(path) {
             Ok(meta) => meta,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -263,7 +305,7 @@ impl Tree {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(error) => return Err(error.into()),
                 };
-                children.extend(Self::node(&entry.path())?);
+                children.extend(Self::node(&entry.path(), cancel)?);
             }
         }
         Ok(Some(Node {
