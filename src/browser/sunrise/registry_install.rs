@@ -77,6 +77,9 @@ fn remember_unfit_sha256(base: &str, sha256: &str) {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum InstallProgress {
+    CheckingBuild,
+    UnpackingBuild,
+    FinishingBuild,
     PreparingBuild,
     Checking,
     /// Another build or a cache cleanup holds the build folder: this install waits for it.
@@ -96,6 +99,19 @@ pub enum InstallProgress {
     Building(Option<f32>),
     Publishing,
     Reviewing,
+}
+
+impl From<crate::backend::InstallPhase> for InstallProgress {
+    fn from(phase: crate::backend::InstallPhase) -> Self {
+        use crate::backend::InstallPhase;
+        match phase {
+            InstallPhase::Checking => Self::CheckingBuild,
+            InstallPhase::Downloading(fraction) => Self::DownloadingBuild(fraction),
+            InstallPhase::Unpacking => Self::UnpackingBuild,
+            InstallPhase::Finishing => Self::FinishingBuild,
+            InstallPhase::Preparing => Self::PreparingBuild,
+        }
+    }
 }
 
 #[derive(Debug)]

@@ -163,6 +163,20 @@ fn confirm_label(tag: &str, current: Option<&str>) -> String {
     }
 }
 
+fn reinstall_label(
+    tag: &str,
+    installing: Option<&(String, backend::InstallPhase)>,
+    detail: Option<&str>,
+) -> String {
+    let Some((_, phase)) = installing.filter(|(started, _)| started == tag) else {
+        return tr("Reinstall for this architecture").into();
+    };
+    if let (backend::InstallPhase::Preparing, Some(detail)) = (*phase, detail) {
+        return detail.to_owned();
+    }
+    crate::mods_page::install::stage_label((*phase).into())
+}
+
 /// What the sheet offers for the picked build. Another build the profile can switch to is
 /// chosen in one press, which downloads and prepares it first when it needs that: a pick that
 /// only downloaded left the profile on its old build, still "the latest" (a player's report,
@@ -568,14 +582,10 @@ impl Launcher {
         let reinstall = pick.as_ref().and_then(|tag| {
             self.architecture_repair(tag)?;
             let tag = tag.clone();
-            let label = match &self.installing {
-                Some((started, progress)) if started == &tag => trf(
-                    "Installing · {percent}%",
-                    &[("percent", &format!("{:.0}", progress * 100.))],
-                ),
-                _ => tr("Reinstall for this architecture").to_owned(),
-            };
-            let button = button("alt-versions-reinstall", label);
+            let button = button(
+                "alt-versions-reinstall",
+                reinstall_label(&tag, self.installing.as_ref(), self.play_detail.as_deref()),
+            );
             Some(if self.can_repair_now(&tag) {
                 button.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     // Recheck the exact offer and the active jobs at click.
@@ -926,6 +936,32 @@ fn bench_wheel_event(bounds: gpui::Bounds<gpui::Pixels>, step: f32) -> gpui::Pla
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn architecture_reinstall_reports_only_the_picked_builds_phase() {
+        use backend::InstallPhase;
+        let tag = "26.3-0.1.0";
+        let active = |phase| (tag.to_owned(), phase);
+        let detail = "Copying the prepared game files: 2 of 8";
+        for (phase, label) in [
+            (InstallPhase::Checking, "Checking the build…"),
+            (InstallPhase::Downloading(0.25), "Downloading the build 25%"),
+            (InstallPhase::Unpacking, "Unpacking the build"),
+            (InstallPhase::Finishing, "Putting the build in place"),
+            (InstallPhase::Preparing, "Getting the build ready…"),
+        ] {
+            let installing = active(phase);
+            assert_eq!(reinstall_label(tag, Some(&installing), None), label);
+            assert_eq!(
+                reinstall_label("other", Some(&installing), Some(detail)),
+                "Reinstall for this architecture"
+            );
+        }
+        assert_eq!(
+            reinstall_label(tag, Some(&active(InstallPhase::Preparing)), Some(detail)),
+            detail
+        );
+    }
 
     #[test]
     fn confirmation_names_the_picked_build_only_when_switching() {

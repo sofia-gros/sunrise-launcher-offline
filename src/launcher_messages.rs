@@ -390,17 +390,32 @@ impl Launcher {
                         }
                     }
                 }
-                Msg::Progress(tag, p) => {
-                    self.bar = (self.bar.1, p);
-                    self.switch_download_progress(&tag, p);
-                    self.installing = Some((tag, p));
+                Msg::Progress(tag, phase) => {
+                    let Some((_, current)) = self
+                        .installing
+                        .as_mut()
+                        .filter(|(active, _)| *active == tag)
+                    else {
+                        continue;
+                    };
+                    let key = crate::eta::install_stage_key;
+                    if key((*current).into()) != key(phase.into()) {
+                        self.play_detail = None;
+                    }
+                    *current = phase;
+                    self.switch_download_progress(&tag, phase);
                 }
                 Msg::Installed(tag, result) => {
-                    self.installing = None;
+                    if self
+                        .installing
+                        .take_if(|(active, _)| *active == tag)
+                        .is_none()
+                    {
+                        continue;
+                    }
                     if self.starting_client.is_none() && !self.preparing {
                         self.play_detail = None;
                     }
-                    self.bar = (0., 0.);
                     self.refresh_installed();
                     if let Some(warning) = self.record_nightly_receipt_outcome(&tag, &result) {
                         glass_toast::say(trf(

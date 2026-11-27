@@ -101,7 +101,6 @@ impl Launcher {
             architecture_reinstall: None,
             instance_install: None,
             install_next: None,
-            bar: (0., 0.),
             releases: Load::Loading,
             installed,
             known_nightly,

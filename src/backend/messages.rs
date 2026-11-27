@@ -5,7 +5,7 @@ pub enum Msg {
     Storage(Result<Box<crate::storage::Report>, String>),
     Releases(Result<Vec<Release>, String>),
     Links(Links),
-    Progress(String, f32),
+    Progress(String, InstallPhase),
     Installed(String, Result<InstallOutcome, String>),
     NightlyReceiptRetried(Arc<NightlyReceiptWarning>, Result<(), String>),
     /// A Storage removal finished; any failed removal names its build.
