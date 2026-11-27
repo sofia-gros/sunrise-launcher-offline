@@ -385,13 +385,16 @@ fn inside_placeholder(bytes: &[u8], start: usize, end: usize) -> bool {
         b"<secret>",
     ];
     let search_from = start.saturating_sub(PRIVATE.len());
-    let Some(rel) = bytes[search_from..end].iter().rposition(|&b| b == b'<') else {
-        return false;
-    };
-    let open = search_from + rel;
-    LABELS
+    bytes[search_from..end]
         .iter()
-        .any(|label| bytes[open..].starts_with(label) && start < open + label.len() && end > open)
+        .enumerate()
+        .filter(|&(_, &b)| b == b'<')
+        .any(|(rel, _)| {
+            let open = search_from + rel;
+            LABELS.iter().any(|label| {
+                bytes[open..].starts_with(label) && start < open + label.len() && end > open
+            })
+        })
 }
 
 /// Substring occurrences of `term`, in any case, without rewriting scrubber placeholders.
@@ -859,6 +862,9 @@ mod tests {
             s.scrub("access_token=<secret> from 10.0.0.1 for Private Profile"),
             "access_token=<secret> from <ip> for <private>"
         );
+        // A term containing `<` must still see an earlier enclosing placeholder.
+        let angle = Scrubber::bare().term("ate>foo<b").term("Private Profile");
+        assert_eq!(angle.scrub("Private Profilefoo<bar"), "<private>foo<bar");
     }
 
     #[test]

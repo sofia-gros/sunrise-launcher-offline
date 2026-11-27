@@ -100,6 +100,16 @@ pub fn carry_over(data: &Path, config: &Path) -> Result<bool, String> {
     let game = crate::identity::game_folder_in(data);
     let stage = launcher.with_file_name(".carry-over");
     let leftover = launcher.with_file_name(LEFTOVER);
+    // Lock-free fast paths so steady-state launches and clean installs with no earlier launcher
+    // never leave a `.carry-over.lock` dotfile behind. Check `game`/`launcher_in_use` before
+    // `!present(&stage)` so an in-progress publish that already renamed one target still takes
+    // the lock and rechecks everything underneath it.
+    if (present(&game)? || launcher_in_use(&launcher)?) && !present(&stage)? {
+        return Ok(false);
+    }
+    if !present(&stage)? && find_earlier_roots(data, config)?.is_none() {
+        return Ok(false);
+    }
     // Shared startup leases allow two first-run launchers to enter carry-over together.
     // Serialize the shared staging directory across read, copy, resume, publish, and cleanup.
     let _lock =
@@ -119,14 +129,7 @@ pub fn carry_over(data: &Path, config: &Path) -> Result<bool, String> {
     if present(&game)? || launcher_in_use(&launcher)? {
         return Ok(false);
     }
-    let mut source = None;
-    for &(old_launcher, old_game, location) in crate::identity::EARLIER {
-        if let Some(roots) = earlier_roots(data, config, old_launcher, old_game, location)? {
-            source = Some(roots);
-            break;
-        }
-    }
-    let Some(source) = source else {
+    let Some(source) = find_earlier_roots(data, config)? else {
         return Ok(false);
     };
     if refuse_link(&stage)?.is_some() {
@@ -398,6 +401,15 @@ fn refuse_link(path: &Path) -> Result<Option<fs::Metadata>, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("{}: {e}", path.display())),
     }
+}
+
+fn find_earlier_roots(data: &Path, config: &Path) -> Result<Option<Roots>, String> {
+    for &(old_launcher, old_game, location) in crate::identity::EARLIER {
+        if let Some(roots) = earlier_roots(data, config, old_launcher, old_game, location)? {
+            return Ok(Some(roots));
+        }
+    }
+    Ok(None)
 }
 
 /// An earlier launcher's folders, when its launcher or game folder exists: where its
@@ -1306,6 +1318,28 @@ mod tests {
         );
         assert_eq!(files(&game), expected_game);
         assert!(!launcher.with_file_name(".carry-over").exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn steady_state_and_clean_starts_do_not_create_carry_over_lock() {
+        let (data, config, base) = scratch("no-lock-fast-path");
+        fs::create_dir_all(&data).unwrap();
+        let launcher = crate::identity::launcher_folder_in(&data);
+        let lock = launcher.with_file_name(".carry-over.lock");
+        assert_eq!(carry_over(&data, &config), Ok(false));
+        assert!(!lock.exists(), "clean install should not create {lock:?}");
+
+        if let Some(&(old_launcher, _, _)) = crate::identity::EARLIER.first() {
+            fs::create_dir_all(data.join(old_launcher)).unwrap();
+            let game = crate::identity::game_folder_in(&data);
+            fs::create_dir_all(&game).unwrap();
+            assert_eq!(carry_over(&data, &config), Ok(false));
+            assert!(
+                !lock.exists(),
+                "steady-state start should not create {lock:?}"
+            );
+        }
         let _ = fs::remove_dir_all(&base);
     }
 
