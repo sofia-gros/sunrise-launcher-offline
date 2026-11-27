@@ -33,16 +33,25 @@ impl Storage {
                 .partition(|entry| entry.category == category);
             remaining = rest;
             let mut row = Row::new(category);
-            let measured = refused(units, std::slice::from_mut(&mut row), cancel, |_| false);
+            let mut seen = HashSet::new();
+            for entry in units {
+                if cancel.is_cancelled() {
+                    return Ok(None);
+                }
+                let measured = measure_entry(&entry, &mut row, cancel, false);
+                if cancel.is_cancelled() {
+                    return Ok(None);
+                }
+                if let Some(tree) = measured.map_err(redact_error)? {
+                    row.has_candidates |= entry.is_candidate(&tree);
+                    row.bytes = row.bytes.saturating_add(tree.size(&mut seen));
+                }
+            }
             if cancel.is_cancelled() {
                 return Ok(None);
             }
-            let (units, trees) = measured.map_err(redact_error)?;
-            row.bytes = allocated(&units, &trees, category);
+            row.measured = true;
             row.remaining_bytes = row.bytes;
-            if cancel.is_cancelled() {
-                return Ok(None);
-            }
             report.push(row);
             counted(&report);
         }

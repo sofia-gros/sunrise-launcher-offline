@@ -434,3 +434,61 @@ fn clear_mod_build_slots_unlinks_directory_links_without_touching_their_target()
     assert!(fs::symlink_metadata(work.join("linked-slot")).is_err());
     assert_eq!(fs::read(canary).unwrap(), vec![7; 8192]);
 }
+
+#[cfg(unix)]
+#[test]
+fn rows_distinguish_zero_byte_candidates_from_wholly_refused_and_mixed_reasons() {
+    let home = Home::new();
+    let canary = home.seed("outside/player-data");
+    fs::create_dir_all(home.0.join("native/w")).unwrap();
+    let slot = home.0.join("native/w/only-link");
+    std::os::unix::fs::symlink(&canary, &slot).unwrap();
+    let broken = home.seed("rust/broken/output");
+    std::os::unix::fs::symlink(&canary, broken.with_file_name("unexpected-link")).unwrap();
+    let storage = Storage::at(&home.0).unwrap();
+    let count = storage.report(None, false).unwrap();
+    let row = |category| {
+        count
+            .rows
+            .iter()
+            .find(|row| row.category == category)
+            .unwrap()
+    };
+    let link_only = row(Category::ModBuildCache);
+    assert_eq!(link_only.measured_bytes(), Some(0));
+    assert_eq!(link_only.eligibility(), Eligibility::Candidate);
+    let refused = row(Category::RustCompiler);
+    assert_eq!(refused.measured_bytes(), Some(0));
+    assert_eq!(refused.eligibility(), Eligibility::WhollyRefused);
+    assert!(refused.only_kept_kind(KeptKind::Unsafe));
+
+    let lockpath = home.seed("cargo/.package-cache");
+    let lock = fs::File::options()
+        .read(true)
+        .write(true)
+        .open(lockpath)
+        .unwrap();
+    lock.lock().unwrap();
+    let cleared = storage.report(Some(Category::RustCompiler), false).unwrap();
+    let mixed = cleared
+        .rows
+        .iter()
+        .find(|row| row.category == Category::RustCompiler)
+        .unwrap();
+    assert!(mixed.kept.iter().any(|unit| unit.kind == KeptKind::Unsafe));
+    assert!(mixed.kept.iter().any(|unit| unit.kind == KeptKind::Busy));
+    assert!(!mixed.only_kept_kind(KeptKind::Unsafe));
+    assert!(!mixed.older_build_kept);
+    let unselected = cleared
+        .rows
+        .iter()
+        .find(|row| row.category == Category::ModBuildCache)
+        .unwrap();
+    assert_eq!(unselected.measured_bytes(), None);
+    assert_eq!(unselected.eligibility(), Eligibility::NotMeasured);
+    storage
+        .report(Some(Category::ModBuildCache), false)
+        .unwrap();
+    assert!(fs::symlink_metadata(slot).is_err());
+    assert!(canary.is_file());
+}

@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 mod inventory;
-pub use inventory::{Report, Row};
+pub use inventory::{Eligibility, Kept, KeptKind, Report, Row};
 
 /// Path-free presentation for Storage surfaces, including fatal errors and kept units.
 pub fn error_message(error: Error) -> String {
@@ -314,7 +314,11 @@ pub(crate) fn entries_calls() -> usize {
 }
 
 /// Allocation identities from one validated walk, independent of directory shape.
-pub(crate) struct Tree(HashMap<(u64, u64), u64>);
+pub(crate) struct Tree {
+    allocations: HashMap<(u64, u64), u64>,
+    present: bool,
+    has_payload: bool,
+}
 
 #[cfg(test)]
 type WalkHook = Box<dyn Fn(&Path)>;
@@ -342,23 +346,27 @@ impl Tree {
     fn walk(path: &Path, cancel: Option<&Cancel>, skip_links: bool) -> Result<Self, Error> {
         #[cfg(test)]
         WALKS.with(|walks| walks.set(walks.get() + 1));
-        let mut found = HashMap::new();
-        Self::visit(path, cancel, skip_links, &mut found)?;
-        Ok(Self(found))
+        let mut tree = Self {
+            allocations: HashMap::new(),
+            present: false,
+            has_payload: false,
+        };
+        tree.present = tree.visit(path, cancel, skip_links)?;
+        Ok(tree)
     }
 
     fn visit(
+        &mut self,
         path: &Path,
         cancel: Option<&Cancel>,
         skip_links: bool,
-        found: &mut HashMap<(u64, u64), u64>,
-    ) -> Result<(), Error> {
+    ) -> Result<bool, Error> {
         if cancel.is_some_and(Cancel::is_cancelled) {
-            return Ok(());
+            return Ok(false);
         }
         let meta = match fs::symlink_metadata(path) {
             Ok(meta) => meta,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error.into()),
         };
         #[cfg(test)]
@@ -369,11 +377,15 @@ impl Tree {
         });
         if linked(&meta) {
             if skip_links {
-                return Ok(());
+                self.has_payload = true;
+                return Ok(true);
             }
             return match fs::read_link(path) {
-                Ok(target) if known_link(&target) => Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Ok(target) if known_link(&target) => {
+                    self.has_payload = true;
+                    Ok(true)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
                 _ => Err(Error::Unsafe(path.to_owned())),
             };
         }
@@ -382,13 +394,15 @@ impl Tree {
         }
         let (id, bytes) = match allocation(path, &meta) {
             Ok(allocated) => allocated,
-            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(false)
+            }
             Err(error) => return Err(error),
         };
         if meta.is_dir() {
             let entries = match fs::read_dir(path) {
                 Ok(entries) => entries,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
                 Err(error) => return Err(error.into()),
             };
             for entry in entries {
@@ -400,16 +414,21 @@ impl Tree {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(error) => return Err(error.into()),
                 };
-                Self::visit(&entry.path(), cancel, skip_links, found)?;
+                self.visit(&entry.path(), cancel, skip_links)?;
             }
+        } else if path
+            .file_name()
+            .is_some_and(|name| !crate::cache_cleanup::reserved(Path::new(name)))
+        {
+            self.has_payload = true;
         }
-        found.entry(id).or_insert(bytes);
-        Ok(())
+        self.allocations.entry(id).or_insert(bytes);
+        Ok(true)
     }
 
     /// The allocated bytes not already in `seen`, including links shared across units.
     pub(crate) fn size(&self, seen: &mut HashSet<(u64, u64)>) -> u64 {
-        self.0.iter().fold(0u64, |total, (&id, &bytes)| {
+        self.allocations.iter().fold(0u64, |total, (&id, &bytes)| {
             if seen.insert(id) {
                 total.saturating_add(bytes)
             } else {
