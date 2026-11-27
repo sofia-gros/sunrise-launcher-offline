@@ -1617,10 +1617,11 @@ fn pre_launch_hook_runs_outside_the_manifest_lock_and_reacquires_before_spawn() 
                 Err(StartError::Other(SENTINEL.into()))
             },
         );
-        assert!(
-            matches!(result, Err(StartError::Other(ref detail)) if detail == SENTINEL),
-            "{result:?}"
-        );
+        match result {
+            Err(StartError::Other(detail)) => assert_eq!(detail, SENTINEL),
+            Err(other) => panic!("unexpected start error: {other:?}"),
+            Ok(_) => panic!("expected hook sentinel error"),
+        }
         assert!(marker.is_file(), "hook did not acquire the manifest lock");
         assert_eq!(FULL_VERIFICATIONS.take(), expected_verifies);
     }

@@ -142,7 +142,7 @@ impl LogFile {
     /// shifts each archive up by one, places the staged file at `launcher.1.log`, and opens a
     /// fresh `launcher.log`.
     fn rotate(&mut self) {
-        self.rotate_with(fs::rename);
+        self.rotate_with(rename_path);
     }
 
     fn rotate_with(&mut self, mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>) {
@@ -166,6 +166,10 @@ impl LogFile {
         let _ = rename(&staged, &name(1));
         *self = Self::open(&self.dir, self.limit);
     }
+}
+
+fn rename_path(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::rename(from, to)
 }
 
 static RING: Mutex<Ring> = Mutex::new(Ring::new());
