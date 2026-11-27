@@ -1089,10 +1089,15 @@ fi
     );
     assert_eq!(FULL_VERIFICATIONS.take(), 1);
     assert!(profile.active().unwrap().is_none());
-    assert!(crate::profile_txn::references(&home)
-        .unwrap()
-        .targets
-        .is_empty());
+    let before_reopen = crate::profile_txn::references(&home).unwrap();
+    assert!(before_reopen.pointer.is_none());
+    assert!(before_reopen.targets.contains(BUILD));
+    // A failed unsealed attempt keeps its safety fence until the next Play takes admission.
+    drop(profile);
+    let mut profile = Profile::open(&home, None).unwrap();
+    let recovered = crate::profile_txn::references(&home).unwrap();
+    assert!(recovered.pointer.is_none());
+    assert!(recovered.targets.is_empty());
     fs::write(snapshot_blob, BLOB).unwrap();
 
     // First Play, an unchanged Play, and a Play that refreshes for a changed mod.
