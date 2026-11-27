@@ -49,3 +49,21 @@ fn clear_reports_one_total_for_all_kept_units_in_a_row() {
         "3.0 MB stayed. Remove older game builds if you no longer use them, then try again."
     );
 }
+
+#[test]
+fn queued_count_error_cannot_settle_a_clear_or_reopened_count() {
+    let stale = storage::Cancel::default();
+    let error = Err("queued count error".into());
+    let mut view = settings::SettingsView::default();
+    view.storage_clear = Some(Err("previous clear error".into()));
+    for clearing in [true, false] {
+        let active = work(clearing);
+        let token = active.cancel.clone();
+        view.storage_work = Some(active);
+        assert_eq!(view.accept_storage(&stale, &error), None);
+        assert!(view.storage_busy());
+        assert!(matches!(&view.storage_clear, Some(Err(error)) if error == "previous clear error"));
+        assert_eq!(view.accept_storage(&token, &error), Some(clearing));
+        assert!(!view.storage_busy());
+    }
+}

@@ -2,7 +2,10 @@ use super::*;
 
 pub enum Msg {
     Playing(Option<u64>),
-    Storage(Result<Box<crate::storage::Report>, String>),
+    Storage(
+        crate::storage::Cancel,
+        Result<Box<crate::storage::Report>, String>,
+    ),
     Releases(Result<Vec<Release>, String>),
     Links(Links),
     Progress(String, InstallPhase),

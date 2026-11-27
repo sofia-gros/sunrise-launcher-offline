@@ -78,6 +78,25 @@ pub(crate) fn clear_question(asked: Option<Category>, bytes: Option<u64>) -> Str
     }
 }
 
+impl settings::SettingsView {
+    /// Reject queued outcomes from a cancelled or superseded worker before changing the view.
+    fn accept_storage(
+        &mut self,
+        token: &storage::Cancel,
+        result: &Result<Box<storage::Report>, String>,
+    ) -> Option<bool> {
+        let work = self
+            .storage_work
+            .as_ref()
+            .filter(|work| work.cancel.is(token))?;
+        let clearing = work.clearing;
+        if result.as_ref().map_or(true, |report| report.is_complete()) {
+            self.storage_work = None;
+        }
+        Some(clearing)
+    }
+}
+
 impl Launcher {
     /// Counts every row (`clear` and `all` unset), or clears one row or all of them. A count
     /// shows nothing it counted before: each row says "Counting…" until its own count is in.
@@ -98,19 +117,18 @@ impl Launcher {
             clearing,
         });
         self.storage_error = None;
-        if !clearing {
-            self.storage_report = None;
+        self.storage_report = None;
+        if clearing {
+            self.ui.settings.storage_clear = None;
         }
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             let send = |result: Result<Box<storage::Report>, String>| {
-                let _ = tx.send(Msg::Storage(result));
+                let _ = tx.send(Msg::Storage(cancel.clone(), result));
             };
             let result = storage::Storage::open().and_then(|storage| {
                 if clearing {
-                    storage
-                        .report(clear, all)
-                        .map(|report| Some(report.tagged(&cancel)))
+                    storage.report(clear, all).map(Some)
                 } else {
                     // The last row arrives as the whole report, below.
                     storage.count(&cancel, |rows| {
@@ -131,35 +149,32 @@ impl Launcher {
     }
 
     /// Rows counted so far, or the finished count or Clear, from the worker.
-    pub(super) fn storage_arrived(&mut self, result: Result<Box<storage::Report>, String>) {
-        let work = self.ui.settings.storage_work.as_ref();
+    pub(super) fn storage_arrived(
+        &mut self,
+        token: storage::Cancel,
+        result: Result<Box<storage::Report>, String>,
+    ) {
+        let Some(clearing) = self.ui.settings.accept_storage(&token, &result) else {
+            return;
+        };
+        if clearing {
+            self.ui.settings.storage_clear = Some(result);
+            if self.ui.page == frame::Page::Settings
+                && self.ui.settings.section == settings::Section::Storage
+            {
+                self.refresh_storage(None, false);
+            }
+            return;
+        }
         match result {
-            Ok(report) => {
-                // What a count that was cancelled or overtaken sent before it noticed is dropped.
-                if !work.is_some_and(|work| report.is_from(&work.cancel)) {
-                    return;
-                }
-                if report.is_complete() {
-                    self.ui.settings.storage_work = None;
-                }
-                self.storage_report = Some(*report);
-                self.storage_error = None;
-            }
-            Err(error) => {
-                self.ui.settings.storage_work = None;
-                self.storage_error = Some(error);
-            }
+            Ok(report) => self.storage_report = Some(*report),
+            Err(error) => self.storage_error = Some(error),
         }
     }
 
-    /// Counts the rows again when the page is shown with some of them missing: an earlier
-    /// count was stopped by leaving it. A failed count waits for an explicit Recount.
+    /// Starts the initial count if no entry or background refresh has started one yet.
     pub(super) fn resume_storage_count(&mut self) {
-        let incomplete = self
-            .storage_report
-            .as_ref()
-            .is_none_or(|report| !report.is_complete());
-        if incomplete && !self.ui.settings.storage_busy() && self.storage_error.is_none() {
+        if self.storage_report.is_none() && self.storage_error.is_none() {
             self.refresh_storage(None, false);
         }
     }
