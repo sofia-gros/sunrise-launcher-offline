@@ -130,16 +130,6 @@ fn remove(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Refuses a link at `path`; whether it is there at all is the caller's to say.
-fn unlinked(path: &Path) -> Result<Option<Metadata>, Error> {
-    match fs::symlink_metadata(path) {
-        Ok(meta) if linked(&meta) => Err(Error::Unsafe(path.to_owned())),
-        Ok(meta) => Ok(Some(meta)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-    }
-}
-
 /// The folders of a work slot the SDK's tool keeps and reuses, checked for links one level at a
 /// time before any of them is handed to a compiler: the slot itself, `prebuilt-build` and
 /// `prebuilt-package`, each build folder in `prebuilt-build`, and in it `target` and `stage-*`.
@@ -147,26 +137,21 @@ fn sdk_owned(slot: &Path) -> Result<(), Error> {
     if checked(slot, true)?.is_none() {
         return Ok(());
     }
-    for name in ["prebuilt-build", "prebuilt-package"] {
-        let folder = slot.join(name);
-        if unlinked(&folder)?.is_some_and(|meta| !meta.is_dir()) {
-            return Err(Error::Unsafe(folder));
-        }
-    }
+    checked(&slot.join("prebuilt-package"), true)?;
     let builds = slot.join("prebuilt-build");
-    if unlinked(&builds)?.is_none() {
+    if checked(&builds, true)?.is_none() {
         return Ok(());
     }
     for build in fs::read_dir(&builds)? {
         let build = build?.path();
-        if !unlinked(&build)?.is_some_and(|meta| meta.is_dir()) {
+        if checked(&build, true)?.is_none() {
             continue;
         }
         for entry in fs::read_dir(&build)? {
             let entry = entry?;
             let name = entry.file_name();
             if name == "target" || name.to_string_lossy().starts_with("stage-") {
-                unlinked(&entry.path())?;
+                checked(&entry.path(), true)?;
             }
         }
     }

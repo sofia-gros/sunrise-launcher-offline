@@ -253,6 +253,15 @@ impl Workspace {
     }
 
     pub(super) fn isolate(&self, command: &mut std::process::Command) -> io::Result<()> {
+        if self.slot.is_some() {
+            let work = self.work();
+            let log = work.join("build.log");
+            match regular_under(&work, &log) {
+                Ok(()) => fs::remove_file(log)?,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => (),
+                Err(err) => return Err(err),
+            }
+        }
         let path = self.path();
         let tmp = path.join("tmp");
         fs::create_dir_all(&tmp)?;

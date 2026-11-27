@@ -713,6 +713,48 @@ fn a_link_poisoned_slot_is_removed_without_following_it_and_built_cold() {
     canaries();
 }
 
+#[cfg(unix)]
+#[test]
+fn a_persistent_sdk_invocation_refuses_a_linked_build_log() {
+    let (dir, lease, build) = leased();
+    let mut stage = Workspace::new(&build.join("native")).unwrap();
+    assert!(stage
+        .attach(&lease, key(crate::native_mods::Target::Client))
+        .unwrap());
+    let log = stage.work().join("build.log");
+    let canary = dir.path().join("outside.log");
+    fs::write(&canary, b"untouched").unwrap();
+    std::os::unix::fs::symlink(&canary, &log).unwrap();
+    let mut command = std::process::Command::new("unused");
+    assert!(stage.isolate(&mut command).is_err());
+    assert_eq!(fs::read(&canary).unwrap(), b"untouched");
+    fs::remove_file(&log).unwrap();
+    fs::write(&log, b"old diagnostics").unwrap();
+    stage.isolate(&mut command).unwrap();
+    assert!(!log.exists());
+}
+
+#[test]
+fn a_file_in_an_sdk_owned_folder_position_resets_the_slot() {
+    let (_dir, lease, build) = leased();
+    let native = build.join("native");
+    let client = key(crate::native_mods::Target::Client);
+    let mut first = Workspace::new(&native).unwrap();
+    assert!(first.attach(&lease, client.clone()).unwrap());
+    for name in [
+        "prebuilt-build/key",
+        "prebuilt-build/key/target",
+        "prebuilt-build/key/stage-1",
+    ] {
+        let wrong_type = first.work().join(name);
+        fs::create_dir_all(wrong_type.parent().unwrap()).unwrap();
+        fs::write(wrong_type, b"not a folder").unwrap();
+        let mut stage = Workspace::new(&native).unwrap();
+        assert!(stage.attach(&lease, client.clone()).unwrap());
+        assert!(listing(&stage.work()).is_empty(), "{name}");
+    }
+}
+
 #[test]
 fn a_failed_kept_slot_is_emptied_and_built_cold_once_after_a_proved_stop() {
     let (_dir, lease, build) = leased();
