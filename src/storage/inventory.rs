@@ -8,6 +8,15 @@ use crate::{backend, instances, native_mods};
 use serde::Serialize;
 use std::sync::Arc;
 
+// Only files the game can regenerate from authoritative inputs may be offered here.
+const PROFILE_GAME_CACHES: [&str; 5] = [
+    ".sunrise-cache/behaviours-v7.bin",
+    ".sunrise-cache/registry-v1.bin",
+    ".sunrise-cache/mod-content",
+    ".sunrise-cache/resourcepacks",
+    "cache/dx12-shaders.bin",
+];
+
 const BUILD_CACHES: [BuildCache; 11] = [
     BuildCache::Source,
     BuildCache::Tools,
@@ -491,6 +500,11 @@ impl Storage {
     fn detached_trash(&self, entries: &mut Vec<Entry>, data: &Root) -> Result<(), Error> {
         let parents: HashSet<_> = entries
             .iter()
+            .filter(|entry| {
+                !PROFILE_GAME_CACHES
+                    .iter()
+                    .any(|relative| entry.relative == Path::new(relative))
+            })
             .filter_map(|entry| entry.path.parent().map(Path::to_owned))
             .chain([
                 self.root.clone(),
@@ -766,9 +780,14 @@ fn profile_caches(entries: &mut Vec<Entry>, profiles: &[instances::Instance]) ->
         let root = Root::open(&instance.home)?;
         old_logs(entries, &root)?;
         unused_jars(entries, &root)?;
-        for relative in [".sunrise-cache", "cache"] {
-            add(entries, &root, relative, Category::OtherCaches)?;
-        }
+        profile_game_caches(entries, &root)?;
+    }
+    Ok(())
+}
+
+fn profile_game_caches(entries: &mut Vec<Entry>, home: &Root) -> Result<(), Error> {
+    for relative in PROFILE_GAME_CACHES {
+        add(entries, home, relative, Category::OtherCaches)?;
     }
     Ok(())
 }
@@ -853,6 +872,44 @@ fn unused_jars(entries: &mut Vec<Entry>, home: &Root) -> Result<(), Error> {
 #[cfg(test)]
 mod manual_tests {
     use super::*;
+
+    #[test]
+    fn profile_game_cache_inventory_counts_only_the_rebuildable_entries() {
+        let home = crate::storage::tests::Home::new();
+        let files = [
+            home.seed(".sunrise-cache/behaviours-v7.bin"),
+            home.seed(".sunrise-cache/registry-v1.bin"),
+            home.seed(".sunrise-cache/mod-content/out"),
+            home.seed(".sunrise-cache/resourcepacks/out"),
+            home.seed("cache/dx12-shaders.bin"),
+        ];
+        let canaries = [
+            home.seed(".sunrise-cache/player-data"),
+            home.seed("cache/unknown/keep"),
+            home.seed("cache/.trash-unrelated/keep"),
+        ];
+        let root = Root::open(&home.0).unwrap();
+        let mut entries = Vec::new();
+        profile_game_caches(&mut entries, &root).unwrap();
+        // Simulate a profile separate from both the build root and launcher data directory.
+        let launcher = crate::storage::tests::Home::new();
+        let storage = Storage::at(&launcher.0).unwrap();
+        let data = Root::open(&launcher.0).unwrap();
+        storage.detached_trash(&mut entries, &data).unwrap();
+        assert_eq!(entries.len(), 5);
+        for file in files {
+            assert_eq!(
+                entries
+                    .iter()
+                    .filter(|entry| file.starts_with(&entry.path))
+                    .count(),
+                1
+            );
+        }
+        for file in canaries {
+            assert!(!entries.iter().any(|entry| file.starts_with(&entry.path)));
+        }
+    }
 
     #[test]
     fn refused_units_are_residual_with_bytes_and_reason() {
