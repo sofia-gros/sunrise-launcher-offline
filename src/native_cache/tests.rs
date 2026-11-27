@@ -236,10 +236,12 @@ fn an_ancestor_redirect_cannot_remove_external_player_data() {
     match fs::rename(&managed, &old) {
         Ok(()) => link_dir(&outside, &managed),
         Err(error) => {
-            // Windows can forbid renaming the ancestor while the lease is open. That OS
-            // barrier also protects the player data; validate it instead of skipping the case.
+            // Windows forbids renaming `managed` while `Cache` holds an open directory handle
+            // (`build_dir`) directly on `managed` (ERROR_SHARING_VIOLATION, os error 32) or open
+            // handles inside it (ERROR_ACCESS_DENIED, os error 5). That OS barrier also protects
+            // the player data; validate it instead of skipping the case.
             assert!(
-                cfg!(windows) && error.kind() == io::ErrorKind::PermissionDenied,
+                cfg!(windows) && matches!(error.raw_os_error(), Some(5 | 32)),
                 "{error}"
             );
             assert_eq!(fs::read(&original).unwrap(), b"original cache");
