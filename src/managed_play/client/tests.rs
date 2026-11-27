@@ -1260,7 +1260,9 @@ fi
     fs::write(&archive, serde_json::to_vec(&wrong_receipt).unwrap()).unwrap();
     let error = ready(&mut profile).unwrap_err();
     assert!(
-        matches!(error, StartError::Other(detail) if detail.contains("managed_play/artifact.rs:"))
+        matches!(&error, StartError::Native(native_mods::Failed::Other(detail), None)
+            if detail.contains("managed_play/artifact.rs:")),
+        "{error:?}"
     );
     assert_eq!(FULL_VERIFICATIONS.take(), 0);
     fs::write(&archive, receipt).unwrap();
@@ -1268,7 +1270,9 @@ fi
     fs::write(&preparer, b"not the saved preparer").unwrap();
     let error = ready(&mut profile).unwrap_err();
     assert!(
-        matches!(error, StartError::Other(detail) if detail.contains("managed_play/artifact.rs:"))
+        matches!(&error, StartError::Native(native_mods::Failed::Other(detail), None)
+            if detail.contains("managed_play/artifact.rs:")),
+        "{error:?}"
     );
     assert_eq!(FULL_VERIFICATIONS.take(), 0);
     fs::remove_file(&preparer).unwrap();
