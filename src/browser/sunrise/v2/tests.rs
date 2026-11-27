@@ -603,3 +603,27 @@ fn the_loaded_serial_is_read_without_the_refresh_lock() {
     drop(held);
     assert!(answer.is_ok(), "loaded_serial waited on the refresh lock");
 }
+
+/// The serial reads back exactly across the whole `u64` range the index's schema allows: a
+/// refresh from the second-highest serial to the highest is seen as a change, and an answer a
+/// worker records at the highest serial still matches it afterwards, so the redraw that follows
+/// keeps it rather than starting the check again (review of #671).
+#[test]
+fn the_loaded_serial_reads_back_the_top_two_serials_exactly() {
+    publish_loaded_serial(u64::MAX - 1);
+    let before = loaded_serial();
+    assert_eq!(before, Some(u64::MAX - 1));
+    publish_loaded_serial(u64::MAX);
+    assert_ne!(
+        loaded_serial(),
+        before,
+        "the refresh to the top serial is a change"
+    );
+    // What Home's lookup and the picker's preview record with an answer at this index.
+    let recorded = Some(u64::MAX);
+    assert_eq!(
+        loaded_serial(),
+        recorded,
+        "an answer at the top serial stays current, so its redraw doesn't start the check again"
+    );
+}
