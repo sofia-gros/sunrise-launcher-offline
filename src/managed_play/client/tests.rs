@@ -909,6 +909,9 @@ fn play_hashes_the_prepared_files_once_and_still_refuses_damage() {
     use std::cell::Cell;
     const TEST: &str =
         "managed_play::client::tests::play_hashes_the_prepared_files_once_and_still_refuses_damage";
+    #[cfg(target_os = "linux")]
+    const BUILD: &str = "developer-snapshot-recovery";
+    #[cfg(not(target_os = "linux"))]
     const BUILD: &str = "v0.1.8";
     const BLOB: &[u8] = b"original bytes";
     const FIXTURE: &str = "PLAY_ONE_HASH_FIXTURE";
@@ -929,6 +932,8 @@ fn play_hashes_the_prepared_files_once_and_still_refuses_damage() {
             )
             .env("SUNRISE_NO_KEYCHAIN", "1")
             .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("SUNRISE_LAUNCHER_DEVELOPER_OFFLINE", "1")
+            .env("SUNRISE_MOD_INDEX_V2", root.path().join("no-index.signed"))
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -960,6 +965,7 @@ fn play_hashes_the_prepared_files_once_and_still_refuses_damage() {
         ("SUNRISE_LAUNCHER_HOME", "launcher"),
         ("SUNRISE_LAUNCHER_LOCATION_FILE", "location"),
         ("XDG_CONFIG_HOME", "config"),
+        ("SUNRISE_MOD_INDEX_V2", "no-index.signed"),
     ] {
         let path = fixture.join(name);
         assert_eq!(std::env::var_os(var).as_deref(), Some(path.as_os_str()));
@@ -975,8 +981,31 @@ fn play_hashes_the_prepared_files_once_and_still_refuses_damage() {
     fs::write(prepared.join("sunrise-resources.json"), b"{}").unwrap();
     fs::write(prepared.join("fixture-blob.bin"), BLOB).unwrap();
     fs::write(build.join(".installed"), []).unwrap();
+    #[cfg(not(target_os = "linux"))]
     let client_bytes = b"unchanged client";
+    #[cfg(target_os = "linux")]
+    let client_bytes = br#"#!/bin/sh
+if [ "$1" = --launch-api ]; then
+  echo '{"options":[{"name":"--developer-single-player"}]}'
+else
+  touch "$SUNRISE_HOME/snapshot-recovery-started"
+fi
+"#;
     fs::write(build.join(backend::CLIENT), client_bytes).unwrap();
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            build.join(backend::CLIENT),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        fs::write(
+            build.join("developer.json"),
+            json!({"revision": "b".repeat(40)}).to_string(),
+        )
+        .unwrap();
+    }
     fs::create_dir_all(home.join(mod_list::DIR)).unwrap();
     let write_package = |version: &str| {
         let body = format!("id='lantern'\nname='Lantern'\nversion='{version}'\napi='{}'\ncapabilities=['registries']\n", manifest::API);
@@ -1147,6 +1176,35 @@ fn play_hashes_the_prepared_files_once_and_still_refuses_damage() {
         backend::finish_preparation(BUILD, &preparation).unwrap();
     }
     assert_eq!(intact(&mut profile), advanced);
+
+    #[cfg(target_os = "linux")]
+    {
+        drop(profile);
+        let marker = home.join("snapshot-recovery-started");
+        assert!(!marker.exists());
+        FULL_VERIFICATIONS.take();
+        let mut game = Client {
+            instance: &instance,
+            accepted_account: None,
+            explicit_account: false,
+            piped: false,
+        }
+        .start_with_recovery(
+            None,
+            || panic!("the repaired profile is already bound"),
+            |_| Ok(()),
+            |_| Ok(()),
+            &cancellation,
+            |_| {},
+        )
+        .unwrap();
+        assert!(game.child.wait().unwrap().success());
+        assert!(marker.is_file());
+        assert_eq!(FULL_VERIFICATIONS.take(), 1);
+        drop(game);
+        profile = Profile::open(&home, None).unwrap();
+        assert_eq!(profile.active().unwrap(), Some(advanced.clone()));
+    }
 
     // A client snapshot cannot authorize its own replacement by claiming to be server-only.
     let manifest_file = advanced.resource_path().join("sunrise-resources.json");
