@@ -3,7 +3,11 @@
 use super::*;
 
 impl Launcher {
-    pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new_with_startup_checks(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        startup_checks: bool,
+    ) -> Self {
         crate::eta::preload_timings();
         // A press on something that then leaves the page (a row that opens its page, a tab)
         // would leave the keyboard on nothing, and Tab dead until the next click.
@@ -264,8 +268,10 @@ impl Launcher {
         });
         this.load_profile_heads();
         this.load_auth_statuses(true);
-        this.check_updates(UpdateCheck::Startup);
-        this.fetch_links();
+        if startup_checks {
+            this.check_updates(UpdateCheck::Startup);
+            this.fetch_links();
+        }
         telemetry::send_in_background();
         telemetry::watch_playing(this.tx.clone());
         this

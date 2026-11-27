@@ -1262,7 +1262,7 @@ mod tests {
         settings.save().unwrap();
 
         let mut app = gpui::TestAppContext::single();
-        let (shell, cx) = app.add_window_view(crate::window_root::Shell::new);
+        let (shell, cx) = app.add_window_view(crate::window_root::Shell::new_for_test);
         let launcher = shell.read_with(cx, |shell, _| shell.launcher());
         launcher.update(cx, |l, cx| {
             l.show_installed_mods();
@@ -1342,7 +1342,7 @@ mod tests {
         settings.save().unwrap();
 
         let mut app = gpui::TestAppContext::single();
-        let (shell, cx) = app.add_window_view(crate::window_root::Shell::new);
+        let (shell, cx) = app.add_window_view(crate::window_root::Shell::new_for_test);
         let launcher = shell.read_with(cx, |shell, _| shell.launcher());
         // Opened at the 251st mod, as Home's mod count opens it at one.
         launcher.update(cx, |l, cx| {
@@ -1455,7 +1455,8 @@ mod tests {
             return;
         }
         let mut app = gpui::TestAppContext::single();
-        let (launcher, cx) = app.add_window_view(Launcher::new);
+        let (launcher, cx) =
+            app.add_window_view(|window, cx| Launcher::new_with_startup_checks(window, cx, false));
         launcher.update(cx, |l, _| {
             l.ui.page = Page::Home;
             l.ui.mods.find.set("faithful".into());
