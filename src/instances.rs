@@ -703,7 +703,13 @@ pub(crate) fn profile_homes_strict(game: &Path) -> Result<Vec<PathBuf>, String> 
 }
 
 fn list_in(game_home: &Path, data: &Path) -> Vec<Instance> {
-    list_with_snapshot(game_home, data, true, || {})
+    let instances = list_with_snapshot(game_home, data, true, || {});
+    for instance in &instances {
+        if instance.id != DEFAULT {
+            crate::launcher_log::hide(&instance.name);
+        }
+    }
+    instances
 }
 
 fn list_with_snapshot(

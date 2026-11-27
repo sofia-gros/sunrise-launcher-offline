@@ -460,10 +460,6 @@ fn main() {
             std::process::exit(status);
         }
     }
-    // After the child-process modes above, which are not launcher runs and would only add header
-    // lines; `data_dir()` is settled by now (it never fails: a location that does not open
-    // stands in as the default folders).
-    sunrise_launcher::launcher_log::init(&sunrise_launcher::backend::data_dir().join("logs"));
     startup::run();
 }
 

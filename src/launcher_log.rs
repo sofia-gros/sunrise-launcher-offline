@@ -18,6 +18,17 @@ const RING_LINES: usize = 5000;
 const FILE_LIMIT: u64 = 1 << 20;
 /// How many rotated files are kept: `launcher.1.log` to `launcher.3.log`.
 const OLD_FILES: u32 = 3;
+fn rotation_name(index: u32) -> String {
+    match index {
+        0 => "launcher.log".into(),
+        n => format!("launcher.{n}.log"),
+    }
+}
+
+pub(crate) fn is_rotation_file(name: &std::ffi::OsStr) -> bool {
+    (0..=OLD_FILES).any(|index| name == std::ffi::OsStr::new(&rotation_name(index)))
+}
+
 /// What replaces a secret.
 const SECRET: &str = "<secret>";
 /// Query, form and JSON keys whose values are secrets. A key matches as the end of a longer
@@ -90,7 +101,7 @@ impl LogFile {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(dir.join("launcher.log"))
+            .open(dir.join(rotation_name(0)))
             .ok();
         let size = file
             .as_ref()
@@ -126,10 +137,7 @@ impl LogFile {
     fn rotate(&mut self) {
         // Windows can't rename an open file, nor onto an existing one.
         self.file = None;
-        let name = |n: u32| match n {
-            0 => self.dir.join("launcher.log"),
-            n => self.dir.join(format!("launcher.{n}.log")),
-        };
+        let name = |n| self.dir.join(rotation_name(n));
         for n in (0..OLD_FILES).rev() {
             let _ = fs::remove_file(name(n + 1));
             let _ = fs::rename(name(n), name(n + 1));
@@ -224,9 +232,14 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// Starts the file: `dir/launcher.log`, rotated at 1 MiB into launcher.1.log .. launcher.3.log
-/// (oldest dropped). Called once by `main()` before anything else logs, for the window and the
-/// command line alike. Without it (tests, other tools) lines go only to the ring.
+/// (oldest dropped). Called after the data location and carry-over settle, for the window and the
+/// command line alike. Until then, lines go only to the ring.
 pub fn init(dir: &Path) {
+    hide_path(&crate::backend::data_dir());
+    hide_path(&crate::backend::game_home());
+    if let Some(parent) = dir.parent() {
+        hide_path(parent);
+    }
     {
         let mut file = lock(&FILE);
         if file.is_some() {
@@ -530,6 +543,24 @@ fn http_status(text: &str) -> Option<u16> {
     })
 }
 
+fn hide_path(path: &Path) {
+    if !path.is_absolute()
+        || !path
+            .components()
+            .any(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        return;
+    }
+    let text = path.to_string_lossy();
+    let text = text.trim_end_matches(std::path::is_separator);
+    hide(text);
+    #[cfg(windows)]
+    {
+        hide(text.replace('\\', "/"));
+        hide(text.replace('\\', "\\\\"));
+    }
+}
+
 /// Hide `term` from now on (an account name, a server address). Terms under 3 chars ignored.
 /// The accounts are read often, so a term already hidden is skipped.
 pub fn hide(term: impl Into<String>) {
@@ -567,7 +598,7 @@ fn scrubber() -> Arc<Scrubber> {
 
 /// The scrub every shown, copied or saved line passes (the game's lines in the panel too).
 pub fn scrub(text: &str) -> String {
-    hide_secrets(&scrubber().scrub(text))
+    scrubber().scrub(&hide_secrets(text))
 }
 
 /// `text` with `SECRET` in place of what looks like a credential: a JWT, a bearer token, the
@@ -706,6 +737,97 @@ macro_rules! elog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn isolated(test: &str, run: impl FnOnce(&Path, &Path, &Path)) {
+        const CHILD: &str = "SUNRISE_TEST_LOG_PRIVACY_ROOT";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = PathBuf::from(root);
+            run(
+                &root.join("custom-launcher"),
+                &root.join("custom-game"),
+                &root.join("custom-log-root/logs"),
+            );
+            println!("log-privacy-check-completed");
+            return;
+        }
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("launcher_log::tests::{test}"),
+                "--nocapture",
+            ])
+            .env(CHILD, root)
+            .env("SUNRISE_LAUNCHER_HOME", root.join("custom-launcher"))
+            .env("SUNRISE_HOME", root.join("custom-game"))
+            .env("SUNRISE_LAUNCHER_LOCATION_FILE", root.join("location.json"))
+            .env("SUNRISE_NO_KEYCHAIN", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("log-privacy-check-completed"),
+            "{output:?}"
+        );
+    }
+
+    #[test]
+    fn log_init_hides_custom_roots_inside_longer_paths() {
+        isolated(
+            "log_init_hides_custom_roots_inside_longer_paths",
+            |data, game, logs| {
+                init(logs);
+                for root in [data, game, logs.parent().unwrap()] {
+                    assert_eq!(
+                        scrub(&format!("Could not open {}/saves/example", root.display())),
+                        "Could not open <private>/saves/example"
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn listing_hides_profile_names_but_not_sunrise() {
+        isolated(
+            "listing_hides_profile_names_but_not_sunrise",
+            |data, game, _| {
+                let name = "Private Observatory Profile";
+                fs::create_dir_all(game.join("instances/observatory")).unwrap();
+                fs::create_dir_all(data).unwrap();
+                fs::write(
+                    data.join("instances.json"),
+                    serde_json::json!({"instances": {"observatory": {"name": name}}}).to_string(),
+                )
+                .unwrap();
+                assert!(crate::instances::list()
+                    .iter()
+                    .any(|instance| instance.name == name));
+                assert_eq!(scrub(&format!("Sunrise: {name}")), "Sunrise: <private>");
+            },
+        );
+    }
+
+    #[test]
+    fn private_terms_cannot_disable_credential_or_address_redaction() {
+        isolated(
+            "private_terms_cannot_disable_credential_or_address_redaction",
+            |_, _, _| {
+                hide("token");
+                hide("Connecting");
+                assert_eq!(scrub("access_token=abc123def"), "access_<private>=<secret>");
+                assert_eq!(
+                    scrub("Connecting to secret.example.org:25565"),
+                    "<private> to <private>:25565"
+                );
+                assert_eq!(
+                    scrub("Connecting to secret.example.org, 25565"),
+                    "<private> to <private>, 25565"
+                );
+            },
+        );
+    }
 
     #[test]
     fn a_sign_in_trace_carries_no_secret_and_keeps_hosts_and_statuses() {
