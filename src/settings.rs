@@ -97,6 +97,12 @@ pub(super) struct SettingsView {
     pub(super) storage_work: Option<glass_storage::Work>,
 }
 
+impl SettingsView {
+    pub(super) fn storage_busy(&self) -> bool {
+        self.storage_work.is_some()
+    }
+}
+
 /// A card of rows with a rule between them.
 pub(crate) fn group(rows: Vec<Div>) -> Div {
     let mut card = div()
@@ -875,7 +881,7 @@ impl Launcher {
             }),
         );
 
-        let busy = self.storage_pending;
+        let busy = self.ui.settings.storage_busy();
         // The total waits for every row; a row shows its own size as soon as it is counted.
         let complete = self.storage_report.as_ref().filter(|r| r.is_complete());
         let total =

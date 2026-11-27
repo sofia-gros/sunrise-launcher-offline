@@ -97,7 +97,6 @@ impl Launcher {
             cancel: cancel.clone(),
             clearing,
         });
-        self.storage_pending = true;
         self.storage_error = None;
         if !clearing {
             self.storage_report = None;
@@ -142,14 +141,12 @@ impl Launcher {
                 }
                 if report.is_complete() {
                     self.ui.settings.storage_work = None;
-                    self.storage_pending = false;
                 }
                 self.storage_report = Some(*report);
                 self.storage_error = None;
             }
             Err(error) => {
                 self.ui.settings.storage_work = None;
-                self.storage_pending = false;
                 self.storage_error = Some(error);
             }
         }
@@ -162,7 +159,7 @@ impl Launcher {
             .storage_report
             .as_ref()
             .is_none_or(|report| !report.is_complete());
-        if incomplete && !self.storage_pending && self.storage_error.is_none() {
+        if incomplete && !self.ui.settings.storage_busy() && self.storage_error.is_none() {
             self.refresh_storage(None, false);
         }
     }
@@ -172,7 +169,6 @@ impl Launcher {
     pub(super) fn stop_storage_work(&mut self) {
         if let Some(count) = self.ui.settings.storage_work.take_if(|work| !work.clearing) {
             count.cancel.cancel();
-            self.storage_pending = false;
         }
         self.stop_storage_builds_count();
     }
@@ -204,5 +200,22 @@ pub(crate) fn category_about(category: Category) -> &'static str {
             tr("The compiler that builds native mods: downloaded again the next time one is built.")
         }
         Category::OtherCaches => tr("Other downloads kept to make the launcher faster."),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn storage_busy_follows_the_active_worker_slot() {
+    let mut view = settings::SettingsView::default();
+    assert!(!view.storage_busy());
+    for clearing in [false, true] {
+        view.storage_work = Some(Work {
+            cancel: storage::Cancel::default(),
+            clearing,
+        });
+        assert!(view.storage_busy());
+        assert_eq!(clear_offered(view.storage_work.as_ref()), !clearing);
+        view.storage_work.take();
+        assert!(!view.storage_busy());
     }
 }

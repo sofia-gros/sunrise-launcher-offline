@@ -216,7 +216,6 @@ struct Launcher {
     removing: Vec<String>,
     storage_builds: storage_builds::View,
     storage_report: Option<storage::Report>,
-    storage_pending: bool,
     /// A Clear the player still has to confirm: `Some(None)` is Clear all.
     storage_confirm: Option<Option<storage::Category>>,
     storage_error: Option<String>,
