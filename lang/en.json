@@ -688,5 +688,6 @@
   "Game builds kept for running servers: downloaded again when needed.": "Game builds kept for running servers: downloaded again when needed.",
   "The compiler that builds native mods: downloaded again the next time one is built.": "The compiler that builds native mods: downloaded again the next time one is built.",
   "Other downloads kept to make the launcher faster.": "Other downloads kept to make the launcher faster.",
-  "No sound (the game will be silent): {why}": "No sound (the game will be silent): {why}"
+  "No sound (the game will be silent): {why}": "No sound (the game will be silent): {why}",
+  "Checking the build…": "Checking the build…"
 }

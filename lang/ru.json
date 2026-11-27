@@ -2027,5 +2027,6 @@
   "The game packages native mods are built against: downloaded again when needed.": "The game packages native mods are built against: downloaded again when needed.",
   "Game builds kept for running servers: downloaded again when needed.": "Game builds kept for running servers: downloaded again when needed.",
   "The compiler that builds native mods: downloaded again the next time one is built.": "The compiler that builds native mods: downloaded again the next time one is built.",
-  "Other downloads kept to make the launcher faster.": "Other downloads kept to make the launcher faster."
+  "Other downloads kept to make the launcher faster.": "Other downloads kept to make the launcher faster.",
+  "Checking the build…": "Checking the build…"
 }
