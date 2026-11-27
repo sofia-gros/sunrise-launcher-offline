@@ -601,7 +601,6 @@ impl Instance {
     pub fn resolve_version(&self, requested: Option<&str>) -> Result<String, String> {
         match (requested, &self.version) {
             (None, Some(pinned)) => backend::resolve_version(Some(pinned)).map_err(|_| {
-                register_profile(self);
                 crate::i18n::trf(
                     "{profile} uses {build}, which is not installed. Install it, or use Switch to choose another build.",
                     &[("profile", &self.name), ("build", pinned)],
@@ -641,7 +640,9 @@ pub fn calendar_time(since_epoch: Duration) -> Option<SystemTime> {
 /// The instances, by the default game home and the launcher's data folder: Sunrise first, then
 /// by group and name.
 pub fn list() -> Vec<Instance> {
-    list_in(&backend::game_home(), &backend::data_dir())
+    let out = list_in(&backend::game_home(), &backend::data_dir());
+    register_profile_names(&out);
+    out
 }
 
 /// Read the atomic metadata snapshot without housekeeping or taking a profile gate.
@@ -659,14 +660,13 @@ pub(crate) fn list_for_storage_until(
     }
     let data = backend::data_dir();
     let store = Store::read(&data)?;
-    Ok(list_snapshot_until(
-        &backend::game_home(),
-        &data,
-        store,
-        true,
-        false,
-        &|| cancel.is_cancelled(),
-    ))
+    let out = list_snapshot_until(&backend::game_home(), &data, store, true, false, &|| {
+        cancel.is_cancelled()
+    });
+    if let Some(instances) = &out {
+        register_profile_names(instances);
+    }
+    Ok(out)
 }
 
 /// Read the profile directories without the migrations or housekeeping of `list`.
@@ -902,7 +902,6 @@ fn list_snapshot_until(
         });
     }
     out[1..].sort_by_key(|i| (i.group.clone(), i.name.to_lowercase()));
-    register_profile_names(&out);
     Some(out)
 }
 
@@ -933,13 +932,11 @@ pub fn delete(query: &str) -> Result<Instance, String> {
 
 /// A completed deletion stays completed even if saving the new selection fails.
 pub fn delete_with_selection(query: &str) -> Result<(Instance, Result<(), String>), String> {
-    let gone = delete_in(
-        &backend::game_home(),
-        &backend::data_dir(),
-        query,
-        &crate::desktop_seams::to_trash,
-    )
-    .map_err(|error| error.to_string())?;
+    let game_home = backend::game_home();
+    let data = backend::data_dir();
+    register_profile_names(&list_with_snapshot(&game_home, &data, false, || {}));
+    let gone = delete_in(&game_home, &data, query, &crate::desktop_seams::to_trash)
+        .map_err(|error| error.to_string())?;
     let mut settings = backend::Settings::load();
     let saved = if clear_deleted_selection(&mut settings, &gone.id) {
         settings.save()
@@ -960,6 +957,7 @@ pub fn clear_deleted_selection(settings: &mut backend::Settings, id: &str) -> bo
 /// Move the exact folder shown in the window's confirmation, not a fresh lookup by slug.
 /// The caller saves its selection once the move settles.
 pub fn trash_confirmed(instance: Instance) -> Result<Instance, DeleteError> {
+    register_profile(&instance);
     delete_selected(
         &backend::game_home(),
         &backend::data_dir(),
@@ -1016,7 +1014,6 @@ fn delete_selected(
     instance: Instance,
     trash: &dyn Fn(&Path) -> Result<(), String>,
 ) -> Result<Instance, DeleteError> {
-    register_profile(&instance);
     if instance.kind == Kind::Pack {
         return Err(registry_pack::remove_unavailable().into());
     }
@@ -1092,6 +1089,7 @@ fn delete_selected_at(
 /// Resolve headless Play without repairing unrelated profile metadata on a refused request.
 pub fn for_play(query: Option<&str>) -> Result<Instance, String> {
     let all = list_with_snapshot(&backend::game_home(), &backend::data_dir(), false, || {});
+    register_profile_names(&all);
     let found = match query {
         Some(name) => find_in(&all, name),
         None => selection_in(&all, backend::Settings::load().instance.as_deref()),
@@ -1136,6 +1134,7 @@ pub fn retired_selection_message(id: &str) -> String {
 /// selection is an error naming it, so nothing is written to Sunrise's setup in its place.
 pub fn read_profile(query: Option<&str>) -> Result<Instance, String> {
     let all = list_with_snapshot(&backend::game_home(), &backend::data_dir(), false, || {});
+    register_profile_names(&all);
     match query {
         Some(name) => find_in(&all, name),
         None => selection_in(&all, backend::Settings::load().instance.as_deref()),
@@ -1205,15 +1204,18 @@ const PLAYER_FILES: &[&str] = &["options.txt", "sunrise-player.txt"];
 /// Creates an instance named `name`: empty but for the player's options and offline name, or a
 /// copy of `from`'s game folder (its worlds, options and packs). Nothing of `from` changes.
 pub fn create(name: &str, from: Option<&str>) -> Result<Instance, String> {
+    crate::launcher_log::hide_profile_name(name);
     let from = from.map(find).transpose()?;
-    create_whole_in(
+    let created = create_whole_in(
         &backend::game_home(),
         &backend::data_dir(),
         name,
         from.as_ref(),
         None,
         |_| {},
-    )
+    )?;
+    register_profile(&created);
+    Ok(created)
 }
 
 /// The directory and build the creation picker told the player it would duplicate.
@@ -1272,7 +1274,11 @@ pub fn create_with(
     picture: Option<Option<&[u8]>>,
     choose: impl FnOnce(&mut Meta),
 ) -> Result<Instance, String> {
-    create_with_publish(
+    crate::launcher_log::hide_profile_name(name);
+    if let Some(from) = from {
+        register_profile(&from.instance);
+    }
+    let created = create_with_publish(
         &backend::game_home(),
         &backend::data_dir(),
         name,
@@ -1280,12 +1286,13 @@ pub fn create_with(
         picture,
         choose,
         |_| {},
-    )
+    )?;
+    register_profile(&created);
+    Ok(created)
 }
 
 /// What creating or renaming an instance says when another already has `name`.
 pub fn name_taken(name: &str) -> String {
-    crate::launcher_log::hide_profile_name(name);
     crate::i18n::trf(
         "There is already a profile called {name}. Choose another name.",
         &[("name", name)],
@@ -1324,11 +1331,7 @@ fn create_with_publish(
     if name.is_empty() {
         return Err("A profile needs a name.".into());
     }
-    crate::launcher_log::hide_profile_name(name);
     let from = copy.map(CopyFrom::instance);
-    if let Some(from) = from {
-        register_profile(from);
-    }
     if let Some(from) = from.filter(|f| f.kind == Kind::Pack) {
         return Err(format!(
             "{} plays its pack's mods: import the pack again for a second copy.",
@@ -1609,7 +1612,21 @@ pub(crate) fn sync_build_choice(
 
 /// Changes what the player chose about an instance: its name, icon or group. No folder moves.
 pub fn edit(query: &str, change: impl FnOnce(&mut Meta)) -> Result<Instance, String> {
-    edit_in(&backend::game_home(), &backend::data_dir(), query, change)
+    let game_home = backend::game_home();
+    let data = backend::data_dir();
+    register_profile_names(&list_in(&game_home, &data));
+    let mut proposed_name = None;
+    let result = edit_in(&game_home, &data, query, |meta| {
+        change(meta);
+        proposed_name = meta.name.clone();
+    });
+    if let Some(name) = proposed_name {
+        crate::launcher_log::hide_profile_name(&name);
+    }
+    if let Ok(instance) = &result {
+        register_profile(instance);
+    }
+    result
 }
 
 fn edit_in(
@@ -1641,7 +1658,6 @@ fn edit_in(
             if name.is_empty() {
                 return Err(crate::i18n::tr("A profile needs a name.").into());
             }
-            crate::launcher_log::hide_profile_name(&name);
             // Only a new name is checked: an import can share a name, and changing anything
             // else about it must still work.
             let renamed = !name.eq_ignore_ascii_case(&instance.name);

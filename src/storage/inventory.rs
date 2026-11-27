@@ -275,11 +275,81 @@ struct Entry {
     directory: Option<Arc<Dir>>,
     relative: PathBuf,
     path: PathBuf,
+    root_id: Option<(u64, u64)>,
     profile: Option<Arc<ProfileContext>>,
+}
+
+fn held_entry_identity(
+    root: &Dir,
+    relative: &Path,
+    owns_links: bool,
+) -> Result<Option<(u64, u64)>, Error> {
+    let Some(name) = relative.file_name() else {
+        return Ok(None);
+    };
+    let mut parent = root.try_clone()?;
+    for part in relative.parent().unwrap_or(Path::new("")).components() {
+        match parent.open_dir_nofollow(part.as_os_str()) {
+            Ok(next) => parent = next,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let name = Path::new(name);
+    let meta = match parent.symlink_metadata(name) {
+        Ok(meta) => meta,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    #[cfg(windows)]
+    let is_link = {
+        use cap_std::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    };
+    #[cfg(not(windows))]
+    let is_link = meta.file_type().is_symlink();
+    if is_link {
+        return if owns_links {
+            Ok(None)
+        } else {
+            Err(Error::Unsafe(relative.to_owned()))
+        };
+    }
+    if !meta.is_dir() && !meta.is_file() {
+        return Ok(None);
+    }
+    match entry_identity(&parent, name, meta.is_dir(), relative) {
+        Ok(id) => Ok(Some(id)),
+        Err(Error::Io(error))
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) || (cfg!(windows) && error.raw_os_error() == Some(32)) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 impl Entry {
     fn fixed(root: &Root, relative: &Path, category: Category) -> Result<Self, Error> {
+        let owns_links = category == Category::ModBuildCache || is_compiler_attempt(relative);
         let mut path = root.path.clone();
         let mut components = relative.components().peekable();
         while let Some(component) = components.next() {
@@ -288,12 +358,7 @@ impl Entry {
             };
             path.push(component);
             match fs::symlink_metadata(&path) {
-                Ok(meta)
-                    if linked(&meta)
-                        && !(components.peek().is_none()
-                            && (category == Category::ModBuildCache
-                                || is_compiler_attempt(relative))) =>
-                {
+                Ok(meta) if linked(&meta) && !(components.peek().is_none() && owns_links) => {
                     return Err(Error::Unsafe(path));
                 }
                 Ok(_) => {}
@@ -301,11 +366,16 @@ impl Entry {
                 Err(error) => return Err(error.into()),
             }
         }
+        let root_id = match &root.directory {
+            Some(directory) => held_entry_identity(directory, relative, owns_links)?,
+            None => None,
+        };
         Ok(Self {
             category,
             directory: root.directory.clone(),
             relative: relative.to_owned(),
             path,
+            root_id,
             profile: None,
         })
     }
@@ -917,7 +987,7 @@ impl Storage {
                 let result = if blocked_build_tools && entry.build_tool() {
                     Err(Error::Busy)
                 } else {
-                    entry.remove(retain, trees[index].root_id)
+                    entry.remove(retain, entry.root_id)
                 };
                 match result {
                     // Only a cleared folder is walked again, to see what is left of it.

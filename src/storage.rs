@@ -305,18 +305,17 @@ impl Storage {
     }
 }
 
-fn check_entry_identity(
+fn entry_identity(
     parent: &Dir,
     name: &Path,
     is_dir: bool,
-    expected: (u64, u64),
     path: &Path,
-) -> Result<(), Error> {
+) -> Result<(u64, u64), Error> {
     use cap_fs_ext::{FollowSymlinks, MetadataExt as _, OpenOptionsFollowExt};
     use cap_std::fs::OpenOptions;
-    let actual = if is_dir {
+    if is_dir {
         let meta = parent.open_dir_nofollow(name)?.dir_metadata()?;
-        (meta.dev(), meta.ino())
+        Ok((meta.dev(), meta.ino()))
     } else {
         let mut options = OpenOptions::new();
         options.read(true).follow(FollowSymlinks::No);
@@ -325,9 +324,18 @@ fn check_entry_identity(
         if !meta.is_file() {
             return Err(Error::Unsafe(path.to_owned()));
         }
-        (meta.dev(), meta.ino())
-    };
-    if actual != expected {
+        Ok((meta.dev(), meta.ino()))
+    }
+}
+
+fn check_entry_identity(
+    parent: &Dir,
+    name: &Path,
+    is_dir: bool,
+    expected: (u64, u64),
+    path: &Path,
+) -> Result<(), Error> {
+    if entry_identity(parent, name, is_dir, path)? != expected {
         return Err(Error::Unsafe(path.to_owned()));
     }
     Ok(())
@@ -364,7 +372,6 @@ pub(crate) fn entries_calls() -> usize {
 /// Allocation identities from one validated walk, independent of directory shape.
 pub(crate) struct Tree {
     allocations: HashMap<(u64, u64), u64>,
-    root_id: Option<(u64, u64)>,
     present: bool,
     has_payload: bool,
 }
@@ -397,11 +404,10 @@ impl Tree {
         WALKS.with(|walks| walks.set(walks.get() + 1));
         let mut tree = Self {
             allocations: HashMap::new(),
-            root_id: None,
             present: false,
             has_payload: false,
         };
-        tree.present = tree.visit(path, cancel, skip_links, true)?;
+        tree.present = tree.visit(path, cancel, skip_links)?;
         Ok(tree)
     }
 
@@ -410,7 +416,6 @@ impl Tree {
         path: &Path,
         cancel: Option<&Cancel>,
         skip_links: bool,
-        is_root: bool,
     ) -> Result<bool, Error> {
         if cancel.is_some_and(Cancel::is_cancelled) {
             return Ok(false);
@@ -450,9 +455,6 @@ impl Tree {
             }
             Err(error) => return Err(error),
         };
-        if is_root {
-            self.root_id = Some(id);
-        }
         if meta.is_dir() {
             let entries = match fs::read_dir(path) {
                 Ok(entries) => entries,
@@ -468,7 +470,7 @@ impl Tree {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(error) => return Err(error.into()),
                 };
-                self.visit(&entry.path(), cancel, skip_links, false)?;
+                self.visit(&entry.path(), cancel, skip_links)?;
             }
         } else if path
             .file_name()

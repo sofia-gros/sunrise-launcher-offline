@@ -1314,7 +1314,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(launcher.join("settings.json")).unwrap(),
-            r#"{"language":"en"}"#
+            "{\n  \"language\": \"en\"\n}"
         );
         assert_eq!(files(&game), expected_game);
         assert!(!launcher.with_file_name(".carry-over").exists());

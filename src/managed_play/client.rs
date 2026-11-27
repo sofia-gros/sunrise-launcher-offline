@@ -586,6 +586,30 @@ mod cli_log_tests {
 
     #[test]
     fn cli_play_prepare_and_meter_lines_land_in_launcher_log_without_ui_sink() {
+        const CHILD: &str = "SUNRISE_TEST_CLI_PLAY_LOG_CHILD";
+        const TEST: &str = "managed_play::client::cli_log_tests::cli_play_prepare_and_meter_lines_land_in_launcher_log_without_ui_sink";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .env("SUNRISE_LAUNCHER_HOME", root.path().join("launcher"))
+                .env("SUNRISE_HOME", root.path().join("game"))
+                .env(
+                    "SUNRISE_LAUNCHER_LOCATION_FILE",
+                    root.path().join("location"),
+                )
+                .env("SUNRISE_NO_KEYCHAIN", "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         crate::launcher_log::hide("Alex_CliPlay");
         let before = crate::launcher_log::since(0).0;
         let seen = std::cell::RefCell::new(Vec::new());
