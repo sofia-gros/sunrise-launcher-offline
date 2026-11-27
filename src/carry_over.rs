@@ -90,6 +90,10 @@ pub fn carry_over(data: &Path, config: &Path) -> Result<bool, String> {
     let game = crate::identity::game_folder_in(data);
     let stage = launcher.with_file_name(".carry-over");
     let leftover = launcher.with_file_name(LEFTOVER);
+    // Shared startup leases allow two first-run launchers to enter carry-over together.
+    // Serialize the shared staging directory across read, copy, resume, publish, and cleanup.
+    let _lock =
+        data_location::lock_exclusive_blocking(&launcher.with_file_name(".carry-over.lock"))?;
     if refuse_link(&stage)?.is_some() {
         let marker = refuse_link(&stage.join(COMPLETE))?;
         refuse_link(&stage.join("launcher"))?;
@@ -1207,6 +1211,60 @@ mod tests {
         assert_eq!(carry_over(&data, &config), Ok(true));
         let game = crate::identity::game_folder_in(&data);
         assert_eq!(access_rules(&game), restricted, "after carry-over rename");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn concurrent_carry_over_starts_serialize_and_publish_once() {
+        let Some(&(old_launcher, old_game, _)) = crate::identity::EARLIER.first() else {
+            return;
+        };
+        let (data, config, base) = scratch("concurrent");
+        let from_launcher = data.join(old_launcher);
+        let from_game = data.join(old_game);
+        fs::create_dir_all(&from_launcher).unwrap();
+        fs::write(from_launcher.join("accounts.json"), r#"{"accounts":[]}"#).unwrap();
+        fs::write(from_launcher.join("settings.json"), r#"{"language":"en"}"#).unwrap();
+        fs::create_dir_all(from_game.join("saves/World")).unwrap();
+        for index in 0..32 {
+            fs::write(
+                from_game.join(format!("saves/World/chunk-{index:02}.dat")),
+                vec![index as u8; 4096],
+            )
+            .unwrap();
+        }
+        let expected_game = files(&from_game);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let barrier = barrier.clone();
+            let data = data.clone();
+            let config = config.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                carry_over(&data, &config)
+            }));
+        }
+        let mut results: Vec<bool> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap().unwrap())
+            .collect();
+        results.sort();
+        assert_eq!(results, vec![false, true]);
+
+        let launcher = crate::identity::launcher_folder_in(&data);
+        let game = crate::identity::game_folder_in(&data);
+        assert_eq!(
+            fs::read_to_string(launcher.join("accounts.json")).unwrap(),
+            r#"{"accounts":[]}"#
+        );
+        assert_eq!(
+            fs::read_to_string(launcher.join("settings.json")).unwrap(),
+            r#"{"language":"en"}"#
+        );
+        assert_eq!(files(&game), expected_game);
+        assert!(!launcher.with_file_name(".carry-over").exists());
         let _ = fs::remove_dir_all(&base);
     }
 }

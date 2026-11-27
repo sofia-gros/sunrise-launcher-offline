@@ -294,6 +294,16 @@ fn lock_file(path: &Path, exclusive: bool) -> Result<MigrationLease> {
     Ok(MigrationLease(file))
 }
 
+/// Acquire an exclusive blocking OS lock on `path` using the same no-follow lock file rules.
+pub(crate) fn lock_exclusive_blocking(path: &Path) -> Result<MigrationLease> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| problem(parent, e))?;
+    }
+    let file = open_lock_file(path)?;
+    file.lock().map_err(|error| problem(path, error))?;
+    Ok(MigrationLease(file))
+}
+
 pub fn migrate_current(source: &Roots, target: &Path, progress: impl FnMut(&str)) -> Result<Roots> {
     migrate_current_with_prepare(source, target, progress, |_, _| Ok(()))
 }
