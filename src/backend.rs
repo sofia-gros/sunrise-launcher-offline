@@ -594,11 +594,16 @@ fn redact_urls_in_text(text: &str) -> String {
         out.push_str(&rest[..pos]);
         let tail = &rest[pos..];
         let mut end = scheme.len();
+        let mut in_query_or_frag = false;
         let bytes = tail.as_bytes();
         while end < bytes.len() {
             let b = bytes[end];
+            if b == b'?' || b == b'#' {
+                in_query_or_frag = true;
+            }
             if b.is_ascii_whitespace()
-                || matches!(b, b'"' | b'\'' | b'<' | b'>' | b')' | b']')
+                || matches!(b, b'"' | b'\'' | b'<' | b'>')
+                || (!in_query_or_frag && matches!(b, b')' | b']'))
                 || (b == b':' && bytes.get(end + 1) == Some(&b' '))
             {
                 break;
@@ -613,14 +618,13 @@ fn redact_urls_in_text(text: &str) -> String {
 }
 
 fn redact_transport(url: &str, transport: &ureq::Transport) -> String {
-    let rendered = transport.to_string();
-    let redacted = redact_url(url);
-    let replaced = if url.is_empty() {
-        rendered
-    } else {
-        rendered.replace(url, &redacted)
-    };
-    redact_urls_in_text(&replaced)
+    let mut rendered = transport.to_string();
+    for candidate in [Some(url), transport.url().map(url::Url::as_str)] {
+        if let Some(raw) = candidate.filter(|raw| !raw.is_empty()) {
+            rendered = rendered.replace(raw, &redact_url(raw));
+        }
+    }
+    redact_urls_in_text(&rendered)
 }
 
 pub(crate) fn get(url: &str) -> Result<ureq::Response, String> {
@@ -10786,8 +10790,20 @@ esac"#
             "https://example.invalid/sdk/v1: Connection Failed via socks5h://127.0.0.1:1080"
         );
 
-        // Live loopback checks for 404 (`get`), 403 (`get_unless_missing`, non-retried), and a
-        // refused transport error through `redact_transport`.
+        assert_eq!(
+            redact_urls_in_text("(https://alice:pw@example.invalid/path)"),
+            "(https://example.invalid/path)"
+        );
+        assert_eq!(
+            redact_urls_in_text(
+                "https://example.invalid/signed?sig=abc)s3cr3t_tail: Connection Failed"
+            ),
+            "https://example.invalid/signed: Connection Failed"
+        );
+
+        // Live loopback checks for 404 (`get`), 403 (`get_unless_missing`, non-retried),
+        // refused transport (`get_unless_missing`), and a failed redirect to a credential-bearing
+        // URL whose query contains `)`.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
@@ -10807,12 +10823,7 @@ esac"#
         let err_404 = get(&secret_url).expect_err("404 must fail");
         let err_403 = get_unless_missing(&secret_url).expect_err("403 must fail");
         server.join().unwrap();
-        let err_transport = match ureq::AgentBuilder::new().build().get(&secret_url).call() {
-            Err(ureq::Error::Transport(t)) => {
-                format!("No connection: {}", redact_transport(&secret_url, &t))
-            }
-            _ => panic!("closed listener must fail with transport error"),
-        };
+        let err_transport = get_unless_missing(&secret_url).expect_err("closed listener must fail");
         for error in [&err_404, &err_403, &err_transport] {
             for secret in ["alice", "s3cr3t", "tok123", "frag"] {
                 assert!(!error.contains(secret), "{secret} leaked in {error}");
@@ -10828,6 +10839,61 @@ esac"#
             err_transport.starts_with("No connection: "),
             "{err_transport}"
         );
+
+        let redirect_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let redirect_addr = redirect_listener.local_addr().unwrap();
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_addr = closed.local_addr().unwrap();
+        drop(closed);
+        let redirect_target =
+            format!("http://bob:pw@{closed_addr}/signed?sig=abc)s3cr3t_tail#frag2");
+        let redirect_response = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {redirect_target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let redirect_server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for _ in 0..=crate::download_retry::WAITS.len() {
+                if let Ok((mut stream, _)) = redirect_listener.accept() {
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf);
+                    let _ = stream.write_all(redirect_response.as_bytes());
+                }
+            }
+        });
+        let err_redirect = get_unless_missing(&format!("http://{redirect_addr}/download"))
+            .expect_err("redirect to closed listener must fail");
+        redirect_server.join().unwrap();
+        assert!(
+            err_redirect.starts_with("No connection: "),
+            "{err_redirect}"
+        );
+        assert!(
+            err_redirect.contains(&format!("http://{redirect_addr}/download")),
+            "expected safe origin/path in {err_redirect}"
+        );
+        for secret in ["bob", "pw", "abc)", "s3cr3t_tail", "frag2"] {
+            assert!(
+                !err_redirect.contains(secret),
+                "{secret} leaked in {err_redirect}"
+            );
+        }
+
+        let err_paren_query =
+            get_unless_missing(&redirect_target).expect_err("closed listener must fail");
+        assert!(
+            err_paren_query.starts_with("No connection: "),
+            "{err_paren_query}"
+        );
+        assert!(
+            err_paren_query.contains(&format!("http://{closed_addr}/signed")),
+            "expected safe origin/path in {err_paren_query}"
+        );
+        for secret in ["bob", "pw", "abc)", "s3cr3t_tail", "frag2"] {
+            assert!(
+                !err_paren_query.contains(secret),
+                "{secret} leaked in {err_paren_query}"
+            );
+        }
     }
 }
 
