@@ -3415,7 +3415,12 @@ mod tests {
             Some(new)
         );
         backend::need_prepared(native).unwrap();
-        assert!(backend::remove_version(old).unwrap_err().contains(native));
+        assert_eq!(resource_dependent(old).as_deref(), Some(native));
+        assert_eq!(
+            backend::remove_version(old).unwrap_err(),
+            crate::storage::error_message(crate::storage::Error::ResourceDependent(native.into()))
+        );
+        assert!(backend::installed().iter().any(|tag| tag == old));
         // (c) Switching the selected version leaves the build and its base as they are.
         let mut settings = backend::Settings::load();
         settings.selected = Some(new.into());
