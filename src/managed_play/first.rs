@@ -409,7 +409,9 @@ impl Profile {
             let Some(old) = self.active()? else {
                 return Ok(None);
             };
-            old.verify_artifacts()?;
+            // The prepared files are hashed once, by `verified_handoff` before the child. A
+            // damaged snapshot is never copied forward: the next generation keeps its digest.
+            old.verify_binaries()?;
             let epoch = inputs(&home)?;
             super::inputs::check_browser_rows(&home, &scan_packages(&home)?)?;
             if old.inputs == epoch && replacement.is_none() {
@@ -679,7 +681,8 @@ fn publish_generation(
 ) -> Result<Active, String> {
     let pointer = serde_json::to_vec(&active).map_err(|e| e.to_string())?;
     stage.seal(pointer, &[])?.publish(|| {
-        active.verify_artifacts()?;
+        // `verified_handoff` hashes the prepared files before the child; see `Profile::refresh`.
+        active.verify_binaries()?;
         if inputs(home)? != epoch {
             return Err(unsettled!());
         }

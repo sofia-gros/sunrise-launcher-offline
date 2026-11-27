@@ -827,7 +827,10 @@ impl Active {
         Ok(())
     }
 
-    pub fn verify_artifacts(&self) -> Result<(), String> {
+    /// The binaries and signed receipts only: milliseconds, unlike the prepared files. Play's
+    /// earlier checks use this; `Profile::verified_handoff` runs the full
+    /// [`Self::verify_artifacts`] right before the child exists.
+    pub fn verify_binaries(&self) -> Result<(), String> {
         let base = match &self.variant {
             Some(variant) => variant.verify(self.base())?,
             None => Artifact::capture(self.base())?,
@@ -838,6 +841,13 @@ impl Active {
         {
             return Err(unsettled!());
         }
+        Ok(())
+    }
+
+    pub fn verify_artifacts(&self) -> Result<(), String> {
+        self.verify_binaries()?;
+        #[cfg(test)]
+        FULL_VERIFICATIONS.with(|count| count.set(count.get() + 1));
         self.resources.verify(self.base())
     }
 
@@ -923,6 +933,12 @@ impl Active {
             mod_locks,
         })
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Full prepared-file verifications requested on this thread. Tests take it with `Cell::take`.
+    pub(crate) static FULL_VERIFICATIONS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 fn capture_mod_locks(home: &Path) -> Result<Vec<ModLock>, String> {
