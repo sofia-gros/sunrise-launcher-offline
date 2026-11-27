@@ -170,6 +170,48 @@ impl Entry {
     }
 }
 
+/// A folder's entries for a report that holds no build lease, so a folder or entry can vanish
+/// while it is read: that one is skipped, as the size walk skips one. Every other failure, and
+/// every link check on what is found, still stands.
+fn children(folder: &Path) -> Result<Vec<fs::DirEntry>, Error> {
+    let entries = match fs::read_dir(folder) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut found = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => found.push(entry),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    #[cfg(test)]
+    LISTED.with(|hook| {
+        if let Some(hook) = &*hook.borrow() {
+            hook(folder);
+        }
+    });
+    Ok(found)
+}
+
+// Lets a test change the disk between a folder's listing and what is done with its entries.
+#[cfg(test)]
+thread_local! {
+    static LISTED: std::cell::RefCell<Option<Box<dyn Fn(&Path)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `Ok(None)` for a result that failed only because its entry vanished.
+fn present<T>(result: std::io::Result<T>) -> Result<Option<T>, Error> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn usage_stamp(name: &Path) -> bool {
     let name = name.as_os_str().to_string_lossy();
     name == ".last-used" || (name.starts_with('.') && name.ends_with(".last-used"))
@@ -203,8 +245,7 @@ impl Storage {
             ) {
                 let parent = self.root.join(cache.relative());
                 if checked(&parent, true)?.is_some() {
-                    for child in fs::read_dir(parent)? {
-                        let child = child?;
+                    for child in children(&parent)? {
                         if usage_stamp(Path::new(&child.file_name())) {
                             continue;
                         }
@@ -242,20 +283,20 @@ impl Storage {
         // deletion goes through Cache, which also acquires Cargo's locks.
         let target = self.root.join("native/target");
         if checked(&target, true)?.is_some() {
-            for child in fs::read_dir(&target)? {
-                let child = child?;
+            for child in children(&target)? {
                 if crate::cache_cleanup::reserved(Path::new(&child.file_name()))
                     || usage_stamp(Path::new(&child.file_name()))
                 {
                     continue;
                 }
                 let relative = Path::new("native/target").join(child.file_name());
-                checked(&child.path(), child.file_type()?.is_dir())?;
-                if child.file_type()?.is_dir() && child.file_name().to_string_lossy().contains('-')
-                {
+                let Some(kind) = present(child.file_type())? else {
+                    continue;
+                };
+                checked(&child.path(), kind.is_dir())?;
+                if kind.is_dir() && child.file_name().to_string_lossy().contains('-') {
                     // Cross-compilation target triples own independent profile units too.
-                    for profile in fs::read_dir(child.path())? {
-                        let profile = profile?;
+                    for profile in children(&child.path())? {
                         if crate::cache_cleanup::reserved(Path::new(&profile.file_name()))
                             || usage_stamp(Path::new(&profile.file_name()))
                         {
@@ -293,24 +334,17 @@ impl Storage {
         }
         // Interrupted removal deliberately loses completion. Keep the remaining unit
         // visible for residual reporting and a safe retry, even though installed() omits it.
-        match fs::read_dir(data.path.join("versions")) {
-            Ok(children) => {
-                for child in children {
-                    let child = child?;
-                    if child.file_type()?.is_dir()
-                        && !child.path().join(".installed").is_file()
-                        && !child.file_name().to_string_lossy().starts_with(".trash-")
-                    {
-                        entries.push(Entry::fixed(
-                            &data,
-                            &Path::new("versions").join(child.file_name()),
-                            Category::SpareGameBuilds,
-                        )?);
-                    }
-                }
+        for child in children(&data.path.join("versions"))? {
+            if present(child.file_type())?.is_some_and(|kind| kind.is_dir())
+                && !child.path().join(".installed").is_file()
+                && !child.file_name().to_string_lossy().starts_with(".trash-")
+            {
+                entries.push(Entry::fixed(
+                    &data,
+                    &Path::new("versions").join(child.file_name()),
+                    Category::SpareGameBuilds,
+                )?);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
         }
         for relative in ["cache/github", "mod-browser", "profile-heads"] {
             add(&mut entries, &data, relative, Category::OtherCaches)?;
@@ -345,8 +379,7 @@ impl Storage {
             if root.directory.is_none() {
                 continue;
             }
-            for entry in fs::read_dir(&parent)? {
-                let entry = entry?;
+            for entry in children(&parent)? {
                 if entry.file_name().to_string_lossy().starts_with(".trash-") {
                     entries.push(Entry::fixed(
                         &root,
@@ -367,8 +400,7 @@ impl Storage {
         let native = self.root.join("native");
         let mut bytes = None;
         if checked(&native, true)?.is_some() {
-            for entry in fs::read_dir(&native)? {
-                let entry = entry?;
+            for entry in children(&native)? {
                 if entry.file_name().to_str().is_some_and(|name| {
                     name.starts_with(native_mods::ATTEMPT_PREFIX)
                         || name.starts_with(native_mods::OLD_ATTEMPT_PREFIX)
@@ -619,8 +651,7 @@ fn old_logs(entries: &mut Vec<Entry>, home: &Root) -> Result<(), Error> {
             continue;
         }
         let mut files = Vec::new();
-        for entry in fs::read_dir(&folder)? {
-            let entry = entry?;
+        for entry in children(&folder)? {
             if crate::cache_cleanup::reserved(Path::new(&entry.file_name()))
                 || usage_stamp(Path::new(&entry.file_name()))
             {
@@ -675,8 +706,7 @@ fn unused_jars(entries: &mut Vec<Entry>, home: &Root) -> Result<(), Error> {
             );
         }
     }
-    for entry in fs::read_dir(folder)? {
-        let entry = entry?;
+    for entry in children(&folder)? {
         if !crate::cache_cleanup::reserved(Path::new(&entry.file_name()))
             && !usage_stamp(Path::new(&entry.file_name()))
             && !referenced.contains(&entry.path())
@@ -772,6 +802,31 @@ mod manual_tests {
         assert!(row(Category::RustCompiler).freed_bytes > 0);
         assert!(row(Category::RustCompiler).kept.is_empty());
         assert!(!good.exists());
+    }
+
+    /// #649: without the build lease, a folder can be detached between its parent's listing and
+    /// its own, which skips it instead of failing the report.
+    #[test]
+    fn a_cross_target_directory_that_vanishes_does_not_fail_a_read_only_report() {
+        let home = crate::storage::tests::Home::new();
+        let triple = home.0.join("native/target/x86_64-unknown-test");
+        home.seed("native/target/x86_64-unknown-test/debug/out");
+        home.seed("native/target/debug/kept");
+        let storage = Storage::at(&home.0).unwrap();
+        let vanishing = triple.clone();
+        LISTED.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |folder| {
+                if folder.ends_with("native/target") {
+                    let _ = fs::remove_dir_all(&vanishing);
+                }
+            }));
+        });
+        let report = storage.report(None, false);
+        LISTED.with(|hook| hook.borrow_mut().take());
+        let report = report.unwrap();
+        assert!(!triple.exists());
+        assert!(report.rows[0].bytes > 0, "the unit that stayed is counted");
+        assert!(children(&home.0.join("gone")).unwrap().is_empty());
     }
 
     #[test]
