@@ -402,27 +402,59 @@ impl Profile {
         log: Option<&dyn Fn(std::sync::Arc<str>)>,
         replacement: Option<Resources>,
     ) -> Result<Option<Active>, native_mods::Failed> {
+        match self.refresh_for_play(mode, cancellation, progress, log, replacement) {
+            Ok(Some((active, _))) => Ok(Some(active)),
+            Ok(None) => Ok(None),
+            Err(RefreshError::Native(error)) => Err(error),
+            Err(RefreshError::Snapshot(error)) => Err(native_mods::Failed::Other(error)),
+        }
+    }
+
+    pub(super) fn refresh_for_play(
+        &mut self,
+        mode: native_mods::Profile,
+        cancellation: &native_mods::Cancellation,
+        progress: impl Fn(native_mods::Step),
+        log: Option<&dyn Fn(std::sync::Arc<str>)>,
+        replacement: Option<Resources>,
+    ) -> Result<Option<(Active, bool)>, RefreshError> {
         let home = self.home().to_owned();
-        let (old, epoch, stage) = {
+        let (old, epoch, stage, verified_resources) = {
             let _manifest = game_lock(&home)?;
             crate::browser::installed::recover_game_install(&home).map_err(String::from)?;
             let Some(old) = self.active()? else {
                 return Ok(None);
             };
-            // The prepared files are hashed once, by `verified_handoff` before the child. A
-            // damaged snapshot is never copied forward: the next generation keeps its digest.
+            // The prepared files are hashed once: before native compilation when refresh
+            // would compile, otherwise at `verified_handoff`. A damaged snapshot is never
+            // copied forward into a new digest.
             old.verify_binaries()?;
             let epoch = inputs(&home)?;
             super::inputs::check_browser_rows(&home, &scan_packages(&home)?)?;
             if old.inputs == epoch && replacement.is_none() {
                 super::verify_included(old.base(), old.executable(), &home)?;
-                return Ok(Some(old));
+                return Ok(Some((old, false)));
             }
+            let verified_resources = if replacement.is_none()
+                && needs_native_build(old.base(), old.executable(), &home)
+            {
+                old.resources
+                    .verify(old.base())
+                    .map_err(RefreshError::Snapshot)?;
+                true
+            } else {
+                false
+            };
             let _references = ReferencePublication::begin(&home)?;
             let tags = [old.base().to_owned(), old.executable().to_owned()]
                 .into_iter()
                 .collect();
-            (old, epoch, self.0.reserve(Intent::Install, tags)?)
+            (
+                old,
+                epoch,
+                self.0.reserve(Intent::Install, tags)?,
+                verified_resources,
+            )
         };
         let image = image_for_stage(
             old.base(),
@@ -447,13 +479,8 @@ impl Profile {
                 resources: replacement,
             },
         )?;
-        Ok(Some(publish_generation(
-            stage,
-            active,
-            &home,
-            epoch,
-            cancellation,
-        )?))
+        let published = publish_generation(stage, active, &home, epoch, cancellation)?;
+        Ok(Some((published, verified_resources)))
     }
 
     /// Recheck the actual committed generation immediately before creating its child.
@@ -794,6 +821,28 @@ fn publish_generation(
         cancellation.check()
     })?;
     Ok(active)
+}
+
+pub(super) enum RefreshError {
+    Native(native_mods::Failed),
+    Snapshot(String),
+}
+
+impl From<String> for RefreshError {
+    fn from(error: String) -> Self {
+        Self::Native(error.into())
+    }
+}
+
+impl From<native_mods::Failed> for RefreshError {
+    fn from(error: native_mods::Failed) -> Self {
+        Self::Native(error)
+    }
+}
+
+fn needs_native_build(base: &str, preferred: &str, home: &Path) -> bool {
+    super::verify_included(base, preferred, home).is_err()
+        && !crate::native_status::enabled(home).is_empty()
 }
 
 #[allow(clippy::too_many_arguments)]

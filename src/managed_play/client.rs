@@ -1,7 +1,7 @@
 //! Ordinary client Play keeps one admission on its worker through the actual spawn.
 use super::{
     catalogue,
-    first::{game_lock, VerifiedSnapshot},
+    first::{game_lock, RefreshError, VerifiedSnapshot},
     unsettled, Active, FirstBuild, Profile,
 };
 use crate::{
@@ -348,17 +348,22 @@ impl Client<'_> {
                 Some(prepared) => (Some(prepared.resources), prepared.proven_by_seal),
                 None => (None, false),
             };
-            let active = profile
-                .refresh(
+            let (active, verified_resources) = profile
+                .refresh_for_play(
                     mode,
                     cancellation,
                     |step| native(old.base(), step),
                     Some(&log),
                     replacement_resources,
                 )
-                .map_err(|error| native_failure(&home, error, || Some(Build::Active(old))))?
+                .map_err(|error| match error {
+                    RefreshError::Native(error) => {
+                        native_failure(&home, error, || Some(Build::Active(old)))
+                    }
+                    RefreshError::Snapshot(error) => StartError::Other(error),
+                })?
                 .ok_or_else(|| unsettled!())?;
-            let proof = proven_by_seal
+            let proof = (proven_by_seal || verified_resources)
                 .then(|| VerifiedSnapshot::new(active.clone(), home.clone(), manifest));
             checking.done("");
             return Ok((active, notices, proof));

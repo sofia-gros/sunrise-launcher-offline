@@ -1229,6 +1229,54 @@ fi
     snapshot_error(&again, result.unwrap_err());
     assert!(!spawned.get());
 
+    // When a refresh would run native compilation, existing resource damage is reported
+    // before the native build starts and without advancing the generation.
+    recovery_mod(&home, "blur", "Motion Blur", true, "");
+    fs::write(
+        home.join(mod_list::FILE),
+        b"mod.lantern:true\nmod.blur:true\n",
+    )
+    .unwrap();
+    let native_started = Cell::new(false);
+    FULL_VERIFICATIONS.take();
+    let error = client
+        .ready(
+            &mut profile,
+            || FirstBuild::installed(BUILD),
+            |_, _| Ok(()),
+            &cancellation,
+            |step| {
+                if matches!(step, Progress::NativeBuild { .. } | Progress::Native(_)) {
+                    native_started.set(true);
+                }
+            },
+            || None,
+        )
+        .unwrap_err();
+    assert!(!native_started.get());
+    assert!(matches!(error, StartError::Other(_)), "{error:?}");
+    snapshot_error(&advanced, error.into());
+    assert_eq!(FULL_VERIFICATIONS.take(), 1);
+    assert_eq!(profile.active().unwrap(), Some(advanced.clone()));
+    let direct_error = profile
+        .refresh(
+            instance.native_profile,
+            &cancellation,
+            |_| panic!("native build started over damaged cached resources"),
+            None,
+            None,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&direct_error, native_mods::Failed::Other(detail)
+            if detail.contains("managed_play/resources.rs:")),
+        "{direct_error:?}"
+    );
+    assert_eq!(FULL_VERIFICATIONS.take(), 1);
+    assert_eq!(profile.active().unwrap(), Some(advanced.clone()));
+    fs::remove_dir_all(home.join(mod_list::NATIVE_DIR)).unwrap();
+    fs::write(home.join(mod_list::FILE), b"mod.lantern:true\n").unwrap();
+
     // Prepare the same build without deleting its damaged snapshot. The committed digest
     // and generation need not change to recover.
     {
