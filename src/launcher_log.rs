@@ -18,6 +18,8 @@ const RING_LINES: usize = 5000;
 const FILE_LIMIT: u64 = 1 << 20;
 /// How many rotated files are kept: `launcher.1.log` to `launcher.3.log`.
 const OLD_FILES: u32 = 3;
+/// Staging name used while moving `launcher.log` out of the way before shifting older archives.
+const ROTATING_NAME: &str = "launcher.log.rotating";
 fn rotation_name(index: u32) -> String {
     match index {
         0 => "launcher.log".into(),
@@ -26,7 +28,8 @@ fn rotation_name(index: u32) -> String {
 }
 
 pub(crate) fn is_rotation_file(name: &std::ffi::OsStr) -> bool {
-    (0..=OLD_FILES).any(|index| name == std::ffi::OsStr::new(&rotation_name(index)))
+    name == std::ffi::OsStr::new(ROTATING_NAME)
+        || (0..=OLD_FILES).any(|index| name == std::ffi::OsStr::new(&rotation_name(index)))
 }
 
 /// What replaces a secret.
@@ -93,6 +96,7 @@ struct LogFile {
     file: Option<File>,
     size: u64,
     limit: u64,
+    rotation_failed: bool,
 }
 
 impl LogFile {
@@ -112,6 +116,7 @@ impl LogFile {
             file,
             size,
             limit,
+            rotation_failed: false,
         }
     }
 
@@ -119,7 +124,7 @@ impl LogFile {
         if self.file.is_none() {
             return;
         }
-        if self.size >= self.limit {
+        if self.size >= self.limit && !self.rotation_failed {
             self.rotate();
         }
         let Some(file) = self.file.as_mut() else {
@@ -132,16 +137,33 @@ impl LogFile {
         self.size += line.len() as u64 + 1;
     }
 
-    /// Moves `launcher.log` to `launcher.1.log` and each older file one up, dropping the oldest,
-    /// then starts a new `launcher.log`.
+    /// Moves `launcher.log` to a staging name first so a failed live rename never shifts or
+    /// deletes older archives (`launcher.1.log`..`launcher.3.log`). Once the live log moves,
+    /// shifts each archive up by one, places the staged file at `launcher.1.log`, and opens a
+    /// fresh `launcher.log`.
     fn rotate(&mut self) {
+        self.rotate_with(fs::rename);
+    }
+
+    fn rotate_with(&mut self, mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>) {
         // Windows can't rename an open file, nor onto an existing one.
         self.file = None;
         let name = |n| self.dir.join(rotation_name(n));
-        for n in (0..OLD_FILES).rev() {
-            let _ = fs::remove_file(name(n + 1));
-            let _ = fs::rename(name(n), name(n + 1));
+        let staged = self.dir.join(ROTATING_NAME);
+        let _ = fs::remove_file(&staged);
+        if rename(&name(0), &staged).is_err() {
+            // Preserve existing archives and stop retrying rotation for this handle so a
+            // locked live file (e.g. a viewer on Windows) cannot wipe older archives.
+            *self = Self::open(&self.dir, self.limit);
+            self.rotation_failed = true;
+            return;
         }
+        for n in (1..OLD_FILES).rev() {
+            let _ = fs::remove_file(name(n + 1));
+            let _ = rename(&name(n), &name(n + 1));
+        }
+        let _ = fs::remove_file(name(1));
+        let _ = rename(&staged, &name(1));
         *self = Self::open(&self.dir, self.limit);
     }
 }
@@ -1027,6 +1049,75 @@ mod tests {
         let newest = fs::read_to_string(dir.path().join("launcher.log")).expect("the new file");
         assert!(newest.contains("line number 059"));
         assert!(newest.len() as u64 <= 100 + 41);
+    }
+
+    #[test]
+    fn failed_live_rotation_preserves_existing_archives_and_keeps_writing() {
+        let dir = tempfile::tempdir().expect("a scratch folder");
+        fs::write(dir.path().join("launcher.1.log"), "archive one\n").unwrap();
+        fs::write(dir.path().join("launcher.2.log"), "archive two\n").unwrap();
+        fs::write(dir.path().join("launcher.3.log"), "archive three\n").unwrap();
+        let mut file = LogFile::open(dir.path(), 20);
+        file.write("line exceeding the rotation limit");
+        file.rotate_with(|_, _| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)));
+        assert!(file.rotation_failed);
+        for extra in [
+            "after failure one",
+            "after failure two",
+            "after failure three",
+        ] {
+            file.write(extra);
+        }
+        assert_eq!(
+            fs::read_to_string(dir.path().join("launcher.1.log")).unwrap(),
+            "archive one\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("launcher.2.log")).unwrap(),
+            "archive two\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("launcher.3.log")).unwrap(),
+            "archive three\n"
+        );
+        let live = fs::read_to_string(dir.path().join("launcher.log")).unwrap();
+        assert!(live.contains("after failure three"), "{live}");
+        assert!(!dir.path().join(ROTATING_NAME).exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn held_live_log_on_windows_does_not_wipe_archives() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+        let dir = tempfile::tempdir().expect("a scratch folder");
+        fs::write(dir.path().join("launcher.1.log"), "archive one\n").unwrap();
+        fs::write(dir.path().join("launcher.2.log"), "archive two\n").unwrap();
+        fs::write(dir.path().join("launcher.3.log"), "archive three\n").unwrap();
+        let mut file = LogFile::open(dir.path(), 20);
+        file.write("line exceeding the rotation limit");
+        // Hold `launcher.log` open without FILE_SHARE_DELETE, blocking rename.
+        let _viewer = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(dir.path().join("launcher.log"))
+            .unwrap();
+        for n in 0..5 {
+            file.write(&format!("oversized line {n} while held by viewer"));
+        }
+        assert!(file.rotation_failed);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("launcher.1.log")).unwrap(),
+            "archive one\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("launcher.2.log")).unwrap(),
+            "archive two\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("launcher.3.log")).unwrap(),
+            "archive three\n"
+        );
     }
 
     #[test]
