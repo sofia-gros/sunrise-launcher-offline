@@ -557,14 +557,73 @@ fn status_shows_a_token_past_its_exp_claim_as_needing_refresh() {
 
 #[test]
 fn a_refusal_from_the_services_never_plays_on_a_fresh_kept_token() {
-    // The profile answers 401: a refusal, not an outage. The kept token is fresh (no renewal),
-    // and still the game doesn't start on it.
-    let (_, ep) = mock(|m| m.profile_answers = [401].into());
-    let store = MemoryStore::default();
-    let mut accounts = signed_in(&store, &secrets("mc-token", true));
-    assert!(launch_for_game(&ep, Some("test-client"), &store, &mut accounts).is_err());
+    // Profile or entitlements 401/403: a refusal, not an outage. The kept token is fresh (no
+    // renewal), Play stops, and the account is marked for sign-in so later presses don't keep
+    // sending the rejected token.
+    for status in [401, 403] {
+        let (m, ep) = mock(|m| m.profile_answers = [status].into());
+        let store = MemoryStore::default();
+        let mut accounts = signed_in(&store, &secrets("mc-token", true));
+        let refused = launch_for_game(&ep, Some("test-client"), &store, &mut accounts)
+            .expect_err("profile refusal must not start play");
+        assert!(refused
+            .keyring
+            .as_deref()
+            .is_some_and(|w| w.contains(SIGN_IN_AGAIN)));
+        assert!(kept(&store).sign_in_required);
+        assert_eq!(
+            session::status(&store, UUID).state,
+            session::State::SignInRequired
+        );
+        let calls = m.lock().unwrap().log.len();
+        assert!(launch_for_game(&ep, Some("test-client"), &store, &mut accounts).is_err());
+        assert_eq!(
+            m.lock().unwrap().log.len(),
+            calls,
+            "rejected token is not re-sent"
+        );
+
+        let (m, ep) = mock(|m| m.entitlements_refused = Some(status));
+        let store = MemoryStore::default();
+        let mut accounts = signed_in(&store, &secrets("mc-token", true));
+        let refused = launch_for_game(&ep, Some("test-client"), &store, &mut accounts)
+            .expect_err("entitlements refusal must not start play");
+        assert!(refused
+            .keyring
+            .as_deref()
+            .is_some_and(|w| w.contains(SIGN_IN_AGAIN)));
+        assert!(kept(&store).sign_in_required);
+        let calls = m.lock().unwrap().log.len();
+        assert!(launch_for_game(&ep, Some("test-client"), &store, &mut accounts).is_err());
+        assert_eq!(
+            m.lock().unwrap().log.len(),
+            calls,
+            "rejected token is not re-sent"
+        );
+    }
+    // A refresh refusal (400..=403) also marks sign-in required and stops offline fallback.
+    for status in [400, 401, 403] {
+        let store = MemoryStore::default();
+        let near = Secrets {
+            minecraft_expires_at: now() + 1800,
+            ..secrets("mc-token", true)
+        };
+        let mut accounts = signed_in(&store, &near);
+        let (_, ep) = mock(|m| m.refresh_refused = Some(status));
+        let refused = launch_accepted(&ep, Some("test-client"), &store, &mut accounts, UUID)
+            .expect_err("a refresh refusal needs sign-in");
+        assert!(refused
+            .keyring
+            .as_deref()
+            .is_some_and(|w| w.contains(SIGN_IN_AGAIN)));
+        assert!(kept(&store).sign_in_required);
+        assert!(
+            launch_accepted(&offline(), Some("test-client"), &store, &mut accounts, UUID).is_err()
+        );
+    }
     // The same request answered 503: the services are down, and the fresh kept token plays.
     let (_, ep) = mock(|m| m.profile_answers = [503].into());
+    let store = MemoryStore::default();
     let mut accounts = signed_in(&store, &secrets("mc-token", true));
     let pass = launch_for_game(&ep, Some("test-client"), &store, &mut accounts).unwrap();
     assert_eq!(pass.session.unwrap().1.minecraft_token, "mc-token");

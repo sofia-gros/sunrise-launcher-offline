@@ -383,8 +383,10 @@ fn refresh_ms(ep: &Endpoints, client_id: &str, refresh: &str) -> Result<MsTokens
     )?;
     // A refresh token issued to another app registration (the launcher's client ID changed
     // since the player signed in) is refused as the client's; only a new sign-in mends it.
-    match v.get("error").and_then(Value::as_str) {
-        Some("invalid_client" | "unauthorized_client") => Err(SignInError::SignInAgain),
+    match (status, v.get("error").and_then(Value::as_str)) {
+        (400..=403, _) | (_, Some("invalid_client" | "unauthorized_client")) => {
+            Err(SignInError::SignInAgain)
+        }
         _ => ms_tokens(status, &v),
     }
 }
@@ -524,6 +526,9 @@ fn owns_game(ep: &Endpoints, token: &str) -> Result<bool, SignInError> {
         None,
         "the Minecraft services",
     )?;
+    if matches!(status, 401 | 403) {
+        return Err(SignInError::SignInAgain);
+    }
     if status != 200 {
         return Err(tr("Could not check which games this account owns.").into());
     }
@@ -562,10 +567,13 @@ fn profile(ep: &Endpoints, token: &str) -> Result<Option<Account>, SignInError> 
         None,
         "the Minecraft services",
     )?;
+    if matches!(status, 401 | 403) {
+        return Err(SignInError::SignInAgain);
+    }
     if status == 404 {
         return Ok(None);
     }
-    let (Some(uuid), Some(name)) = (str_field(&v, "id"), str_field(&v, "name")) else {
+    let (200, Some(uuid), Some(name)) = (status, str_field(&v, "id"), str_field(&v, "name")) else {
         return Err(tr("Could not read the Minecraft profile.").into());
     };
     let active = |key: &str| {
@@ -737,7 +745,10 @@ pub(super) fn check_with(
         progress(session::Phase::Profile);
         profile(ep, token)
     }) {
-        Err(e) => Check::NoAnswer(e, kept),
+        Err(e) => {
+            kept.sign_in_required = matches!(e, SignInError::SignInAgain);
+            Check::NoAnswer(e, kept)
+        }
         Ok(None) => Check::DoesNot(Secrets {
             owns: false,
             ..kept
