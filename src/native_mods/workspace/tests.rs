@@ -1167,3 +1167,112 @@ fn a_persistent_build_binds_each_output_to_the_one_root_it_belongs_to() {
         assert!(verify(&linked, &[]).is_err());
     }
 }
+
+#[test]
+fn prebuilt_route_rejects_noncanonical_work_executables_and_requires_joined_patch() {
+    let dir = tempfile::tempdir().unwrap();
+    let stage = Workspace::new(dir.path()).unwrap();
+    let root = stage.path();
+    let package = Package::at(&root.join("package"));
+    let rust = crate::rust_toolchain::Toolchain {
+        dir: dir.path().join("rust"),
+        host: crate::rust_toolchain::hosts().first().unwrap(),
+    };
+    let work = stage.work();
+    let release = work
+        .join("prebuilt-build/fixture/target")
+        .join(rust.host.target)
+        .join("release");
+    let runtime_binary = package.runtime.join("bin").join(crate::backend::CLIENT);
+    let joined_binary = work
+        .join("prebuilt-package/bin")
+        .join(crate::backend::CLIENT);
+    let arbitrary_binary = work.join("other-executable");
+    let wrong_name = work.join("prebuilt-package/bin/other-binary");
+    let noncanonical = work
+        .join("prebuilt-package/bin/..")
+        .join("bin")
+        .join(crate::backend::CLIENT);
+    let mod_output = release.join("libgreeter.so");
+    let patch = release.join("libsunrise_patch.so");
+    let joined_dep = work.join("prebuilt-package/deps/libjoined_dep.so");
+    for file in [
+        &runtime_binary,
+        &joined_binary,
+        &arbitrary_binary,
+        &wrong_name,
+        &mod_output,
+        &patch,
+        &joined_dep,
+    ] {
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, b"compiled bytes").unwrap();
+    }
+    let rust_version = crate::rust_toolchain::VERSION;
+    let record = |file: &Path, kind, id: &str, version: &str| tool::LibraryRecord {
+        file: file.file_name().unwrap().to_str().unwrap().into(),
+        sha256: sha256_file(file).unwrap(),
+        kind,
+        mod_id: id.into(),
+        identity: format!("fixture-build {id} {version} {rust_version} unwind"),
+    };
+    let manifest = Manifest::parse(
+        "id = 'greeter'\nname = 'Greeter'\nversion = '1.0.0'\napi = '0.2'\ncapabilities = ['registries']\n[native]\ngame = '26.3'\nsunrise = 'a123456789012345678901234567890123456789'\n",
+    )
+    .unwrap();
+    let check = |binary: &Path, with_patch: bool, with_joined_dep: bool| {
+        let mut libraries = vec![mod_output.clone()];
+        let mut records = vec![record(
+            &mod_output,
+            tool::LibraryKind::Mod,
+            "greeter",
+            "1.0.0",
+        )];
+        if with_patch {
+            libraries.push(patch.clone());
+            records.push(record(
+                &patch,
+                tool::LibraryKind::Patch,
+                "sunrise_patch",
+                "0",
+            ));
+        }
+        if with_joined_dep {
+            libraries.push(joined_dep.clone());
+        }
+        let built = tool::Built {
+            route: tool::CheckRoute::Prebuilt,
+            binary: binary.to_path_buf(),
+            libraries,
+            records,
+            mods: vec!["greeter".into()],
+            internals: Default::default(),
+        };
+        stage.verify_outputs(
+            &built,
+            &package,
+            &rust,
+            Some(tool::CheckRoute::Prebuilt),
+            "fixture-build",
+            [&manifest].into_iter(),
+        )
+    };
+    for (bad, why) in [
+        (&arbitrary_binary, "arbitrary file in work slot"),
+        (&wrong_name, "non-client file under prebuilt-package/bin"),
+        (&noncanonical, "noncanonical .. path to joined binary"),
+    ] {
+        assert!(check(bad, false, false).is_err(), "{why}");
+        assert!(check(bad, true, false).is_err(), "{why} even with patch");
+    }
+    assert!(
+        check(&joined_binary, false, false).is_err(),
+        "joined binary must enforce the stamped sunrise_patch registry-target gate"
+    );
+    assert!(
+        check(&runtime_binary, false, true).is_err(),
+        "runtime binary must not admit prebuilt-package/deps without joined binary"
+    );
+    assert!(check(&runtime_binary, false, false).is_ok());
+    assert!(check(&joined_binary, true, true).is_ok());
+}

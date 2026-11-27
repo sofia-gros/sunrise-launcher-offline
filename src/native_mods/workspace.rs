@@ -380,14 +380,14 @@ impl Workspace {
         }
         // Both SDK runtime slices use this filename; installation renames the server image.
         let binary = crate::backend::plain(built.binary.clone());
+        let whole = work.join("prebuilt-package");
         let runtime_binary = binary == package.runtime.join("bin").join(crate::backend::CLIENT)
             && regular_under(&package.runtime, &binary).is_ok();
+        let joined_binary = binary == whole.join("bin").join(crate::backend::CLIENT)
+            && regular_under(&work, &binary).is_ok();
         match built.route {
             tool::CheckRoute::PrebuiltApi if !runtime_binary => return Err(invalid()),
-            tool::CheckRoute::Prebuilt
-                if !runtime_binary
-                    && (!binary.starts_with(&work) || regular_under(&work, &binary).is_err()) =>
-            {
+            tool::CheckRoute::Prebuilt if !runtime_binary && !joined_binary => {
                 return Err(invalid())
             }
             _ => (),
@@ -405,10 +405,7 @@ impl Workspace {
         // Registry compilation returns the merged package's executable and places the
         // stamped patch in <target>/<triple>/release. The latter binds the one allowed
         // Cargo target root without recalculating the SDK's private build key.
-        let whole = work.join("prebuilt-package");
-        let registry_target = if built.route == tool::CheckRoute::Prebuilt
-            && binary == whole.join("bin").join(crate::backend::CLIENT)
-        {
+        let registry_target = if built.route == tool::CheckRoute::Prebuilt && joined_binary {
             let patch = built
                 .records
                 .iter()
@@ -486,7 +483,7 @@ impl Workspace {
                 regular_under(&work, &file)?;
                 file.clone()
             } else if dynamic
-                && ((built.route == tool::CheckRoute::Prebuilt
+                && ((joined_binary
                     && file.starts_with(&joined_runtime)
                     && regular_under(&work, &file).is_ok())
                     || runtime()

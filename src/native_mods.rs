@@ -2312,11 +2312,12 @@ fn build_stages(
         cancellation.check()?;
         progress(Step::Install);
         let installing = std::time::Instant::now();
+        let verified_binary = crate::backend::plain(built.binary.clone());
         install(
             base,
             &version,
             target,
-            &built.binary,
+            &verified_binary,
             &libraries,
             &about(built.route.name(), &built.internals, &built.records),
             &ordered,
