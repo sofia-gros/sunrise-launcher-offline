@@ -1105,7 +1105,7 @@ fi
         let mut no_receipt = Profile::open(&no_receipt_home, None).unwrap();
         let error = ready(&mut no_receipt).unwrap_err();
         assert!(
-            matches!(error, StartError::Other(detail) if detail.contains("managed_play/resources.rs:"))
+            matches!(error, StartError::Snapshot(detail) if detail.contains("managed_play/resources.rs:"))
         );
         assert_eq!(FULL_VERIFICATIONS.take(), 1);
         assert!(no_receipt.active().unwrap().is_none());
@@ -1135,9 +1135,25 @@ fi
     };
     let snapshot_blob = prepared_snapshot.path(BUILD).join("fixture-blob.bin");
     fs::write(&snapshot_blob, b"already damaged").unwrap();
-    let error = ready(&mut profile).unwrap_err();
+    let saw_verify = Cell::new(false);
+    FULL_VERIFICATIONS.take();
+    let error = client
+        .ready(
+            &mut profile,
+            || FirstBuild::installed(BUILD),
+            |_, _| Ok(()),
+            &cancellation,
+            |step| {
+                if matches!(step, Progress::Verify) {
+                    saw_verify.set(true);
+                }
+            },
+            || None,
+        )
+        .unwrap_err();
+    assert!(saw_verify.get());
     assert!(
-        matches!(error, StartError::Other(detail) if detail.contains("managed_play/resources.rs:"))
+        matches!(error, StartError::Snapshot(detail) if detail.contains("managed_play/resources.rs:"))
     );
     assert_eq!(FULL_VERIFICATIONS.take(), 1);
     assert!(profile.active().unwrap().is_none());
@@ -1186,7 +1202,7 @@ fi
         profile.spawn_configured(&active, &cancellation, command, &failing_hook, true)
     };
     let error = try_hook().err().expect("damaged snapshot launched");
-    assert!(matches!(error, StartError::Other(_)), "{error:?}");
+    assert!(matches!(error, StartError::Snapshot(_)), "{error:?}");
     snapshot_error(&active, error.into());
     assert_eq!(FULL_VERIFICATIONS.take(), 1);
     fs::write(&blob, BLOB).unwrap();
@@ -1254,7 +1270,7 @@ fi
         )
         .unwrap_err();
     assert!(!native_started.get());
-    assert!(matches!(error, StartError::Other(_)), "{error:?}");
+    assert!(matches!(error, StartError::Snapshot(_)), "{error:?}");
     snapshot_error(&advanced, error.into());
     assert_eq!(FULL_VERIFICATIONS.take(), 1);
     assert_eq!(profile.active().unwrap(), Some(advanced.clone()));

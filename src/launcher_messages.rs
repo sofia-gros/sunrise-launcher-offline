@@ -32,6 +32,49 @@ fn finish_play_build_at_handoff(
     false
 }
 
+/// Route a Play failure that arrived while the Play build sheet was still open.
+/// Returns `(captured_build_error, close_build_sheet)`: a cached-snapshot failure
+/// belongs to Start, not Build, so the build run finishes and closes its sheet.
+fn route_active_play_build_error(
+    run: &mut crate::mods::build_run::Run,
+    error: &StartError,
+    cancelled: bool,
+) -> (bool, bool) {
+    match error {
+        _ if cancelled => {
+            run.cancelled();
+            (false, false)
+        }
+        StartError::Native(error, build) => {
+            run.failed_build = build.clone();
+            run.native_failed(error, &[]);
+            (false, false)
+        }
+        StartError::Snapshot(_) => {
+            run.done();
+            (false, true)
+        }
+        StartError::Other(error) => {
+            run.stopped(
+                tr("The build could not finish. No game was started.").into(),
+                error.clone(),
+            );
+            (true, false)
+        }
+        StartError::Journal(error) => {
+            run.stopped(error.summary().into(), error.details());
+            (false, false)
+        }
+        _ => {
+            run.stopped(
+                tr("The build could not be published.").into(),
+                String::new(),
+            );
+            (false, false)
+        }
+    }
+}
+
 impl Launcher {
     pub(super) fn refresh_installed(&mut self) {
         (self.installed, self.known_nightly) =
@@ -221,31 +264,15 @@ impl Launcher {
                         })
                     });
                     let mut captured_build_error = false;
+                    let mut close_build_sheet = false;
                     if let (Some(run), Err(error)) = (&mut self.ui.mods.build, result.as_ref()) {
                         if active_play_build {
-                            match error {
-                                _ if cancelled => run.cancelled(),
-                                StartError::Native(error, build) => {
-                                    run.failed_build = build.clone();
-                                    run.native_failed(error, &[]);
-                                }
-                                StartError::Other(error) => {
-                                    run.stopped(
-                                        tr("The build could not finish. No game was started.")
-                                            .into(),
-                                        error.clone(),
-                                    );
-                                    captured_build_error = true;
-                                }
-                                StartError::Journal(error) => {
-                                    run.stopped(error.summary().into(), error.details())
-                                }
-                                _ => run.stopped(
-                                    tr("The build could not be published.").into(),
-                                    String::new(),
-                                ),
-                            }
+                            (captured_build_error, close_build_sheet) =
+                                route_active_play_build_error(run, error, cancelled);
                         }
+                    }
+                    if close_build_sheet && self.ui.sheet == Some(crate::sheets::Sheet::ModBuild) {
+                        self.close_sheet();
                     }
                     if !self.ui.mods.build.as_ref().is_some_and(|run| {
                         run.for_play
@@ -308,7 +335,11 @@ impl Launcher {
                         }
                         Err(StartError::Hook(error)) => self.client_error = Some(error.to_string()),
                         Err(StartError::Other(_)) if captured_build_error => (),
-                        Err(StartError::UnknownSpawn(error) | StartError::Other(error)) => {
+                        Err(
+                            StartError::UnknownSpawn(error)
+                            | StartError::Snapshot(error)
+                            | StartError::Other(error),
+                        ) => {
                             self.client_error = Some(error);
                         }
                     }
@@ -861,10 +892,32 @@ mod tests {
         );
         assert!(matches!(run.end, Some(crate::mods::build_run::End::Done)));
 
-        use crate::launch_state::{Act, Facts, Main};
+        // A cached snapshot failure arriving before the Verify step is processed must not be
+        // captured as a Build failure; it finishes the build sheet and surfaces on Start.
+        let mut pre_verify = crate::mods::build_run::Run::start(
+            "fixture".into(),
+            "fixture profile".into(),
+            "fixture".into(),
+            Vec::new(),
+            true,
+        );
         let detail =
             "Sunrise couldn't verify the profile's saved game build (managed_play/resources.rs:1)."
                 .to_owned();
+        let (captured, close_sheet) = route_active_play_build_error(
+            &mut pre_verify,
+            &StartError::Snapshot(detail.clone()),
+            false,
+        );
+        assert!(!captured);
+        assert!(close_sheet);
+        assert!(!pre_verify.running());
+        assert!(matches!(
+            pre_verify.end,
+            Some(crate::mods::build_run::End::Done)
+        ));
+
+        use crate::launch_state::{Act, Facts, Main};
         let view = Facts {
             client_error: Some(detail.clone()),
             signed_in: true,

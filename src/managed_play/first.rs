@@ -501,7 +501,9 @@ impl Profile {
         cancellation: &native_mods::Cancellation,
         spawn: impl FnOnce(ProfileHandoff<'_>) -> Result<T, E>,
     ) -> Result<T, E> {
-        let _manifest = self.verify_handoff(active, proof, cancellation)?;
+        let _manifest = self
+            .verify_handoff(active, proof, cancellation)
+            .map_err(|error| E::from(String::from(error)))?;
         spawn(self.handoff())
     }
 
@@ -510,15 +512,15 @@ impl Profile {
         active: &Active,
         proof: Option<VerifiedSnapshot>,
         cancellation: &native_mods::Cancellation,
-    ) -> Result<HomeLockGuard, String> {
+    ) -> Result<HomeLockGuard, super::StartError> {
         let home = self.home();
         let checking = crate::launcher_log::step("Verifying the game and its prepared files");
         let manifest = game_lock(home)?;
         checking.note("the profile's lock is held");
-        let verified = (|| {
+        let verified: Result<(), super::StartError> = (|| {
             crate::browser::installed::recover_game_install(home).map_err(String::from)?;
             if self.active()?.as_ref() != Some(active) || inputs(home)? != active.inputs {
-                return Err(unsettled!());
+                return Err(unsettled!().into());
             }
             // First Play (or a fresh prepare seal) proved this exact snapshot, and the proof
             // still owns the game-manifest lock from that check through this handoff.
@@ -526,21 +528,33 @@ impl Profile {
                 Some(proof) if &proof.active == active && proof.home.as_path() == home => {
                     active.verify_binaries()?;
                 }
-                Some(_) => return Err(unsettled!()),
-                None => active.verify_artifacts()?,
+                Some(_) => return Err(unsettled!().into()),
+                None => {
+                    active.verify_binaries()?;
+                    active
+                        .resources
+                        .verify(active.base())
+                        .map_err(super::StartError::Snapshot)?;
+                }
             }
             active
                 .resources
                 .check_play_output(active.base())
                 .map_err(|issue| issue.message(|| unsettled!()))?;
-            super::verify_included(active.base(), active.executable(), home)
+            super::verify_included(active.base(), active.executable(), home)?;
+            Ok(())
         })();
         // Drop `proof` while `manifest` holds the re-entrant lock so `manifest` is the sole
         // remaining guard on this thread; dropping `manifest` before a hook frees the OS lock.
         drop(proof);
         match &verified {
             Ok(()) => checking.done(""),
-            Err(why) => checking.failed(why),
+            Err(why) => checking.failed(&match why {
+                super::StartError::Snapshot(detail)
+                | super::StartError::UnknownSpawn(detail)
+                | super::StartError::Other(detail) => detail.as_str(),
+                _ => "verification failed",
+            }),
         }
         verified?;
         cancellation.check()?;
@@ -760,7 +774,8 @@ impl FirstAttempt<'_> {
         self.bound.verify_image()?;
         let resources = Resources::capture(self.base(), &self.stage)?;
         Ok(self
-            .commit_prepared(image, PreparedResources::reused(resources), cancellation)?
+            .commit_prepared(image, PreparedResources::reused(resources), cancellation)
+            .map_err(String::from)?
             .active)
     }
 
@@ -769,13 +784,17 @@ impl FirstAttempt<'_> {
         image: &str,
         prepared: PreparedResources,
         cancellation: &native_mods::Cancellation,
-    ) -> Result<VerifiedSnapshot, String> {
+    ) -> Result<VerifiedSnapshot, super::StartError> {
         let manifest = game_lock(&self.home)?;
-        crate::browser::installed::recover_game_install(&self.home)?;
+        crate::browser::installed::recover_game_install(&self.home)
+            .map_err(super::StartError::Journal)?;
         // Refuse a damaged reused tree before it can bind an unbound profile.
         // A snapshot just sealed inside `prepare` is already proven by its seal.
         if !prepared.proven_by_seal {
-            prepared.resources.verify(self.base())?;
+            prepared
+                .resources
+                .verify(self.base())
+                .map_err(super::StartError::Snapshot)?;
         }
         let _references = ReferencePublication::begin(&self.home)?;
         self.bound.verify_image()?;

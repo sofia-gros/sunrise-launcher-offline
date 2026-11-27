@@ -42,6 +42,7 @@ pub enum StartError {
     Native(native_mods::Failed, Option<Arc<FailedBuild>>),
     Hook(crate::launch::PreLaunchError),
     UnknownSpawn(String),
+    Snapshot(String),
     Other(String),
 }
 
@@ -61,7 +62,9 @@ impl From<StartError> for String {
             },
             StartError::Native(error, _) => error.into(),
             StartError::Hook(error) => error.to_string(),
-            StartError::UnknownSpawn(error) | StartError::Other(error) => error,
+            StartError::UnknownSpawn(error)
+            | StartError::Snapshot(error)
+            | StartError::Other(error) => error,
         }
     }
 }
@@ -327,7 +330,10 @@ impl Client<'_> {
                 Err(backend::Unprepared::Incomplete | backend::Unprepared::ServerOnly) => {
                     // The on-disk manifest is not proof of what the saved snapshot was.
                     // Verify both the old resources and the preparer before replacing them.
-                    old.verify_artifacts()?;
+                    old.verify_binaries()?;
+                    old.resources
+                        .verify(old.base())
+                        .map_err(StartError::Snapshot)?;
                     progress(Progress::Prepare);
                     Some(super::Resources::for_play_with(
                         old.base(),
@@ -360,7 +366,7 @@ impl Client<'_> {
                     RefreshError::Native(error) => {
                         native_failure(&home, error, || Some(Build::Active(old)))
                     }
-                    RefreshError::Snapshot(error) => StartError::Other(error),
+                    RefreshError::Snapshot(error) => StartError::Snapshot(error),
                 })?
                 .ok_or_else(|| unsettled!())?;
             let proof = (proven_by_seal || verified_resources)
@@ -399,6 +405,9 @@ impl Client<'_> {
                     })?;
                 (image, notices)
             };
+            if !prepared.proven_by_seal {
+                progress(Progress::Verify);
+            }
             let first = first.commit_prepared(&image, prepared, cancellation)?;
             Ok((first.active.clone(), notices, Some(first)))
         })();
