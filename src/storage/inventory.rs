@@ -171,6 +171,11 @@ fn compiler_attempt(name: &std::ffi::OsStr) -> bool {
     })
 }
 
+fn is_compiler_attempt(relative: &Path) -> bool {
+    relative.parent() == Some(Path::new("native"))
+        && relative.file_name().is_some_and(compiler_attempt)
+}
+
 struct Entry {
     category: Category,
     directory: Option<Arc<Dir>>,
@@ -190,8 +195,9 @@ impl Entry {
             match fs::symlink_metadata(&path) {
                 Ok(meta)
                     if linked(&meta)
-                        && !(category == Category::ModBuildCache
-                            && components.peek().is_none()) =>
+                        && !(components.peek().is_none()
+                            && (category == Category::ModBuildCache
+                                || is_compiler_attempt(relative))) =>
                 {
                     return Err(Error::Unsafe(path));
                 }
@@ -208,13 +214,8 @@ impl Entry {
         })
     }
 
-    fn is_compiler_attempt(&self) -> bool {
-        self.relative.parent() == Some(Path::new("native"))
-            && self.relative.file_name().is_some_and(compiler_attempt)
-    }
-
     fn tree(&self, cancel: &Cancel) -> Result<Tree, Error> {
-        if self.category == Category::ModBuildCache {
+        if self.category == Category::ModBuildCache || is_compiler_attempt(&self.relative) {
             Tree::mod_work(&self.path, cancel)
         } else {
             Tree::build_until(&self.path, cancel)
@@ -227,7 +228,7 @@ impl Entry {
         ACCESS.with(|calls| calls.set(calls.get() + 1));
         match self.category {
             Category::RustCompiler | Category::ModBuildCache => Ok(Access::BuildTools),
-            _ if self.is_compiler_attempt() => Ok(Access::BuildTools),
+            _ if is_compiler_attempt(&self.relative) => Ok(Access::BuildTools),
             // No game runs from kept mod libraries: a build copies them into its workspace.
             _ if self.relative.starts_with(BuildCache::KeptMods.relative()) => {
                 Ok(Access::BuildTools)
@@ -237,7 +238,9 @@ impl Entry {
     }
 
     fn clear(&self) -> Result<(), Error> {
-        if self.category != Category::ModBuildCache && !self.path.try_exists()? {
+        let owns_links =
+            self.category == Category::ModBuildCache || is_compiler_attempt(&self.relative);
+        if !owns_links && !self.path.try_exists()? {
             return Ok(());
         }
         let Some(root) = &self.directory else {
@@ -253,8 +256,8 @@ impl Entry {
             parent = parent.open_dir_nofollow(part.as_os_str())?;
         }
         let name = Path::new(self.relative.file_name().expect("entry has a name"));
-        if self.category == Category::ModBuildCache {
-            let Some(meta) = present(fs::symlink_metadata(&self.path))? else {
+        if owns_links {
+            let Some(meta) = present(parent.symlink_metadata(name))? else {
                 return Ok(());
             };
             // On Windows, a junction is a directory entry; unlink it without opening it.
@@ -269,18 +272,7 @@ impl Entry {
             if linked(&meta) || meta.is_file() {
                 return present(parent.remove_file(name)).map(|_| ());
             }
-            // The parent walk above opens `native/w` without following links.
-            // Recursive removal does not follow interior links or junctions.
-            #[cfg(windows)]
-            let result = fs::remove_dir_all(&self.path);
-            #[cfg(not(windows))]
-            let result = parent.remove_dir_all(name);
-            return present(result).map(|_| ());
-        }
-        if self.is_compiler_attempt() {
-            // Attempts are never reused. Explicit Clear holds the build lease, but an old
-            // compiler could still be writing here. Use no-follow removal and let the OS
-            // reject any open file it can't unlink.
+            // Keep the no-follow parent as the boundary throughout recursive removal.
             return present(parent.remove_dir_all(name)).map(|_| ());
         }
         Storage::clear_entry(root, &parent, name)
@@ -440,7 +432,8 @@ impl Storage {
         let build_files = Category::BuildFiles;
         for child in children(&native.path)? {
             if compiler_attempt(&child.file_name())
-                && present(child.file_type())?.is_some_and(|kind| kind.is_dir())
+                && present(child.file_type())?
+                    .is_some_and(|kind| kind.is_dir() || kind.is_symlink())
             {
                 entries.push(Entry::fixed(
                     build_root,
@@ -654,7 +647,7 @@ impl Storage {
                     }
                     Err(error @ Error::Io(_))
                         if retain
-                            && (entry.is_compiler_attempt()
+                            && (is_compiler_attempt(&entry.relative)
                                 || entry.category == Category::ModBuildCache) =>
                     {
                         // A failed recursive removal can already have freed some files. If
@@ -928,6 +921,36 @@ mod manual_tests {
         assert!(row(Category::RustCompiler).freed_bytes > 0);
         assert!(row(Category::RustCompiler).kept.is_empty());
         assert!(!good.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_compiler_attempt_with_outside_link_is_cleared_without_following_it() {
+        let home = crate::storage::tests::Home::new();
+        let payload = home.seed("native/.nb-retained/output");
+        let outside = home.seed("player-data/keep");
+        let link = payload.with_file_name("link");
+        std::os::unix::fs::symlink(outside.parent().unwrap(), &link).unwrap();
+        let storage = Storage::at(&home.0).unwrap();
+        let root = Root::open(&home.0).unwrap();
+        let entries = vec![Entry::fixed(
+            &root,
+            Path::new("native/.nb-retained"),
+            Category::BuildFiles,
+        )
+        .unwrap()];
+        let report = storage
+            .apply_retaining(entries, Some(Category::BuildFiles), false, true, None)
+            .unwrap();
+        let row = report
+            .rows
+            .iter()
+            .find(|row| row.category == Category::BuildFiles)
+            .unwrap();
+        assert!(row.freed_bytes > 0);
+        assert!(row.kept.is_empty());
+        assert!(!payload.parent().unwrap().exists());
+        assert!(outside.is_file());
     }
 
     #[test]
