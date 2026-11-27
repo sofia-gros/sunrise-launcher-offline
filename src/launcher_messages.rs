@@ -67,7 +67,7 @@ fn route_active_play_build_error(
         }
         _ => {
             run.stopped(
-                tr("The build could not be published.").into(),
+                tr("The build couldn't be saved. No game was started.").into(),
                 String::new(),
             );
             (false, false)

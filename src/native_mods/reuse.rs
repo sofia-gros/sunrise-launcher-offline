@@ -451,7 +451,7 @@ pub(super) fn installable(
                 "Native build refused: no vacant or proved installed image slot",
             );
             Err(Failed::Other(trf(
-                "Every installed build named for these mods ({version}) holds other mods or was changed after it was installed. Remove them, then build again.",
+                "The installed builds for these mods ({version}) hold different mods or were changed after they were installed. Remove them, then build again.",
                 &[("version", version)],
             )))
         }

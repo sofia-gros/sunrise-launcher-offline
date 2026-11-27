@@ -15,24 +15,16 @@ pub use inventory::{Eligibility, Kept, KeptKind, Report, Row};
 
 /// Path-free presentation for Storage surfaces, including fatal errors and kept units.
 pub fn error_message(error: Error) -> String {
-    use crate::i18n::{tr, trf};
+    use crate::i18n::tr;
     match error {
         Error::Unsafe(_) => tr("Storage found an unexpected file or link.").into(),
         Error::ResourceDependent(_) => {
             tr("Another build needs these resources, so they were kept.").into()
         }
-        Error::Io(error) => trf(
-            "Storage could not access a file or folder ({kind}, OS error {code}).",
-            &[
-                ("kind", &format!("{:?}", error.kind())),
-                (
-                    "code",
-                    &error
-                        .raw_os_error()
-                        .map_or_else(|| "—".into(), |code| code.to_string()),
-                ),
-            ],
-        ),
+        Error::Io(_) => tr(
+            "Sunrise couldn't access a file or folder. Close any programs using it and try again.",
+        )
+        .into(),
         error => crate::native_mods::cache_error(error),
     }
 }

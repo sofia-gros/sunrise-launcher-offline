@@ -494,21 +494,31 @@ pub fn cache_error(error: crate::storage::Error) -> String {
         crate::native_cache::Error::Busy => {
             tr("A native build or cache cleanup is running. Try again when it finishes.").into()
         }
-        crate::native_cache::Error::IncompleteUnit => tr("Native compilation outputs were kept because their executable completeness cannot be proven.").into(),
-        crate::native_cache::Error::UnpublishedGame => tr("An unpublished game download was kept. It may still be in use by another launcher.").into(),
+        crate::native_cache::Error::IncompleteUnit => {
+            tr("Kept: a mod build may still be using these files.").into()
+        }
+        crate::native_cache::Error::UnpublishedGame => {
+            tr("An unfinished game download was kept. Another launcher may still be using it.")
+                .into()
+        }
         crate::native_cache::Error::ResourceDependent(build) => trf(
             "This version supplies resources to native build {build}. Remove that build first.",
             &[("build", &build)],
         ),
-        crate::native_cache::Error::ReferencedProfile => tr("A profile still uses this build, so it was kept.").into(),
-        crate::native_cache::Error::UnprovenReferences => tr("Sunrise couldn't check which profiles use this build, so it was kept.").into(),
+        crate::native_cache::Error::ReferencedProfile => {
+            tr("A profile still uses this build, so it was kept.").into()
+        }
+        crate::native_cache::Error::UnprovenReferences => {
+            tr("Sunrise couldn't check which profiles use this build, so it was kept.").into()
+        }
         crate::native_cache::Error::UnprovenExclusion => tr(
-            "An older game build can use this cache without runtime leases.",
+            "An older game build may still use these files. Remove older game builds if you no longer use them, then try again.",
         )
         .into(),
-        crate::native_cache::Error::UnsupportedFilesystem => {
-            tr("Game cache leases require a supported local filesystem.").into()
-        }
+        crate::native_cache::Error::UnsupportedFilesystem => tr(
+            "Sunrise can't lock files on this drive. Move your data folder to a local drive.",
+        )
+        .into(),
         crate::native_cache::Error::Unsafe(_) => {
             tr("The native build cache contains an unexpected file or link.").into()
         }
@@ -1612,7 +1622,7 @@ fn resolve_build_dependencies(
         .collect();
     let links = dependencies::resolve_links(&inputs).map_err(|error| {
         trf(
-            "code link requirements refused: {error}",
+            "These mods can't be built together: {error}",
             &[("error", &error.to_string())],
         )
     })?;
@@ -1785,8 +1795,8 @@ fn build_stages(
     for b in &found {
         if !ids.insert(&b.manifest.id) {
             return Err(trf(
-                "Duplicate native mod id {id}.",
-                &[("id", &format!("{:?}", b.manifest.id))],
+                "More than one native mod uses the ID {id}. Remove the duplicate, then try again.",
+                &[("id", &b.manifest.id)],
             )
             .into());
         }
@@ -1894,10 +1904,10 @@ fn build_stages(
     for (bundle, pin) in mods.iter().zip(&mixins_pins) {
         mixins::materialize(bundle, &bundle.dir, pin)?;
     }
-    timed(tr("Pinning horizon-mixins"), pinning)?;
+    timed(tr("Choosing the mixin tool version"), pinning)?;
     let preparing = std::time::Instant::now();
     let check_inputs = retry_check_inputs(&mods, &mixins_pins, requested.len())?;
-    timed(tr("Preparing the check inputs"), preparing)?;
+    timed(tr("Preparing mods for checking"), preparing)?;
     let check_folder = check_inputs
         .as_ref()
         .map_or(incoming.as_path(), |dir| dir.path());
@@ -3342,7 +3352,7 @@ mod tests {
                 assert!(!staged
                     .kept
                     .iter()
-                    .any(|keep| keep.reason.contains("unpublished game download")));
+                    .any(|keep| keep.reason.contains("unfinished game download")));
                 if backend::installed().is_empty() {
                     assert_eq!(staged.remaining_bytes, 0);
                     assert!(staged.kept.is_empty());
@@ -3352,7 +3362,7 @@ mod tests {
                 assert!(
                     backend::remove(stage.file_name().unwrap().to_str().unwrap())
                         .unwrap_err()
-                        .contains("unpublished game download")
+                        .contains("unfinished game download")
                 );
                 inventoried.set(true);
             })
