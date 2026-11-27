@@ -940,4 +940,37 @@ fn switching_mixins_source_mode_selects_a_different_image() {
     );
 }
 
+#[test]
+fn a_missing_developer_manifest_does_not_expose_its_path() {
+    if !in_child(
+        "native_mods::reuse::tests::a_missing_developer_manifest_does_not_expose_its_path",
+        "SUNRISE_REUSE_MANIFEST_ERROR_CHILD",
+    ) {
+        return;
+    }
+    for (shape, private_component) in [
+        ("home/private-unix-account/checkout", "private-unix-account"),
+        (
+            r"Users\private-windows-account\checkout",
+            "private-windows-account",
+        ),
+    ] {
+        let scratch = tempfile::tempdir().unwrap();
+        let folder = scratch.path().join(shape);
+        let failed = logged(&Cancellation::default(), &|| {}, |_| {
+            Chosen::select(Some(&folder), None, || unreachable!())
+        })
+        .unwrap_err();
+        let log = fs::read_to_string(super::super::build_log::log_path()).unwrap();
+        for text in [failed.to_string(), log] {
+            assert!(text.contains(PREBUILT_IDENTITY), "{text}");
+            assert!(
+                text.contains(&std::io::ErrorKind::NotFound.to_string()),
+                "{text}"
+            );
+            assert!(!text.contains(private_component), "{text}");
+        }
+    }
+}
+
 mod unsealed;

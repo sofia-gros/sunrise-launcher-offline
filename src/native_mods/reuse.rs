@@ -107,7 +107,15 @@ impl Chosen {
     ) -> Result<Self, Failed> {
         if let Some(folder) = local {
             let path = folder.join(PREBUILT_IDENTITY);
-            let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let bytes = fs::read(&path).map_err(|error| {
+                trf(
+                    "Could not read the developer SDK manifest {manifest}: {kind}.",
+                    &[
+                        ("manifest", PREBUILT_IDENTITY),
+                        ("kind", &error.kind().to_string()),
+                    ],
+                )
+            })?;
             return Ok(Self::Local {
                 folder: folder.to_owned(),
                 sha256: sunrise_launcher_release_verify::sha256_hex(&bytes),
