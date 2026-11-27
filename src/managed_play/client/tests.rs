@@ -899,3 +899,187 @@ fn windows_bound_x64_fallback_survives_pending_retry_and_committed_replay() {
     );
     assert_eq!(reopened.active().unwrap(), Some(active));
 }
+
+/// One Play hashes the prepared files once, at the handoff right before the child. Damage still
+/// refuses every Play, from the saved generation and from the one a refresh advanced to, and
+/// putting the files back is all it takes to play again.
+#[test]
+fn play_hashes_the_prepared_files_once_and_still_refuses_damage() {
+    use super::super::FULL_VERIFICATIONS;
+    use std::cell::Cell;
+    const TEST: &str =
+        "managed_play::client::tests::play_hashes_the_prepared_files_once_and_still_refuses_damage";
+    const BUILD: &str = "v0.1.8";
+    const BLOB: &[u8] = b"original bytes";
+    if std::env::var_os("PLAY_ONE_HASH_FIXTURE").is_none() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env("PLAY_ONE_HASH_FIXTURE", "1")
+            .env("SUNRISE_HOME", root.path().join("game"))
+            .env("SUNRISE_LAUNCHER_HOME", root.path().join("launcher"))
+            .env(
+                "SUNRISE_LAUNCHER_LOCATION_FILE",
+                root.path().join("location")
+            )
+            .env("SUNRISE_NO_KEYCHAIN", "1")
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .status()
+            .unwrap()
+            .success());
+        return;
+    }
+    let home = backend::game_home();
+    let build = backend::version_dir(BUILD);
+    let prepared = backend::resources(BUILD);
+    fs::create_dir_all(&prepared).unwrap();
+    fs::write(prepared.join("sunrise-resources.json"), b"{}").unwrap();
+    fs::write(prepared.join("fixture-blob.bin"), BLOB).unwrap();
+    fs::write(build.join(".installed"), []).unwrap();
+    let client_bytes = b"unchanged client";
+    fs::write(build.join(backend::CLIENT), client_bytes).unwrap();
+    fs::create_dir_all(home.join(mod_list::DIR)).unwrap();
+    let write_package = |version: &str| {
+        let body = format!("id='lantern'\nname='Lantern'\nversion='{version}'\napi='{}'\ncapabilities=['registries']\n", manifest::API);
+        fs::write(
+            home.join(mod_list::DIR).join("lantern.smod"),
+            manifest::Package::write_files(&body, &[]).unwrap(),
+        )
+        .unwrap();
+    };
+    write_package("1.0.0");
+    fs::write(home.join(mod_list::FILE), b"mod.lantern:true\n").unwrap();
+
+    let instance = instances::selection().unwrap();
+    let client = Client {
+        instance: &instance,
+        accepted_account: None,
+        explicit_account: false,
+        piped: false,
+    };
+    let cancellation = native_mods::Cancellation::default();
+    let mut profile = Profile::open(&home, None).unwrap();
+    // The game's own two steps of a Play, each with the full verifications it asked for.
+    let ready = |profile: &mut Profile| {
+        FULL_VERIFICATIONS.take();
+        let (active, _) = client.ready(
+            profile,
+            || FirstBuild::installed(BUILD),
+            |_, _| Ok(()),
+            &cancellation,
+            |_| {},
+            || None,
+        )?;
+        Ok::<_, StartError>((active, FULL_VERIFICATIONS.take()))
+    };
+    let spawned = Cell::new(false);
+    let handoff = |profile: &Profile, active: &Active| {
+        spawned.set(false);
+        FULL_VERIFICATIONS.take();
+        let result = profile.verified_handoff(active, &cancellation, |_| {
+            spawned.set(true);
+            Ok::<(), String>(())
+        });
+        (result, FULL_VERIFICATIONS.take())
+    };
+    let intact = |profile: &mut Profile| {
+        let (active, before_handoff) = ready(profile).unwrap();
+        assert_eq!(
+            before_handoff, 0,
+            "hashed the prepared files before the handoff"
+        );
+        let (result, at_handoff) = handoff(profile, &active);
+        result.unwrap();
+        assert!(spawned.get());
+        assert_eq!(at_handoff, 1, "hashed the prepared files other than once");
+        active
+    };
+    let snapshot_error = |active: &Active, error: String| {
+        assert!(
+            error.starts_with(&format!("{}: ", active.resource_path().display())),
+            "{error}"
+        );
+        assert!(error.contains("managed_play/resources.rs:"), "{error}");
+    };
+
+    // First Play, an unchanged Play, and a Play that refreshes for a changed mod.
+    let first = intact(&mut profile);
+    assert_eq!(first.generation(), 1);
+    assert_eq!(intact(&mut profile), first);
+    write_package("2.0.0");
+    let refreshed = intact(&mut profile);
+    assert_eq!(refreshed.generation(), 2);
+
+    // A changed prepared file: an unchanged Play gets to the handoff and is refused there.
+    let blob = refreshed.resource_path().join("fixture-blob.bin");
+    fs::write(&blob, b"tampered bytes").unwrap();
+    let (active, before_handoff) = ready(&mut profile).unwrap();
+    assert_eq!((active.clone(), before_handoff), (refreshed.clone(), 0));
+    let (result, at_handoff) = handoff(&profile, &active);
+    snapshot_error(&active, result.unwrap_err());
+    assert_eq!((spawned.get(), at_handoff), (false, 1));
+
+    // Mod recovery still hashes the files itself, and refuses in its own words.
+    let recovery = ModRecovery {
+        build: Arc::new(FailedBuild {
+            build: Build::Active(refreshed.clone()),
+            digests: Default::default(),
+        }),
+        mods: off(),
+    };
+    let verify = |profile: &Profile| {
+        FULL_VERIFICATIONS.take();
+        let result = recovery.verify(profile, &mut None::<fn() -> Result<FirstBuild, String>>);
+        (result, FULL_VERIFICATIONS.take())
+    };
+    let (result, count) = verify(&profile);
+    assert_eq!(
+        result.unwrap_err(),
+        "The profile's game build changed. No mods were turned off."
+    );
+    assert_eq!(count, 1);
+
+    // A refresh over the changed file advances without sealing it: the next generation keeps
+    // the original digest, so the next Play refuses the same way.
+    write_package("3.0.0");
+    let (advanced, before_handoff) = ready(&mut profile).unwrap();
+    assert_eq!((advanced.generation(), before_handoff), (3, 0));
+    assert_eq!(advanced.resources, refreshed.resources);
+    assert_eq!(profile.active().unwrap(), Some(advanced.clone()));
+    let (result, at_handoff) = handoff(&profile, &advanced);
+    snapshot_error(&advanced, result.unwrap_err());
+    assert_eq!((spawned.get(), at_handoff), (false, 1));
+    let (again, _) = ready(&mut profile).unwrap();
+    let (result, _) = handoff(&profile, &again);
+    snapshot_error(&again, result.unwrap_err());
+    assert!(!spawned.get());
+
+    // Putting the file back is the way out from generation 3, as it was from 2.
+    fs::write(&blob, BLOB).unwrap();
+    assert_eq!(intact(&mut profile), advanced);
+
+    // A deleted manifest leaves the output incomplete: that branch hashes the files before it
+    // would prepare anything, and refuses.
+    let manifest_file = advanced.resource_path().join("sunrise-resources.json");
+    fs::remove_file(&manifest_file).unwrap();
+    let error = ready(&mut profile).unwrap_err();
+    snapshot_error(&advanced, String::from(error));
+    assert_eq!(FULL_VERIFICATIONS.take(), 1);
+    fs::write(&manifest_file, b"{}").unwrap();
+    assert_eq!(intact(&mut profile), advanced);
+
+    // A changed binary is refused by the first check of an unchanged Play, without hashing
+    // the prepared files, and again at the handoff when it changes after Play was ready.
+    let program = build.join(backend::CLIENT);
+    fs::write(&program, b"changed client").unwrap();
+    let error = ready(&mut profile).unwrap_err();
+    assert!(String::from(error).contains("managed_play.rs:"));
+    fs::write(&program, client_bytes).unwrap();
+    let (active, _) = ready(&mut profile).unwrap();
+    fs::write(&program, b"changed client").unwrap();
+    let (result, _) = handoff(&profile, &active);
+    assert!(result.unwrap_err().contains("managed_play.rs:"));
+    assert!(!spawned.get());
+    fs::write(&program, client_bytes).unwrap();
+    assert_eq!(intact(&mut profile), advanced);
+}

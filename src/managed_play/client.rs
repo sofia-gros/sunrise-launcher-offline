@@ -317,9 +317,18 @@ impl Client<'_> {
             // saved generation continues to reserve this base until refresh commits.
             let replacement = match old.resources.check_play_output(old.base()) {
                 Ok(()) => None,
-                Err(backend::Unprepared::Incomplete | backend::Unprepared::ServerOnly) => {
-                    // The preparer is part of the saved image. Verify it before starting it.
-                    old.verify_artifacts()?;
+                Err(
+                    unprepared
+                    @ (backend::Unprepared::Incomplete | backend::Unprepared::ServerOnly),
+                ) => {
+                    // The preparer is part of the saved image. Verify it before starting it. A
+                    // server-only tree is replaced next and the replacement is hashed at the
+                    // handoff; an incomplete one still refuses here, as damaged files always did.
+                    if matches!(unprepared, backend::Unprepared::Incomplete) {
+                        old.verify_artifacts()?;
+                    } else {
+                        old.verify_binaries()?;
+                    }
                     progress(Progress::Prepare);
                     Some(super::Resources::for_play_with(
                         old.base(),

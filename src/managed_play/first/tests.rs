@@ -876,3 +876,77 @@ fn a_pointer_written_by_the_released_launcher_is_read_and_kept() {
     let refused = Active::parse(&serde_json::to_vec(&zero).unwrap()).unwrap_err();
     assert!(refused.contains("managed_play.rs:"), "{refused}");
 }
+
+/// Only Play moved its hashing to the handoff. Every other caller of `verify_artifacts` still
+/// hashes the prepared files itself, once, before it changes anything.
+#[test]
+fn edits_switch_and_copies_still_hash_the_prepared_files_and_refuse_damage() {
+    use crate::managed_play::FULL_VERIFICATIONS;
+    const CASE: &str = "managed_play::first::tests::edits_switch_and_copies_still_hash_the_prepared_files_and_refuse_damage";
+    if std::env::var_os("NON_PLAY_HASH_FIXTURE").is_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = backend::plain(temp.path().canonicalize().unwrap());
+        assert!(Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", CASE, "--nocapture"])
+            .env("NON_PLAY_HASH_FIXTURE", "1")
+            .env("SUNRISE_HOME", root.join("game"))
+            .env("SUNRISE_LAUNCHER_HOME", root.join("launcher"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .status()
+            .unwrap()
+            .success());
+        return;
+    }
+    let home = backend::game_home();
+    let resources = backend::resources(BUILD);
+    fs::create_dir_all(&resources).unwrap();
+    fs::write(resources.join("sunrise-resources.json"), b"{}").unwrap();
+    fs::write(resources.join("fixture-blob.bin"), b"original bytes").unwrap();
+    fs::write(backend::version_dir(BUILD).join(".installed"), []).unwrap();
+    fs::write(backend::version_dir(BUILD).join(backend::CLIENT), "client").unwrap();
+    let mut profile = Profile::open(&home, None).unwrap();
+    let active = profile
+        .begin_first(|| FirstBuild::installed(BUILD), |_| {})
+        .unwrap()
+        .commit(BUILD, &native_mods::Cancellation::default())
+        .unwrap();
+    fs::write(active.resource_path().join("fixture-blob.bin"), b"tampered").unwrap();
+    let prefix = format!("{}: ", active.resource_path().display());
+    let counted = |what: &str, error: String| {
+        assert!(error.starts_with(&prefix), "{what}: {error}");
+        assert_eq!(
+            FULL_VERIFICATIONS.take(),
+            1,
+            "{what} did not hash exactly once"
+        );
+    };
+    FULL_VERIFICATIONS.take();
+    counted(
+        "edit",
+        profile
+            .begin_edit(|| FirstBuild::installed(BUILD), |_| {})
+            .err()
+            .expect("edit began on damaged files"),
+    );
+    counted(
+        "pending edit",
+        profile
+            .begin_pending_edit()
+            .err()
+            .expect("pending edit began on damaged files"),
+    );
+    counted(
+        "switch",
+        profile
+            .begin_switch("another-build")
+            .err()
+            .expect("switch began on damaged files"),
+    );
+    let copy = tempfile::tempdir().unwrap();
+    counted(
+        "copy",
+        profile
+            .stage_copy(active, copy.path())
+            .expect_err("copied a profile with damaged files"),
+    );
+}
