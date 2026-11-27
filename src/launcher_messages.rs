@@ -18,6 +18,20 @@ fn settle_managed_play_error(
     cancelled
 }
 
+/// Once Play reaches verification, the native build and profile publication are complete.
+fn finish_play_build_at_handoff(
+    run: Option<&mut crate::mods::build_run::Run>,
+    step: backend::PlayStep,
+) -> bool {
+    if matches!(step, backend::PlayStep::Assets | backend::PlayStep::SignIn) {
+        if let Some(run) = run.filter(|run| run.for_play && run.running()) {
+            run.done();
+            return true;
+        }
+    }
+    false
+}
+
 impl Launcher {
     pub(super) fn refresh_installed(&mut self) {
         (self.installed, self.known_nightly) =
@@ -151,11 +165,9 @@ impl Launcher {
                         }
                         self.play_step = Some(step);
                     }
-                    if step == backend::PlayStep::SignIn && self.native_step.take().is_some() {
+                    if finish_play_build_at_handoff(self.ui.mods.build.as_mut(), step) {
+                        self.native_step = None;
                         self.native_progress = None;
-                        if let Some(run) = &mut self.ui.mods.build {
-                            run.done();
-                        }
                         if self.ui.sheet == Some(crate::sheets::Sheet::ModBuild) {
                             self.close_sheet();
                         }
@@ -823,6 +835,32 @@ impl Launcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verification_handoff_leaves_start_errors_out_of_the_build_sheet() {
+        use backend::PlayStep;
+        let mut run = crate::mods::build_run::Run::start(
+            "fixture".into(),
+            "fixture profile".into(),
+            "fixture".into(),
+            Vec::new(),
+            true,
+        );
+        assert!(!finish_play_build_at_handoff(
+            Some(&mut run),
+            PlayStep::Native
+        ));
+        assert!(run.running());
+        assert!(finish_play_build_at_handoff(
+            Some(&mut run),
+            PlayStep::Assets
+        ));
+        assert!(
+            !run.running(),
+            "a subsequent Other error belongs to Start, not Build"
+        );
+        assert!(matches!(run.end, Some(crate::mods::build_run::End::Done)));
+    }
 
     #[test]
     fn a_managed_play_build_failure_disarms_the_update_but_a_cancellation_does_not() {
