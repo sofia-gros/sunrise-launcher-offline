@@ -2142,11 +2142,14 @@ fn build_stages(
         let slot = workspace::SlotKey::new(&revision, rust.host.target, target)
             .and_then(|key| key.usable(local_sdk.is_some()));
         if let Some(key) = slot {
-            if !workspace.attach(lease, key).map_err(cache_error)? {
-                crate::launcher_log::line(
-                    "Native build folder not kept: its paths would be too deep for Windows",
-                );
-            }
+            let described = key.describe();
+            let note = if workspace.attach(lease, key).map_err(cache_error)? {
+                format!("Native build slot {described}")
+            } else {
+                "Native build folder not kept: its paths would be too deep for Windows".to_owned()
+            };
+            let _ = append_log(&note);
+            crate::launcher_log::line(note);
         }
         let game = workspace.package(game).map_err(|e| e.to_string())?;
         // A package carries the registry lock `cargo sunrise-mod build` wrote; a source folder may
@@ -2169,7 +2172,6 @@ fn build_stages(
         }
         // The libraries an earlier build of these mods kept (`kept`), copied in so the tool
         // compiles only the mods whose own inputs changed. Without them, every mod compiles.
-        let seeding = std::time::Instant::now();
         let mixins_from_source = MIXINS_FROM_SOURCE.load(std::sync::atomic::Ordering::Relaxed);
         let kept_store = kept::Kept::new(&root());
         let kept_plan = match (signed_sdk, expected_route) {
@@ -2201,6 +2203,7 @@ fn build_stages(
         // one more time (`retry_cold` allows it once).
         let (built, libraries) = loop {
             let work = workspace.work();
+            let seeding = std::time::Instant::now();
             if let Some(plan) = &kept_plan {
                 let reused = kept_store.seed(&work, &plan.mods, &plan.keys);
                 if !reused.is_empty() {

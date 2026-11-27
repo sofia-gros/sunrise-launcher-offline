@@ -444,6 +444,38 @@ fn a_build_too_deep_for_windows_is_found_before_it_starts() {
     assert_eq!(too_deep(&home(&"u".repeat(36))), Some(260));
 }
 
+#[test]
+fn a_slot_path_fits_a_35_character_windows_user_and_names_its_inputs() {
+    let slot = key(crate::native_mods::Target::Client);
+    let home = |user: &str| {
+        std::path::PathBuf::from(format!(
+            r"C:\Users\{user}\AppData\Roaming\sunrise\launcher\native\w\{}",
+            slot.as_str()
+        ))
+    };
+    // The same budget as an attempt's own folder in the test above.
+    assert_eq!(too_long(&home(&"u".repeat(35))), None);
+    assert_eq!(too_long(&home(&"u".repeat(36))), Some(260));
+    let other = SlotKey::keyed(
+        COMMIT,
+        "x86_64-unknown-linux-gnu",
+        crate::native_mods::Target::Client,
+        "1.99.2",
+    )
+    .unwrap();
+    assert_ne!(slot.as_str(), other.as_str());
+    let line = slot.describe();
+    for part in [
+        slot.as_str(),
+        COMMIT,
+        "x86_64-unknown-linux-gnu",
+        "client",
+        "1.99.1",
+    ] {
+        assert!(line.contains(part), "{line}");
+    }
+}
+
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
 /// A scratch build folder with its lease held, and the canonical path of that folder.
@@ -480,9 +512,15 @@ fn a_slot_is_keyed_by_game_build_target_side_and_rust_never_by_the_mods() {
     let named =
         |commit: &str, triple: &str, side, rust: &str| SlotKey::keyed(commit, triple, side, rust);
     let base = named(COMMIT, "x86_64-pc-windows-gnu", Client, "1.99.1").unwrap();
+    // A folder name is 10 lowercase hex characters, the digest of the four inputs.
+    assert_eq!(base.as_str().len(), 10);
+    assert!(base
+        .as_str()
+        .bytes()
+        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
     assert_eq!(
         base.as_str(),
-        format!("{COMMIT}-x86_64-pc-windows-gnu-client-rust-1.99.1")
+        &sha256(format!("{COMMIT}\0x86_64-pc-windows-gnu\0client\01.99.1").as_bytes())[..10]
     );
     let other_commit = "f".repeat(40);
     for other in [
@@ -491,7 +529,9 @@ fn a_slot_is_keyed_by_game_build_target_side_and_rust_never_by_the_mods() {
         named(COMMIT, "x86_64-pc-windows-gnu", Server, "1.99.1"),
         named(COMMIT, "x86_64-pc-windows-gnu", Client, "1.99.2"),
     ] {
-        assert_ne!(other.unwrap(), base);
+        let other = other.unwrap();
+        assert_ne!(other, base);
+        assert_ne!(other.as_str(), base.as_str());
     }
     // Only a commit and names fit to be one folder make a key.
     assert!(named("abc", "x86_64-pc-windows-gnu", Client, "1.99.1").is_none());
@@ -518,7 +558,7 @@ fn a_slot_is_keyed_by_game_build_target_side_and_rust_never_by_the_mods() {
     fs::write(first.work().join("kept"), b"compiled").unwrap();
     assert!(second.attach(&lease, client.clone()).unwrap());
     assert!(headless.attach(&lease, key(Server)).unwrap());
-    assert_eq!(first.work(), native.join("work").join(client.as_str()));
+    assert_eq!(first.work(), native.join("w").join(client.as_str()));
     assert_eq!(second.work(), first.work());
     assert_eq!(fs::read(second.work().join("kept")).unwrap(), b"compiled");
     assert_ne!(headless.work(), first.work());
@@ -554,7 +594,7 @@ fn a_developer_sdk_keeps_the_attempts_own_folders() {
         Some(Some(stage.path().join("cargo").as_os_str()))
     );
     drop(lease);
-    assert!(!build.join("native/work").exists());
+    assert!(!build.join("native/w").exists());
 }
 
 #[test]
@@ -613,14 +653,14 @@ fn a_link_poisoned_slot_is_removed_without_following_it_and_built_cold() {
     fs::write(outside.join("canary"), b"alive").unwrap();
     fs::write(outside.join("inner/canary"), b"alive").unwrap();
     let client = key(crate::native_mods::Target::Client);
-    let slot = native.join("work").join(client.as_str());
+    let slot = native.join("w").join(client.as_str());
     let canaries = || {
         for file in ["canary", "inner/canary"] {
             assert_eq!(fs::read(outside.join(file)).unwrap(), b"alive");
         }
     };
     // The slot itself is a link.
-    fs::create_dir_all(native.join("work")).unwrap();
+    fs::create_dir_all(native.join("w")).unwrap();
     symlink(&outside, &slot).unwrap();
     let mut stage = Workspace::new(&native).unwrap();
     assert!(stage.attach(&lease, client.clone()).unwrap());
@@ -655,7 +695,7 @@ fn a_link_poisoned_slot_is_removed_without_following_it_and_built_cold() {
     assert_eq!(stage.cargo_home(), build.join("cargo"));
     assert!(listing(&build.join("cargo")).is_empty());
     canaries();
-    // The folders above are not the lease's to redirect: `native/work` as a link goes too.
+    // The folders above are not the lease's to redirect: `native/w` as a link goes too.
     let other = SlotKey::keyed(
         COMMIT,
         "x86_64-unknown-linux-gnu",
@@ -663,12 +703,12 @@ fn a_link_poisoned_slot_is_removed_without_following_it_and_built_cold() {
         "1.99.1",
     )
     .unwrap();
-    fs::remove_dir_all(native.join("work")).unwrap();
-    symlink(&outside, native.join("work")).unwrap();
+    fs::remove_dir_all(native.join("w")).unwrap();
+    symlink(&outside, native.join("w")).unwrap();
     let mut stage = Workspace::new(&native).unwrap();
     assert!(stage.attach(&lease, other.clone()).unwrap());
-    assert!(fs::symlink_metadata(native.join("work")).unwrap().is_dir());
-    assert_eq!(stage.work(), native.join("work").join(other.as_str()));
+    assert!(fs::symlink_metadata(native.join("w")).unwrap().is_dir());
+    assert_eq!(stage.work(), native.join("w").join(other.as_str()));
     assert!(!outside.join(other.as_str()).exists());
     canaries();
 }
@@ -776,8 +816,7 @@ fn a_persistent_build_binds_each_output_to_the_one_root_it_belongs_to() {
     let beside_native = build.join("native/libbeside.so.1");
     let beside_cargo = build.join("cargo-other/libbeside.so.1");
     let in_other_work = work.join("elsewhere/libelsewhere.so.1");
-    let in_other_slot =
-        build.join("native/work/another-slot/prebuilt-build/key/target/libother.so.1");
+    let in_other_slot = build.join("native/w/another-slot/prebuilt-build/key/target/libother.so.1");
     let stamped_in_cargo = cargo.join("libgreeter.so");
     let all = [
         &binary,

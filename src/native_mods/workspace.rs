@@ -37,16 +37,37 @@ fn too_long(work: &Path) -> Option<usize> {
     (length >= MAX_PATH).then_some(length)
 }
 
+/// How many hex characters of a game build's digest name its persistent work folder.
+///
+/// Derivation: SHA-256 over the four keying inputs joined by NUL bytes,
+/// `<commit>\0<triple>\0<side>\0<rust version>`, written as lowercase hex, first 10 characters
+/// (40 bits: collisions among the few builds one player keeps are not a concern, and a collision
+/// would only share a folder whose contents Cargo's fingerprints already check).
+///
+/// Length arithmetic: the slot is `native\w\<10 hex>`, 6 + 1 + 1 + 1 + 10 = 19 characters below
+/// the build folder, exactly the attempt's own `native\.nb-XXXXXX\w`, 6 + 1 + 10 + 1 + 1 = 19.
+/// So the deepest path is 19 + 1 + `DEEPEST` (161) = 181 characters below the build folder, as
+/// it is in an attempt's own folder, and the 35-character Windows user name that fits under
+/// `MAX_PATH` (#396) still fits. A longer, readable slot name would shrink that budget.
+const WORK_SLOT_HEX: usize = 10;
+
 /// Game builds whose work folder was left with compiler workers not proved stopped, in this
 /// launcher run only. Nothing is written to disk: the next start reuses the folder as usual.
 static UNPROVED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
 
 /// Which game build a persistent work folder belongs to: its commit, the Rust target, the side
-/// and the Rust version, `<commit>-<triple>-<side>-rust-<version>`. Never a mod set or a profile:
-/// Cargo's own fingerprints decide what a different set rebuilds, and every set on one game
-/// build shares the folder.
+/// and the Rust version. Never a mod set or a profile: Cargo's own fingerprints decide what a
+/// different set rebuilds, and every set on one game build shares the folder. The folder's name
+/// is a short digest of those four inputs (see `WORK_SLOT_HEX`), so [`Self::describe`] says
+/// what it stands for.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct SlotKey(String);
+pub(super) struct SlotKey {
+    dir: String,
+    revision: String,
+    triple: String,
+    side: &'static str,
+    rust: String,
+}
 
 impl SlotKey {
     pub(super) fn new(revision: &str, triple: &str, target: super::Target) -> Option<Self> {
@@ -61,8 +82,17 @@ impl SlotKey {
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
         };
-        (super::is_revision(revision) && name(triple) && name(rust))
-            .then(|| Self(format!("{revision}-{triple}-{}-rust-{rust}", target.name())))
+        (super::is_revision(revision) && name(triple) && name(rust)).then(|| {
+            let side = target.name();
+            let digest = sha256(format!("{revision}\0{triple}\0{side}\0{rust}").as_bytes());
+            Self {
+                dir: digest[..WORK_SLOT_HEX].to_owned(),
+                revision: revision.to_owned(),
+                triple: triple.to_owned(),
+                side,
+                rust: rust.to_owned(),
+            }
+        })
     }
 
     /// The slot only a build the launcher can trust to be left alone uses: not a developer's own
@@ -72,15 +102,24 @@ impl SlotKey {
         (!local_sdk && !self.is_unproved()).then_some(self)
     }
 
+    /// The slot's folder name, `native/w/<name>`.
     pub(super) fn as_str(&self) -> &str {
-        &self.0
+        &self.dir
+    }
+
+    /// The slot and the four inputs it stands for, for the build log. No path.
+    pub(super) fn describe(&self) -> String {
+        format!(
+            "{} (commit={} triple={} side={} rust={})",
+            self.dir, self.revision, self.triple, self.side, self.rust
+        )
     }
 
     fn is_unproved(&self) -> bool {
         UNPROVED
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .contains(&self.0)
+            .contains(&self.dir)
     }
 
     /// What the next launcher start does: the slot is used again.
@@ -89,7 +128,7 @@ impl SlotKey {
         UNPROVED
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(&self.0);
+            .remove(&self.dir);
     }
 }
 
@@ -171,10 +210,11 @@ impl Workspace {
         lease: &crate::native_cache::Cache,
         key: SlotKey,
     ) -> Result<bool, crate::native_cache::Error> {
-        let work = lease.work_slot(key.as_str())?;
-        if cfg!(windows) && too_long(&work.path).is_some() {
+        // Checked before the folder is made, so an unusable slot leaves no empty one behind.
+        if cfg!(windows) && too_long(&lease.work_slot_path(key.as_str())).is_some() {
             return Ok(false);
         }
+        let work = lease.work_slot(key.as_str())?;
         let cargo_home = lease.cargo_home()?;
         self.slot = Some(Slot {
             key,
@@ -208,7 +248,7 @@ impl Workspace {
             UNPROVED
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .insert(slot.key.0.clone());
+                .insert(slot.key.dir.clone());
         }
     }
 

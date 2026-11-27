@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 
 pub(crate) const PROFILES: [&str; 2] = ["fast", "release"];
 
-/// The folder under `native/` holding one persistent compiler work folder per game build.
-pub(crate) const WORK: &str = "work";
+/// The folder under `native/` holding one persistent compiler work folder per game build. One
+/// letter, because Windows' path limit counts it (see `WORK_SLOT_HEX` in the native workspace).
+pub(crate) const WORK: &str = "w";
 
 #[derive(Debug)]
 pub enum Error {
@@ -232,8 +233,13 @@ impl Cache {
         self.unchanged_path(path)
     }
 
+    /// Where [`Self::work_slot`] puts `slot`, before anything is made there.
+    pub(crate) fn work_slot_path(&self, slot: &str) -> PathBuf {
+        crate::backend::plain(self.root.join(WORK).join(slot))
+    }
+
     /// The folder the compiler's own build folders persist in for the game build `slot` names,
-    /// `native/work/<slot>`, checked link-free below the lease. A slot holding a link where the
+    /// `native/w/<slot>`, checked link-free below the lease. A slot holding a link where the
     /// SDK keeps its own folders is removed whole (never followed) and made again empty: it
     /// builds cold once, with no repair of what was there.
     pub(crate) fn work_slot(&self, slot: &str) -> Result<Provisioned, Error> {
