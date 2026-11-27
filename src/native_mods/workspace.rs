@@ -1,9 +1,12 @@
-//! SDK inputs and writable paths for one native compiler attempt, never reused by a retry.
+//! SDK inputs and writable paths for one native compiler attempt. The attempt's own folder is
+//! never reused by a retry; the compiler's work folder and Cargo's home can outlive it (see
+//! [`SlotKey`]).
 use super::{sdk_cache::Package, tool, Path};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs, io,
-    path::Component,
+    path::{Component, PathBuf},
+    sync::{LazyLock, Mutex, PoisonError},
 };
 use sunrise_launcher_smod::{
     index::{library_identity::LibraryIdentity, sha256, sha256_file},
@@ -25,11 +28,87 @@ const MAX_PATH: usize = 260;
 
 /// How long the deepest path of a build in `attempt` would be, when it would pass Windows' limit.
 pub(super) fn too_deep(attempt: &Path) -> Option<usize> {
-    let length = attempt.as_os_str().len() + 1 + WORK.len() + 1 + DEEPEST.len();
+    too_long(&attempt.join(WORK))
+}
+
+/// The same for a build whose SDK work folder is `work`.
+fn too_long(work: &Path) -> Option<usize> {
+    let length = work.as_os_str().len() + 1 + DEEPEST.len();
     (length >= MAX_PATH).then_some(length)
 }
 
-pub(super) struct Workspace(tempfile::TempDir);
+/// Game builds whose work folder was left with compiler workers not proved stopped, in this
+/// launcher run only. Nothing is written to disk: the next start reuses the folder as usual.
+static UNPROVED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
+
+/// Which game build a persistent work folder belongs to: its commit, the Rust target, the side
+/// and the Rust version, `<commit>-<triple>-<side>-rust-<version>`. Never a mod set or a profile:
+/// Cargo's own fingerprints decide what a different set rebuilds, and every set on one game
+/// build shares the folder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct SlotKey(String);
+
+impl SlotKey {
+    pub(super) fn new(revision: &str, triple: &str, target: super::Target) -> Option<Self> {
+        Self::keyed(revision, triple, target, crate::rust_toolchain::VERSION)
+    }
+
+    /// None unless every part is fit to be one folder name.
+    fn keyed(revision: &str, triple: &str, target: super::Target, rust: &str) -> Option<Self> {
+        let name = |text: &str| {
+            !text.is_empty()
+                && text
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        };
+        (super::is_revision(revision) && name(triple) && name(rust))
+            .then(|| Self(format!("{revision}-{triple}-{}-rust-{rust}", target.name())))
+    }
+
+    /// The slot only a build the launcher can trust to be left alone uses: not a developer's own
+    /// SDK, whose unpinned checkout would mix into a signed build's folder, and not a game build
+    /// whose last compiler tree was not proved gone in this run.
+    pub(super) fn usable(self, local_sdk: bool) -> Option<Self> {
+        (!local_sdk && !self.is_unproved()).then_some(self)
+    }
+
+    pub(super) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn is_unproved(&self) -> bool {
+        UNPROVED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&self.0)
+    }
+
+    /// What the next launcher start does: the slot is used again.
+    #[cfg(test)]
+    fn forget_unproved(&self) {
+        UNPROVED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
+/// The persistent folders a build compiles in, in place of the attempt's own.
+struct Slot {
+    key: SlotKey,
+    work: PathBuf,
+    cargo_home: PathBuf,
+    /// Something was in the work folder before this build: a failure there may be its leftovers.
+    warm: bool,
+}
+
+pub(super) struct Workspace {
+    dir: tempfile::TempDir,
+    slot: Option<Slot>,
+    /// No compiler worker of this attempt may still be running: true until one starts, and
+    /// again once an OS proof says the tree is gone.
+    workers_stopped: bool,
+}
 
 /// One SDK library, with the exact basename it is installed under and the verified
 /// bytes. A registry symlink alias is copied as a regular file under its original name.
@@ -59,46 +138,127 @@ impl Workspace {
             .prefix(ATTEMPT_PREFIX)
             .rand_bytes(6)
             .tempdir_in(parent)
-            .map(Self)
+            .map(|dir| Self {
+                dir,
+                slot: None,
+                workers_stopped: true,
+            })
     }
 
     pub(super) fn path(&self) -> &Path {
-        self.0.path()
+        self.dir.path()
     }
 
-    /// The folder the SDK builds in.
-    pub(super) fn work(&self) -> std::path::PathBuf {
-        self.path().join(WORK)
+    /// The folder the SDK builds in: the game build's persistent one, else the attempt's own.
+    pub(super) fn work(&self) -> PathBuf {
+        self.slot
+            .as_ref()
+            .map_or_else(|| self.path().join(WORK), |slot| slot.work.clone())
+    }
+
+    /// Cargo's home: the launcher's own `cargo/` for a persistent build, else the attempt's.
+    pub(super) fn cargo_home(&self) -> PathBuf {
+        self.slot
+            .as_ref()
+            .map_or_else(|| self.path().join("cargo"), |slot| slot.cargo_home.clone())
+    }
+
+    /// Moves the SDK's work folder and Cargo's home out of the attempt into `key`'s slot and the
+    /// launcher's `cargo/`, both checked link-free below `lease`. False, with nothing moved,
+    /// when the slot's deepest build path would pass Windows' limit (#396).
+    pub(super) fn attach(
+        &mut self,
+        lease: &crate::native_cache::Cache,
+        key: SlotKey,
+    ) -> Result<bool, crate::native_cache::Error> {
+        let work = lease.work_slot(key.as_str())?;
+        if cfg!(windows) && too_long(&work.path).is_some() {
+            return Ok(false);
+        }
+        let cargo_home = lease.cargo_home()?;
+        self.slot = Some(Slot {
+            key,
+            work: work.path,
+            cargo_home,
+            warm: !work.cold,
+        });
+        Ok(true)
+    }
+
+    /// Empties the slot a failed build ran in, for one cold build: only after a proved stop of
+    /// the compiler, only when the slot held something before, and so at most once. False when
+    /// any of that doesn't hold; nothing is removed then.
+    pub(super) fn retry_cold(
+        &mut self,
+        lease: &crate::native_cache::Cache,
+    ) -> Result<bool, crate::native_cache::Error> {
+        let stopped = self.workers_stopped;
+        let Some(slot) = self.slot.as_mut().filter(|slot| slot.warm && stopped) else {
+            return Ok(false);
+        };
+        slot.work = lease.fresh_work_slot(slot.key.as_str())?.path;
+        slot.warm = false;
+        Ok(true)
+    }
+
+    /// After an attempt: a persistent folder whose compiler tree was not proved gone is not
+    /// used again in this launcher run (builds take their own folders), and nothing is written.
+    pub(super) fn note_unproved(&self) {
+        if let Some(slot) = self.slot.as_ref().filter(|_| !self.workers_stopped) {
+            UNPROVED
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(slot.key.0.clone());
+        }
     }
 
     pub(super) fn isolate(&self, command: &mut std::process::Command) -> io::Result<()> {
         let path = self.path();
-        for dir in ["cargo", "target", "tmp"] {
-            fs::create_dir_all(path.join(dir))?;
-        }
         let tmp = path.join("tmp");
+        fs::create_dir_all(&tmp)?;
         command
-            .env("CARGO_HOME", path.join("cargo"))
-            .env("CARGO_TARGET_DIR", path.join("target"))
+            .env("CARGO_HOME", self.cargo_home())
             .env("TMPDIR", &tmp)
             .env("TMP", &tmp)
             .env("TEMP", &tmp);
+        if self.slot.is_some() {
+            // The SDK gives Cargo its own target folder inside the work folder.
+            command.env_remove("CARGO_TARGET_DIR");
+        } else {
+            for dir in ["cargo", "target"] {
+                fs::create_dir_all(path.join(dir))?;
+            }
+            command.env("CARGO_TARGET_DIR", path.join("target"));
+        }
         Ok(())
     }
 
     /// From here on an escaped descendant can outlive the launcher or SDK. It can keep its
     /// private paths; ordinary retry and recovery must not unlink or reuse them.
     pub(super) fn allow_worker(&mut self) {
-        self.0.disable_cleanup(true);
+        self.workers_stopped = false;
+        self.dir.disable_cleanup(true);
     }
 
     /// A terminal OS proof, not successful compilation by itself, permits cleanup.
     pub(super) fn worker_finished(&mut self) {
-        self.0.disable_cleanup(false);
+        self.workers_stopped = true;
+        self.dir.disable_cleanup(false);
     }
 
-    /// Copy the installed SDK inputs, never giving a compiler links into the shared cache.
+    /// The installed SDK inputs a compiler gets. A persistent build is pointed straight at the
+    /// kept slices, read-only by agreement with the tool, once each is a link-free folder. Any
+    /// other copies them, never giving a compiler links into the shared cache.
     pub(super) fn package(&self, package: &Package) -> io::Result<Package> {
+        if self.slot.is_some() {
+            for slice in [&package.runtime, &package.api, &package.engine] {
+                let unit = slice.parent().ok_or_else(invalid)?;
+                for folder in [unit, slice.as_path()] {
+                    crate::native_cache::checked(folder, true).map_err(|_| invalid())?;
+                }
+            }
+            return Ok(package.clone());
+        }
         let root = self.path().join("package");
         fs::create_dir(&root)?;
         let private = Package::at(&root);
@@ -122,7 +282,7 @@ impl Workspace {
     pub(super) fn import_log(&self) -> io::Result<String> {
         let work = self.work();
         let log = work.join("build.log");
-        match regular_under(self.path(), &log) {
+        match regular_under(&work, &log) {
             Ok(()) => Ok(tool::tail(fs::File::open(log)?)),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(String::new()),
             Err(err) => Err(err),
@@ -130,7 +290,10 @@ impl Workspace {
     }
 
     /// Bind the exact SDK path and bytes of every published library, including ordinary unstamped
-    /// dependencies. Only the registry route can add Cargo output or Cargo-home libraries.
+    /// dependencies. Only the registry route can add Cargo output or Cargo-home libraries. Each
+    /// kind of file is checked against the one root it can belong to, never a folder above them
+    /// all: the SDK runtime slice, the work folder, Cargo's home, or the toolchain's own folders.
+    /// Nothing here may run before the compiler tree is proved gone.
     pub(super) fn verify_outputs<'a>(
         &self,
         built: &tool::Built,
@@ -147,13 +310,12 @@ impl Workspace {
         // Both SDK runtime slices use this filename; installation renames the server image.
         let binary = crate::backend::plain(built.binary.clone());
         let runtime_binary = binary == package.runtime.join("bin").join(crate::backend::CLIENT)
-            && regular_under(self.path(), &binary).is_ok();
+            && regular_under(&package.runtime, &binary).is_ok();
         match built.route {
             tool::CheckRoute::PrebuiltApi if !runtime_binary => return Err(invalid()),
             tool::CheckRoute::Prebuilt
                 if !runtime_binary
-                    && (!binary.starts_with(&work)
-                        || regular_under(self.path(), &binary).is_err()) =>
+                    && (!binary.starts_with(&work) || regular_under(&work, &binary).is_err()) =>
             {
                 return Err(invalid())
             }
@@ -210,7 +372,7 @@ impl Workspace {
         } else {
             None
         };
-        let cargo_home = self.path().join("cargo");
+        let cargo_home = self.cargo_home();
         let joined_runtime = whole.join("deps");
         let stamped_names: BTreeSet<_> =
             built.records.iter().map(|row| row.file.as_str()).collect();
@@ -235,8 +397,9 @@ impl Workspace {
             if !dynamic && !(dependency && versioned_so) {
                 return Err(invalid());
             }
-            let runtime =
-                || file.starts_with(&package.runtime) && regular_under(self.path(), &file).is_ok();
+            let runtime = || {
+                file.starts_with(&package.runtime) && regular_under(&package.runtime, &file).is_ok()
+            };
             let standard = || {
                 (name.starts_with("libstd-") || name.starts_with("std-"))
                     && std_lib.as_ref().is_some_and(|dir| {
@@ -253,14 +416,14 @@ impl Workspace {
                     && built.route == tool::CheckRoute::Prebuilt
                     && file.starts_with(&joined_runtime));
             let source = if dynamic
-                && ((produced && regular_under(self.path(), &file).is_ok())
+                && ((produced && regular_under(&work, &file).is_ok())
                     || runtime()
                     || standard()
                     || gnu())
             {
                 file.clone()
             } else if let Some(target) = registry_target.as_ref().filter(|_| dependency) {
-                registry_library(self.path(), [target, &cargo_home], &file)?
+                registry_library(&work, target, &cargo_home, &file)?
             } else {
                 return Err(invalid());
             };
@@ -383,27 +546,36 @@ fn invalid() -> io::Error {
 }
 
 // The SDK preserves linked library basenames (e.g. libx.so -> libx.so.1). Only a
-// final file symlink within the registry's exact roots is allowed. Keep the resolved
-// checked source, not the symlink, and verify the published copy's digest again.
+// final file symlink within the registry's exact roots is allowed: Cargo's target folder
+// (checked from the work folder down) or Cargo's home. Keep the resolved checked source, not
+// the symlink, and verify the published copy's digest again.
 fn registry_library(
-    workspace: &Path,
-    roots: [&Path; 2],
+    work: &Path,
+    target: &Path,
+    cargo_home: &Path,
     path: &Path,
-) -> io::Result<std::path::PathBuf> {
-    let allowed = |file: &Path| roots.iter().any(|root| file.starts_with(root));
-    if !allowed(path) {
-        return Err(invalid());
+) -> io::Result<PathBuf> {
+    // The folder each place is checked from, component by component.
+    let root = |file: &Path| {
+        if file.starts_with(target) {
+            Some(work)
+        } else if file.starts_with(cargo_home) {
+            Some(cargo_home)
+        } else {
+            None
+        }
+    };
+    let parent = path.parent().ok_or_else(invalid)?;
+    let from = root(path).ok_or_else(invalid)?;
+    if parent != from {
+        checked_under(from, parent, true)?;
     }
-    checked_under(workspace, path.parent().ok_or_else(invalid)?, true)?;
     let source = if fs::symlink_metadata(path)?.file_type().is_symlink() {
         crate::backend::plain(path.canonicalize()?)
     } else {
         path.to_owned()
     };
-    if !allowed(&source) {
-        return Err(invalid());
-    }
-    regular_under(workspace, &source)?;
+    regular_under(root(&source).ok_or_else(invalid)?, &source)?;
     Ok(source)
 }
 
