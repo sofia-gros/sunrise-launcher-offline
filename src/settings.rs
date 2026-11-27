@@ -915,7 +915,11 @@ impl Launcher {
             detail,
             div().child(
                 if offered
-                    && complete.is_none_or(|r| r.rows.iter().any(|row| row.clearable_bytes() > 0))
+                    && complete.is_none_or(|r| {
+                        r.rows
+                            .iter()
+                            .any(|row| glass_storage::row_clearable(Some(row)))
+                    })
                 {
                     clear_all.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.storage_confirm = Some(None);
@@ -949,8 +953,10 @@ impl Launcher {
             } else {
                 1
             };
-            let bytes = (counted.len() == wanted)
-                .then(|| counted.iter().map(|r| r.clearable_bytes()).sum());
+            let bytes = (counted.len() == wanted
+                && counted.iter().all(|r| r.measured_bytes().is_some()))
+            .then(|| counted.iter().map(|r| r.clearable_bytes()).sum())
+            .filter(|&bytes| bytes > 0);
             let question = glass_storage::clear_question(asked, bytes);
             cache.push(
                 div()
@@ -981,30 +987,24 @@ impl Launcher {
                 .storage_report
                 .as_ref()
                 .and_then(|report| report.rows.iter().find(|r| r.category == category));
-            let size = found.map_or_else(
-                || uncounted.to_string(),
-                |r| storage::format_bytes(r.remaining_bytes),
-            );
+            let size = found
+                .and_then(storage::Row::measured_bytes)
+                .map_or_else(|| uncounted.to_string(), storage::format_bytes);
             let clear = button(ElementId::named_usize("alt-storage-clear", n), tr("Clear…"));
             let mut line = row(
                 trf(
                     "{category} · {size}",
-                    &[
-                        ("category", glass_storage::category_label(category)),
-                        ("size", &size),
-                    ],
+                    &[("category", category.label()), ("size", &size)],
                 ),
                 glass_storage::category_about(category),
-                div().child(
-                    if offered && found.is_none_or(|r| r.clearable_bytes() > 0) {
-                        clear.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.storage_confirm = Some(Some(category));
-                            cx.notify();
-                        }))
-                    } else {
-                        off(clear)
-                    },
-                ),
+                div().child(if offered && glass_storage::row_clearable(found) {
+                    clear.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.storage_confirm = Some(Some(category));
+                        cx.notify();
+                    }))
+                } else {
+                    off(clear)
+                }),
             );
             let feedback = cleared.and_then(|report| {
                 report
@@ -1012,15 +1012,10 @@ impl Launcher {
                     .iter()
                     .find(|r| r.category == category && r.after_clear)
             });
-            if let Some(kept) = feedback.or(found).and_then(|r| {
-                glass_storage::kept_line(
-                    r.remaining_bytes,
-                    r.clearable_bytes(),
-                    r.after_clear,
-                    !r.kept.is_empty(),
-                    r.older_build_kept,
-                )
-            }) {
+            if let Some(kept) = feedback
+                .and_then(glass_storage::kept_line)
+                .or_else(|| found.and_then(glass_storage::kept_line))
+            {
                 line = div()
                     .flex()
                     .flex_col()

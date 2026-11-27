@@ -30,24 +30,86 @@ fn the_question_asks_without_a_size_when_the_rows_are_not_counted() {
     }
 }
 
+#[cfg(unix)]
 #[test]
-fn idle_clear_explains_only_a_wholly_protected_row() {
-    let line = kept_line(2_000_000, 0, false, true, false).unwrap();
-    assert_eq!(
-        line,
-        "2.0 MB is protected and can't be cleared. See the launcher log for details."
-    );
-    assert_eq!(kept_line(2_000_000, 1_000_000, false, true, false), None);
-}
+fn storage_row_actions_and_advice_use_real_inventory_rows() {
+    use std::{fs, os::unix::fs::symlink, path::PathBuf, process::Command};
 
-#[test]
-fn clear_reports_one_total_for_all_kept_units_in_a_row() {
-    let kept = [1_000_000, 2_000_000];
-    let line = kept_line(kept.iter().sum(), 0, true, true, true).unwrap();
+    // Storage opens the process's data roots. Keep the test's roots in a fresh process.
+    const CHILD: &str = "SUNRISE_TEST_STORAGE_ROW_CHILD";
+    let Some(root) = std::env::var_os(CHILD).map(PathBuf::from) else {
+        let home = tempfile::tempdir().unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "glass_storage::tests::storage_row_actions_and_advice_use_real_inventory_rows",
+                "--nocapture",
+            ])
+            .env(CHILD, home.path())
+            .env("SUNRISE_LAUNCHER_HOME", home.path().join("launcher"))
+            .env(
+                "SUNRISE_LAUNCHER_LOCATION_FILE",
+                home.path().join("location.json"),
+            )
+            .env("SUNRISE_HOME", home.path().join("game"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    };
+    let launcher = root.join("launcher");
+    let target = launcher.join("native/target/debug");
+    let source = launcher.join("native/source/revision");
+    let work = launcher.join("native/w");
+    for dir in [&target, &source, &work] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    let canary = root.join("private-path-canary");
+    fs::write(&canary, [1; 8192]).unwrap();
+    fs::write(target.join("output"), [1; 8192]).unwrap();
+    symlink(&canary, source.join("private-path-canary")).unwrap();
+    symlink(&canary, work.join("link-only")).unwrap();
+
+    let storage = storage::Storage::open().unwrap();
+    let mut report = storage.report(None, false).unwrap();
+    let links = report
+        .rows
+        .iter()
+        .find(|r| r.category == Category::ModBuildCache)
+        .unwrap();
+    assert_eq!(links.measured_bytes(), Some(0));
+    assert!(row_clearable(Some(links)));
+    assert_eq!(kept_line(links), None);
+
+    let refused = report
+        .rows
+        .iter_mut()
+        .find(|r| r.category == Category::BuildFiles)
+        .unwrap();
+    assert_eq!(refused.eligibility(), Eligibility::WhollyRefused);
+    assert!(!row_clearable(Some(refused)));
+    assert!(kept_line(refused).is_some());
+    assert!(refused
+        .kept
+        .iter()
+        .any(|unit| unit.kind == KeptKind::Unsafe));
+    assert!(refused
+        .kept
+        .iter()
+        .all(|unit| !unit.reason.contains("private-path-canary")));
+
+    // Check a post-Clear report with both older-build and other refusals, then only older builds.
+    refused.after_clear = true;
+    refused.kept[0].kind = KeptKind::OlderBuild;
+    let size = storage::format_bytes(refused.remaining_bytes);
     assert_eq!(
-        line,
-        "3.0 MB stayed. Remove older game builds if you no longer use them, then try again."
+        kept_line(refused).unwrap(),
+        format!("{size} stayed. See the launcher log for details.")
     );
+    refused.kept.truncate(1);
+    assert!(kept_line(refused)
+        .unwrap()
+        .contains("Remove older game builds"));
 }
 
 #[test]

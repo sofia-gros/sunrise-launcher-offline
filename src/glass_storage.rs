@@ -2,7 +2,7 @@
 //! filesystem work never runs on the render thread.
 use super::*;
 
-use storage::Category;
+use storage::{Category, Eligibility, KeptKind, Row};
 
 #[cfg(test)]
 mod tests;
@@ -19,36 +19,44 @@ pub(crate) fn clear_offered(work: Option<&Work>) -> bool {
     !work.is_some_and(|work| work.clearing)
 }
 
+/// Unknown rows can be cleared without waiting for counting; a link-only candidate can
+/// be cleared even though it owns no allocated bytes.
+pub(super) fn row_clearable(row: Option<&Row>) -> bool {
+    row.is_none_or(|row| {
+        matches!(
+            row.eligibility(),
+            Eligibility::NotMeasured | Eligibility::Candidate
+        )
+    })
+}
+
 /// A row says nothing about partial protection until a Clear has tried it.
-pub(super) fn kept_line(
-    remaining: u64,
-    clearable: u64,
-    after_clear: bool,
-    has_refusals: bool,
-    older_build_kept: bool,
-) -> Option<String> {
-    if remaining == 0 {
-        return (after_clear && has_refusals).then(|| {
-            tr("Some files couldn't be cleared. See the launcher log for details.").into()
+pub(super) fn kept_line(row: &Row) -> Option<String> {
+    let first = row.kept.first()?;
+    if !row.after_clear {
+        if row.eligibility() != Eligibility::WhollyRefused {
+            return None;
+        }
+        return Some(if row.only_kept_kind(first.kind) {
+            first.reason.clone()
+        } else {
+            tr("These files can't be cleared. See the launcher log for details.").into()
         });
     }
-    if !after_clear && clearable > 0 {
-        return None;
+    if row.remaining_bytes == 0 {
+        return Some(
+            tr("Some files couldn't be cleared. See the launcher log for details.").into(),
+        );
     }
-    let size = storage::format_bytes(remaining);
-    Some(if !after_clear {
-        trf(
-            "{size} is protected and can't be cleared. See the launcher log for details.",
-            &[("size", &size)],
-        )
-    } else if older_build_kept {
-        trf(
-            "{size} stayed. Remove older game builds if you no longer use them, then try again.",
-            &[("size", &size)],
-        )
+    let size = storage::format_bytes(row.remaining_bytes);
+    let text = if row.only_kept_kind(KeptKind::OlderBuild) {
+        "{size} stayed. Remove older game builds if you no longer use them, then try again."
+    } else if row.only_kept_kind(KeptKind::Busy) {
+        "{size} stayed. Close the game, wait for any builds to finish, then try again. See the launcher log if files still remain."
     } else {
-        trf("{size} stayed. Close the game, wait for any builds to finish, then try again. See the launcher log if files still remain.", &[("size", &size)])
-    })
+        "{size} stayed. See the launcher log for details."
+    };
+    Some(trf(text, &[("size", &size)]))
 }
 
 /// What the confirmation asks: with the size to free when the rows asked about are counted, and
@@ -67,13 +75,13 @@ pub(crate) fn clear_question(asked: Option<Category>, bytes: Option<u64>) -> Str
         (Some(category), Some(size)) => trf(
             "Clear {category}? Up to {size} is freed. Close the game first. Files a game or build is using stay.",
             &[
-                ("category", category_label(category)),
+                ("category", category.label()),
                 ("size", &size),
             ],
         ),
         (Some(category), None) => trf(
             "Clear {category}? Close the game first. Files a game or build is using stay.",
-            &[("category", category_label(category))],
+            &[("category", category.label())],
         ),
     }
 }
@@ -143,7 +151,7 @@ impl Launcher {
                 // Cancelled: the window has moved on and wants nothing from this worker.
                 Ok(None) => {}
                 Err(_) if cancel.is_cancelled() => {}
-                Err(error) => send(Err(native_mods::cache_error(error))),
+                Err(error) => send(Err(storage::error_message(error))),
             }
         });
     }
@@ -186,17 +194,6 @@ impl Launcher {
             count.cancel.cancel();
         }
         self.stop_storage_builds_count();
-    }
-}
-
-pub(crate) fn category_label(category: Category) -> &'static str {
-    match category {
-        Category::BuildFiles => tr("Build files"),
-        Category::ModBuildCache => tr("Mod build cache"),
-        Category::PrebuiltGames => tr("Prebuilt games"),
-        Category::SpareGameBuilds => tr("Spare game builds"),
-        Category::RustCompiler => tr("Rust compiler"),
-        Category::OtherCaches => tr("Other caches"),
     }
 }
 
