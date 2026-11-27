@@ -80,7 +80,18 @@ impl Profile {
                 |command| {
                     prepare_jars(command)?;
                     crate::launch::managed_pre_launch(command, launch, piped, hook_log)
-                        .map_err(StartError::Hook)
+                        .map_err(StartError::Hook)?;
+                    // The hook is a separate process; it can change files without taking
+                    // the launcher's manifest lock. Do not start with different inputs.
+                    if !launch.pre_launch.trim().is_empty() {
+                        if self.active()?.as_ref() != Some(active)
+                            || super::inputs(self.home())? != active.inputs
+                        {
+                            return Err(unsettled!().into());
+                        }
+                        active.verify_binaries()?;
+                    }
+                    Ok(())
                 },
                 before_spawn,
             ),
