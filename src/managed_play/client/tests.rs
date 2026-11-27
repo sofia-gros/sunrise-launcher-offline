@@ -512,7 +512,7 @@ fn play_checks_hash_only_takedowns_after_proving_the_actual_package() {
         });
         Some(Arc::new(result))
     };
-    let (active, _) = client
+    let (active, _, _) = client
         .ready(
             &mut profile,
             || FirstBuild::installed(BUILD),
@@ -888,7 +888,7 @@ fn windows_bound_x64_fallback_survives_pending_retry_and_committed_replay() {
     install_candidate(&archive, "x64");
     interrupt_after_proof();
     let mut profile = Profile::open(&home, None).unwrap();
-    let (active, _) = retry(&mut profile).unwrap();
+    let (active, _, _) = retry(&mut profile).unwrap();
     drop(profile);
     let mut reopened = Profile::open(&home, None).unwrap();
     assert_eq!(retry(&mut reopened).unwrap().0, active);
@@ -902,33 +902,80 @@ fn windows_bound_x64_fallback_survives_pending_retry_and_committed_replay() {
 
 /// One Play hashes the prepared files once, at the handoff right before the child. Damage still
 /// refuses every Play, from the saved generation and from the one a refresh advanced to, and
-/// putting the files back is all it takes to play again.
+/// re-preparing restores Play without removing the damaged snapshot by hand.
 #[test]
 fn play_hashes_the_prepared_files_once_and_still_refuses_damage() {
     use super::super::FULL_VERIFICATIONS;
     use std::cell::Cell;
     const TEST: &str =
         "managed_play::client::tests::play_hashes_the_prepared_files_once_and_still_refuses_damage";
+    #[cfg(target_os = "linux")]
+    const BUILD: &str = "developer-snapshot-recovery";
+    #[cfg(not(target_os = "linux"))]
     const BUILD: &str = "v0.1.8";
     const BLOB: &[u8] = b"original bytes";
-    if std::env::var_os("PLAY_ONE_HASH_FIXTURE").is_none() {
-        let root = tempfile::tempdir().unwrap();
-        assert!(Command::new(std::env::current_exe().unwrap())
+    const FIXTURE: &str = "PLAY_ONE_HASH_FIXTURE";
+    let Some(fixture) = std::env::var_os(FIXTURE) else {
+        let root = tempfile::Builder::new()
+            .prefix("play-one-hash-")
+            .tempdir()
+            .unwrap();
+        fs::write(root.path().join("fixture"), TEST).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", TEST, "--nocapture"])
-            .env("PLAY_ONE_HASH_FIXTURE", "1")
+            .env(FIXTURE, root.path())
             .env("SUNRISE_HOME", root.path().join("game"))
             .env("SUNRISE_LAUNCHER_HOME", root.path().join("launcher"))
             .env(
                 "SUNRISE_LAUNCHER_LOCATION_FILE",
-                root.path().join("location")
+                root.path().join("location"),
             )
             .env("SUNRISE_NO_KEYCHAIN", "1")
             .env("XDG_CONFIG_HOME", root.path().join("config"))
-            .status()
-            .unwrap()
-            .success());
+            .env("SUNRISE_LAUNCHER_DEVELOPER_OFFLINE", "1")
+            .env("SUNRISE_MOD_INDEX_V2", root.path().join("no-index.signed"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success()
+                && stdout
+                    .lines()
+                    .any(|line| line.starts_with("test result: ok. 1 passed;")),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(&*root.path().to_string_lossy()));
         return;
+    };
+    let fixture = std::path::PathBuf::from(fixture);
+    let canonical = fixture.canonicalize().unwrap();
+    assert_eq!(
+        canonical.parent().unwrap(),
+        std::env::temp_dir().canonicalize().unwrap()
+    );
+    assert!(canonical
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("play-one-hash-"));
+    assert_eq!(fs::read_to_string(fixture.join("fixture")).unwrap(), TEST);
+    for (var, name) in [
+        ("SUNRISE_HOME", "game"),
+        ("SUNRISE_LAUNCHER_HOME", "launcher"),
+        ("SUNRISE_LAUNCHER_LOCATION_FILE", "location"),
+        ("XDG_CONFIG_HOME", "config"),
+        ("SUNRISE_MOD_INDEX_V2", "no-index.signed"),
+    ] {
+        let path = fixture.join(name);
+        assert_eq!(std::env::var_os(var).as_deref(), Some(path.as_os_str()));
+        assert_eq!(
+            fs::symlink_metadata(path).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
     }
+    let log_dir = fixture.join("logs");
+    crate::launcher_log::init(&log_dir);
     let home = backend::game_home();
     let build = backend::version_dir(BUILD);
     let prepared = backend::resources(BUILD);
@@ -936,8 +983,32 @@ fn play_hashes_the_prepared_files_once_and_still_refuses_damage() {
     fs::write(prepared.join("sunrise-resources.json"), b"{}").unwrap();
     fs::write(prepared.join("fixture-blob.bin"), BLOB).unwrap();
     fs::write(build.join(".installed"), []).unwrap();
+    #[cfg(not(target_os = "linux"))]
     let client_bytes = b"unchanged client";
+    #[cfg(target_os = "linux")]
+    let client_bytes = br#"#!/bin/sh
+if [ "$1" = --launch-api ]; then
+  echo '{"options":[{"name":"--developer-single-player"}]}'
+else
+  touch "$SUNRISE_HOME/snapshot-recovery-started"
+fi
+"#;
     fs::write(build.join(backend::CLIENT), client_bytes).unwrap();
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            build.join(backend::CLIENT),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        fs::write(
+            build.join("developer.json"),
+            json!({"revision": "b".repeat(40)}).to_string(),
+        )
+        .unwrap();
+    }
+    super::super::Artifact::record_archive(&build, BUILD, &"a".repeat(64)).unwrap();
     fs::create_dir_all(home.join(mod_list::DIR)).unwrap();
     let write_package = |version: &str| {
         let body = format!("id='lantern'\nname='Lantern'\nversion='{version}'\napi='{}'\ncapabilities=['registries']\n", manifest::API);
@@ -962,7 +1033,7 @@ fn play_hashes_the_prepared_files_once_and_still_refuses_damage() {
     // The game's own two steps of a Play, each with the full verifications it asked for.
     let ready = |profile: &mut Profile| {
         FULL_VERIFICATIONS.take();
-        let (active, _) = client.ready(
+        let (active, _, first) = client.ready(
             profile,
             || FirstBuild::installed(BUILD),
             |_, _| Ok(()),
@@ -970,37 +1041,59 @@ fn play_hashes_the_prepared_files_once_and_still_refuses_damage() {
             |_| {},
             || None,
         )?;
-        Ok::<_, StartError>((active, FULL_VERIFICATIONS.take()))
+        Ok::<_, StartError>((active, FULL_VERIFICATIONS.take(), first))
     };
     let spawned = Cell::new(false);
-    let handoff = |profile: &Profile, active: &Active| {
+    let handoff = |profile: &Profile, active: &Active, first: Option<&VerifiedFirst>| {
         spawned.set(false);
         FULL_VERIFICATIONS.take();
-        let result = profile.verified_handoff(active, &cancellation, |_| {
+        let result = profile.verified_handoff_for(active, first, &cancellation, |_| {
             spawned.set(true);
             Ok::<(), String>(())
         });
         (result, FULL_VERIFICATIONS.take())
     };
     let intact = |profile: &mut Profile| {
-        let (active, before_handoff) = ready(profile).unwrap();
-        assert_eq!(
-            before_handoff, 0,
-            "hashed the prepared files before the handoff"
-        );
-        let (result, at_handoff) = handoff(profile, &active);
+        let (active, before_handoff, proof) = ready(profile).unwrap();
+        let initial = u32::from(proof.is_some());
+        assert_eq!(before_handoff, initial);
+        let (result, at_handoff) = handoff(profile, &active, proof.as_ref());
         result.unwrap();
         assert!(spawned.get());
-        assert_eq!(at_handoff, 1, "hashed the prepared files other than once");
+        assert_eq!(at_handoff, 1 - initial);
         active
     };
     let snapshot_error = |active: &Active, error: String| {
+        let prefix =
+            "Sunrise couldn't verify the profile's saved game build (managed_play/resources.rs:";
+        let line = error
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(")."));
         assert!(
-            error.starts_with(&format!("{}: ", active.resource_path().display())),
+            line.is_some_and(|line| line.parse::<u32>().is_ok()),
             "{error}"
         );
-        assert!(error.contains("managed_play/resources.rs:"), "{error}");
+        assert!(!error.contains(&active.resource_path().to_string_lossy().into_owned()));
     };
+
+    // A cached snapshot with an intact manifest but damaged payload must not bind First Play.
+    let prepared_snapshot = {
+        let preparation = backend::prepare_lock(BUILD).unwrap();
+        super::super::Resources::prepare(BUILD, &preparation, None).unwrap()
+    };
+    let snapshot_blob = prepared_snapshot.path(BUILD).join("fixture-blob.bin");
+    fs::write(&snapshot_blob, b"already damaged").unwrap();
+    let error = ready(&mut profile).unwrap_err();
+    assert!(
+        matches!(error, StartError::Other(detail) if detail.contains("managed_play/resources.rs:"))
+    );
+    assert_eq!(FULL_VERIFICATIONS.take(), 1);
+    assert!(profile.active().unwrap().is_none());
+    assert!(crate::profile_txn::references(&home)
+        .unwrap()
+        .targets
+        .is_empty());
+    fs::write(snapshot_blob, BLOB).unwrap();
 
     // First Play, an unchanged Play, and a Play that refreshes for a changed mod.
     let first = intact(&mut profile);
@@ -1010,14 +1103,39 @@ fn play_hashes_the_prepared_files_once_and_still_refuses_damage() {
     let refreshed = intact(&mut profile);
     assert_eq!(refreshed.generation(), 2);
 
-    // A changed prepared file: an unchanged Play gets to the handoff and is refused there.
+    // Tamper after publication: the resources must still be checked at the handoff.
+    let (active, before_handoff, _) = ready(&mut profile).unwrap();
+    assert_eq!(before_handoff, 0);
     let blob = refreshed.resource_path().join("fixture-blob.bin");
     fs::write(&blob, b"tampered bytes").unwrap();
-    let (active, before_handoff) = ready(&mut profile).unwrap();
-    assert_eq!((active.clone(), before_handoff), (refreshed.clone(), 0));
-    let (result, at_handoff) = handoff(&profile, &active);
+    assert_eq!(active, refreshed);
+    let (result, at_handoff) = handoff(&profile, &active, None);
     snapshot_error(&active, result.unwrap_err());
     assert_eq!((spawned.get(), at_handoff), (false, 1));
+
+    let failing_hook = crate::launch::Launch {
+        pre_launch: "exit 23".into(),
+        ..Default::default()
+    };
+    let try_hook = || {
+        let mut command = Command::new(build.join(backend::CLIENT));
+        command
+            .current_dir(&home)
+            .env("SUNRISE_HOME", &home)
+            .arg("--game-dir")
+            .arg(&home)
+            .arg("--resources")
+            .arg(active.resource_path());
+        profile.spawn_configured(&active, &cancellation, command, &failing_hook, true)
+    };
+    let error = try_hook().err().expect("damaged snapshot launched");
+    assert!(matches!(error, StartError::Other(_)), "{error:?}");
+    snapshot_error(&active, error.into());
+    assert_eq!(FULL_VERIFICATIONS.take(), 1);
+    fs::write(&blob, BLOB).unwrap();
+    assert!(matches!(try_hook(), Err(StartError::Hook(_))));
+    assert_eq!(FULL_VERIFICATIONS.take(), 1);
+    fs::write(&blob, b"tampered bytes").unwrap();
 
     // Mod recovery still hashes the files itself, and refuses in its own words.
     let recovery = ModRecovery {
@@ -1042,21 +1160,63 @@ fn play_hashes_the_prepared_files_once_and_still_refuses_damage() {
     // A refresh over the changed file advances without sealing it: the next generation keeps
     // the original digest, so the next Play refuses the same way.
     write_package("3.0.0");
-    let (advanced, before_handoff) = ready(&mut profile).unwrap();
+    let (advanced, before_handoff, _) = ready(&mut profile).unwrap();
     assert_eq!((advanced.generation(), before_handoff), (3, 0));
     assert_eq!(advanced.resources, refreshed.resources);
     assert_eq!(profile.active().unwrap(), Some(advanced.clone()));
-    let (result, at_handoff) = handoff(&profile, &advanced);
+    let (result, at_handoff) = handoff(&profile, &advanced, None);
     snapshot_error(&advanced, result.unwrap_err());
     assert_eq!((spawned.get(), at_handoff), (false, 1));
-    let (again, _) = ready(&mut profile).unwrap();
-    let (result, _) = handoff(&profile, &again);
+    let (again, _, _) = ready(&mut profile).unwrap();
+    let (result, _) = handoff(&profile, &again, None);
     snapshot_error(&again, result.unwrap_err());
     assert!(!spawned.get());
 
-    // Putting the file back is the way out from generation 3, as it was from 2.
-    fs::write(&blob, BLOB).unwrap();
+    // Prepare the same build without deleting its damaged snapshot. The committed digest
+    // and generation need not change to recover.
+    {
+        let preparation = backend::prepare_lock(BUILD).unwrap();
+        backend::finish_preparation(BUILD, &preparation).unwrap();
+    }
     assert_eq!(intact(&mut profile), advanced);
+
+    #[cfg(target_os = "linux")]
+    {
+        drop(profile);
+        let marker = home.join("snapshot-recovery-started");
+        assert!(!marker.exists());
+        FULL_VERIFICATIONS.take();
+        let mut game = Client {
+            instance: &instance,
+            accepted_account: None,
+            explicit_account: false,
+            piped: false,
+        }
+        .start_with_recovery(
+            None,
+            || panic!("the repaired profile is already bound"),
+            |_| Ok(()),
+            |_| Ok(()),
+            &cancellation,
+            |_| {},
+        )
+        .unwrap();
+        assert!(game.child.wait().unwrap().success());
+        assert!(marker.is_file());
+        assert_eq!(FULL_VERIFICATIONS.take(), 1);
+        drop(game);
+        profile = Profile::open(&home, None).unwrap();
+        assert_eq!(profile.active().unwrap(), Some(advanced.clone()));
+    }
+
+    // A client snapshot cannot authorize its own replacement by claiming to be server-only.
+    let manifest_file = advanced.resource_path().join("sunrise-resources.json");
+    fs::write(&manifest_file, br#"{"profile":"server"}"#).unwrap();
+    let error = ready(&mut profile).unwrap_err();
+    snapshot_error(&advanced, String::from(error));
+    assert_eq!(profile.active().unwrap(), Some(advanced.clone()));
+    assert_eq!(FULL_VERIFICATIONS.take(), 1);
+    fs::write(&manifest_file, b"{}").unwrap();
 
     // A deleted manifest leaves the output incomplete: that branch hashes the files before it
     // would prepare anything, and refuses.
@@ -1068,18 +1228,95 @@ fn play_hashes_the_prepared_files_once_and_still_refuses_damage() {
     fs::write(&manifest_file, b"{}").unwrap();
     assert_eq!(intact(&mut profile), advanced);
 
-    // A changed binary is refused by the first check of an unchanged Play, without hashing
+    // A changed binary is refused before refreshing changed inputs, without hashing
     // the prepared files, and again at the handoff when it changes after Play was ready.
     let program = build.join(backend::CLIENT);
+    write_package("4.0.0");
     fs::write(&program, b"changed client").unwrap();
     let error = ready(&mut profile).unwrap_err();
-    assert!(String::from(error).contains("managed_play.rs:"));
+    assert!(String::from(error).contains("managed_play/artifact.rs:"));
+    assert_eq!(FULL_VERIFICATIONS.take(), 0);
+    assert_eq!(profile.active().unwrap(), Some(advanced.clone()));
+    write_package("3.0.0");
     fs::write(&program, client_bytes).unwrap();
-    let (active, _) = ready(&mut profile).unwrap();
+    let (active, _, _) = ready(&mut profile).unwrap();
     fs::write(&program, b"changed client").unwrap();
-    let (result, _) = handoff(&profile, &active);
-    assert!(result.unwrap_err().contains("managed_play.rs:"));
+    let (result, _) = handoff(&profile, &active, None);
+    assert!(result.unwrap_err().contains("managed_play/artifact.rs:"));
     assert!(!spawned.get());
     fs::write(&program, client_bytes).unwrap();
     assert_eq!(intact(&mut profile), advanced);
+
+    // Saved image evidence covers both the preparer and the archive receipt.
+    let archive = build.join(super::super::Artifact::ARCHIVE_RECEIPT);
+    let receipt = fs::read(&archive).unwrap();
+    let mut wrong_receipt: serde_json::Value = serde_json::from_slice(&receipt).unwrap();
+    wrong_receipt["archive"] = json!("b".repeat(64));
+    fs::write(&archive, serde_json::to_vec(&wrong_receipt).unwrap()).unwrap();
+    let error = ready(&mut profile).unwrap_err();
+    assert!(
+        matches!(error, StartError::Other(detail) if detail.contains("managed_play/artifact.rs:"))
+    );
+    assert_eq!(FULL_VERIFICATIONS.take(), 0);
+    fs::write(&archive, receipt).unwrap();
+    let preparer = build.join(crate::preparer::BINARY);
+    fs::write(&preparer, b"not the saved preparer").unwrap();
+    let error = ready(&mut profile).unwrap_err();
+    assert!(
+        matches!(error, StartError::Other(detail) if detail.contains("managed_play/artifact.rs:"))
+    );
+    assert_eq!(FULL_VERIFICATIONS.take(), 0);
+    fs::remove_file(&preparer).unwrap();
+    assert_eq!(profile.active().unwrap(), Some(advanced.clone()));
+
+    // Seed the legacy pointer to a real server-only tree while leaving a playable client
+    // preparation available. Neither changing a server payload nor claiming the client is a
+    // server should authorize a replacement; the intact legacy tree should upgrade.
+    let legacy = tempfile::tempdir_in(build.join(".local")).unwrap();
+    let legacy_tree = legacy.path().join("resources");
+    fs::create_dir(&legacy_tree).unwrap();
+    fs::write(
+        legacy_tree.join("sunrise-resources.json"),
+        br#"{"profile":"server"}"#,
+    )
+    .unwrap();
+    fs::write(legacy_tree.join("fixture-blob.bin"), BLOB).unwrap();
+    let primary = super::super::artifact::tree(&legacy_tree, true)
+        .unwrap()
+        .unwrap();
+    let resources: super::super::Resources = serde_json::from_value(json!({
+        "primary": primary, "accelerator": null,
+    }))
+    .unwrap();
+    let path = resources.path(BUILD);
+    fs::create_dir(path.parent().unwrap()).unwrap();
+    fs::rename(legacy_tree, &path).unwrap();
+    let server = profile
+        .refresh(
+            instance.native_profile,
+            &cancellation,
+            |_| {},
+            None,
+            Some(resources),
+        )
+        .unwrap()
+        .unwrap();
+    let blob = path.join("fixture-blob.bin");
+    fs::write(&blob, b"damaged server payload").unwrap();
+    let error = ready(&mut profile).unwrap_err();
+    snapshot_error(&server, error.into());
+    assert_eq!(FULL_VERIFICATIONS.take(), 1);
+    assert_eq!(profile.active().unwrap(), Some(server.clone()));
+    fs::write(&blob, BLOB).unwrap();
+    let (upgraded, old_verifications, _) = ready(&mut profile).unwrap();
+    assert_eq!(old_verifications, 1);
+    assert_eq!(upgraded.generation(), server.generation() + 1);
+    assert_eq!(upgraded.resources, advanced.resources);
+    let (result, replacement_verifications) = handoff(&profile, &upgraded, None);
+    result.unwrap();
+    assert!(spawned.get());
+    assert_eq!(replacement_verifications, 1);
+    let log = fs::read_to_string(log_dir.join("launcher.log")).unwrap();
+    assert!(log.contains("Verifying game files: done"));
+    assert!(!log.contains(&*fixture.to_string_lossy()));
 }

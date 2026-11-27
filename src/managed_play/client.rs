@@ -1,5 +1,9 @@
 //! Ordinary client Play keeps one admission on its worker through the actual spawn.
-use super::{catalogue, first::game_lock, unsettled, Active, FirstBuild, Profile};
+use super::{
+    catalogue,
+    first::{game_lock, VerifiedFirst},
+    unsettled, Active, FirstBuild, Profile,
+};
 use crate::{
     account::{self, NoOwner},
     backend::{self, installation::BoundVariant, RuntimeGuard},
@@ -201,7 +205,7 @@ impl Client<'_> {
             backend::managed_game_architecture_launch_error(tag, variant)
                 .map_or(Ok(()), |error| Err(StartError::Other(error)))
         };
-        let (active, registry_notices) = self.ready(
+        let (active, registry_notices, first) = self.ready(
             &mut profile,
             || selected.map_or_else(|| choose.expect("a first Play needs a selection")(), Ok),
             check_build,
@@ -242,9 +246,12 @@ impl Client<'_> {
                 &active,
                 cancellation,
                 cmd,
-                (launch, self.piped, &|line| {
-                    progress(Progress::HookLine(line))
-                }),
+                (
+                    launch,
+                    self.piped,
+                    &|line| progress(Progress::HookLine(line)),
+                    first.as_ref(),
+                ),
                 prepare_jars,
                 |cmd| {
                     // The game refuses a session file older than two minutes, so it is made
@@ -296,7 +303,7 @@ impl Client<'_> {
         cancellation: &native_mods::Cancellation,
         progress: impl Fn(Progress),
         load_index: impl FnOnce() -> Option<std::sync::Arc<sunrise_launcher_smod::index_v2::Index>>,
-    ) -> Result<(Active, Vec<String>), StartError> {
+    ) -> Result<(Active, Vec<String>, Option<VerifiedFirst>), StartError> {
         let home = profile.home().to_owned();
         let mode = self.instance.native_profile;
         let started = std::cell::Cell::new(false);
@@ -317,18 +324,10 @@ impl Client<'_> {
             // saved generation continues to reserve this base until refresh commits.
             let replacement = match old.resources.check_play_output(old.base()) {
                 Ok(()) => None,
-                Err(
-                    unprepared
-                    @ (backend::Unprepared::Incomplete | backend::Unprepared::ServerOnly),
-                ) => {
-                    // The preparer is part of the saved image. Verify it before starting it. A
-                    // server-only tree is replaced next and the replacement is hashed at the
-                    // handoff; an incomplete one still refuses here, as damaged files always did.
-                    if matches!(unprepared, backend::Unprepared::Incomplete) {
-                        old.verify_artifacts()?;
-                    } else {
-                        old.verify_binaries()?;
-                    }
+                Err(backend::Unprepared::Incomplete | backend::Unprepared::ServerOnly) => {
+                    // The on-disk manifest is not proof of what the saved snapshot was.
+                    // Verify both the old resources and the preparer before replacing them.
+                    old.verify_artifacts()?;
                     progress(Progress::Prepare);
                     Some(super::Resources::for_play_with(
                         old.base(),
@@ -356,7 +355,7 @@ impl Client<'_> {
                 .map_err(|error| native_failure(&home, error, || Some(Build::Active(old))))?
                 .ok_or_else(|| unsettled!())?;
             checking.done("");
-            return Ok((active, notices));
+            return Ok((active, notices, None));
         }
 
         let ready = (|| {
@@ -365,9 +364,10 @@ impl Client<'_> {
             })?;
             check_build(first.base(), first.variant().as_ref())?;
             progress(Progress::Prepare);
-            first.prepare_with(&|line| emit_prepare_line(&progress, line), &|line| {
-                progress(Progress::Line(line))
-            })?;
+            let resources = first
+                .prepare_with(&|line| emit_prepare_line(&progress, line), &|line| {
+                    progress(Progress::Line(line))
+                })?;
             let (image, notices) = {
                 let _manifest = game_lock(&home)?;
                 crate::browser::installed::recover_game_install(&home)
@@ -388,9 +388,8 @@ impl Client<'_> {
                     })?;
                 (image, notices)
             };
-            // Resource preparation takes a version lock. Don't take it under the game
-            // manifest lock; commit rechecks the frozen input epoch before publication.
-            Ok((first.commit(&image, cancellation)?, notices))
+            let first = first.commit_prepared(&image, resources, cancellation)?;
+            Ok((first.active.clone(), notices, Some(first)))
         })();
         if ready.is_err() {
             profile.release_failed_first_play()?;
