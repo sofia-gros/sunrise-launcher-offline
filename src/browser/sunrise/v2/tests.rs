@@ -588,3 +588,18 @@ fn a_change_whose_refetch_fails_uses_the_last_verified_index() {
     assert_eq!(catalog.index.serial, 41);
     assert!(catalog.from_cache);
 }
+
+/// Reading the loaded index's serial never waits on `LOADED`, which a refresh holds while it
+/// writes the verified index to disk, so a frame that asks for it (Home's suggestion, the
+/// picker's preview) doesn't stall on that write (review of #616).
+#[test]
+fn the_loaded_serial_is_read_without_the_refresh_lock() {
+    let held = LOADED.lock().unwrap_or_else(|e| e.into_inner());
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(loaded_serial());
+    });
+    let answer = rx.recv_timeout(Duration::from_secs(2));
+    drop(held);
+    assert!(answer.is_ok(), "loaded_serial waited on the refresh lock");
+}

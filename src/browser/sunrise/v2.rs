@@ -187,14 +187,18 @@ struct RefreshContext<'a> {
 
 static LOADED: Mutex<Option<LoadedState>> = Mutex::new(None);
 
+/// [`loaded_serial`]'s value, one more than the serial so that 0 means none: published apart
+/// from [`LOADED`], whose lock a refresh holds while it writes the verified index to disk, so a
+/// frame that reads the serial never waits on that write (review of #616).
+static LOADED_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The serial of the verified catalogue held in memory, if one is: what a cached answer drawn
-/// from the index (Home's build suggestion) keys on, with no file read or fetch.
+/// from the index (Home's build suggestion, the picker's preview) keys on, with no lock, file
+/// read or fetch.
 pub fn loaded_serial() -> Option<u64> {
-    LOADED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_ref()
-        .map(|loaded| loaded.catalog.index.serial)
+    LOADED_SERIAL
+        .load(std::sync::atomic::Ordering::Acquire)
+        .checked_sub(1)
 }
 /// The verified snapshot on disk, read by [`read_saved_index`] while nothing is loaded yet.
 static SAVED: Mutex<Option<Catalog>> = Mutex::new(None);
@@ -411,6 +415,12 @@ where
         catalog: catalog.clone(),
         highest_serial,
     });
+    if std::ptr::eq(loaded, &LOADED) {
+        LOADED_SERIAL.store(
+            catalog.index.serial.saturating_add(1),
+            std::sync::atomic::Ordering::Release,
+        );
+    }
     Ok(catalog)
 }
 
