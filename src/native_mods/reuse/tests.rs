@@ -733,7 +733,7 @@ fn in_child(test: &str, child: &str) -> bool {
         return true;
     }
     let home = tempfile::tempdir().unwrap();
-    let status = Command::new(std::env::current_exe().unwrap())
+    let output = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", test, "--nocapture"])
         .env(child, "1")
         .env("SUNRISE_LAUNCHER_HOME", home.path().join("launcher"))
@@ -749,9 +749,18 @@ fn in_child(test: &str, child: &str) -> bool {
         .env_remove(sdk_cache::BASE_VAR)
         .env_remove(sdk_cache::DEVELOPER_SDK)
         .env_remove(sdk_cache::DEVELOPER_TOOL)
-        .status()
+        .output()
         .unwrap();
-    assert!(status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("1 passed; 0 failed"),
+        "child did not run {test}: {stdout}"
+    );
     false
 }
 
@@ -897,6 +906,37 @@ fn the_default_build_uses_the_slot_with_the_planned_image() {
         set.found().as_deref(),
         Some(next.as_str()),
         "planning admitted the matching image"
+    );
+}
+
+#[test]
+fn switching_mixins_source_mode_selects_a_different_image() {
+    if !in_child(
+        "native_mods::reuse::tests::switching_mixins_source_mode_selects_a_different_image",
+        "SUNRISE_REUSE_MIXINS_MODE_CHILD",
+    ) {
+        return;
+    }
+    let set = Set::new("reuse-mode-switch");
+    let options = BuildOptions::default();
+    let release = set.install(&options);
+    assert_eq!(set.found().as_deref(), Some(release.as_str()));
+
+    mixins_from_source(true);
+    assert!(
+        set.found().is_none(),
+        "an ordinary image cannot prove a source build"
+    );
+    let source = set.install(&options);
+    assert_ne!(release, source);
+    assert_eq!(set.found().as_deref(), Some(source.as_str()));
+
+    mixins_from_source(false);
+    assert_eq!(set.found().as_deref(), Some(release.as_str()));
+    fs::remove_dir_all(backend::version_dir(release.as_str())).unwrap();
+    assert!(
+        set.found().is_none(),
+        "a source image cannot prove an ordinary build"
     );
 }
 

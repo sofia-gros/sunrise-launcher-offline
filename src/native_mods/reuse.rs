@@ -36,7 +36,7 @@ pub(super) const EVIDENCE: &str = ".native-reuse.json";
 pub(super) const OLDER_EVIDENCE: &str = ".native-inputs";
 
 /// The evidence's layout. An unknown layout is unreadable, not missing.
-const SCHEMA: u32 = 1;
+const SCHEMA: u32 = 2;
 
 /// How many admissions one build keeps (each caller and base that planned it has one).
 const ADMISSIONS_KEPT: usize = 8;
@@ -61,6 +61,8 @@ pub(super) struct Image {
     local_sdk: Option<String>,
     /// The SDK the build compiles against, whether or not any pin was read from it.
     build_sdk: BuildSdk,
+    mixins_from_source: bool,
+    tool: CompilerTool,
 }
 
 /// The identity of the SDK a build compiles against.
@@ -72,6 +74,15 @@ pub(super) enum BuildSdk {
     /// A developer's prebuilt game: the SHA-256 of its `sunrise-prebuilt.json`, which lists the
     /// digest of every file of the package.
     Local { sha256: String },
+}
+
+/// The selected compiler for the installed image, independent of its SDK inputs.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+enum CompilerTool {
+    Signed,
+    Local { sha256: String },
+    Unavailable,
 }
 
 /// What the developer's prebuilt game folder ([`sdk_cache::DEVELOPER_SDK`]) names its package by
@@ -150,6 +161,15 @@ impl Image {
             sdk: read.sdk.clone(),
             local_sdk: read.local.clone(),
             build_sdk: chosen.identity(),
+            mixins_from_source: MIXINS_FROM_SOURCE.load(std::sync::atomic::Ordering::Relaxed),
+            tool: match chosen {
+                Chosen::Signed(_) => CompilerTool::Signed,
+                Chosen::Local { .. } => sdk_cache::developer_tool(true)
+                    .and_then(|tool| sunrise_launcher_smod::index::sha256_file(&tool).ok())
+                    .map_or(CompilerTool::Unavailable, |sha256| CompilerTool::Local {
+                        sha256,
+                    }),
+            },
         }
     }
 }
@@ -237,7 +257,7 @@ impl Evidence {
     /// image and its game is still the sealed one. A build with no evidence is never proved, and
     /// never sealed here.
     fn prove(version: &str, contents: &Contents<'_>, image: &Image) -> Option<Self> {
-        if !contents.installed_in(version) {
+        if image.tool == CompilerTool::Unavailable || !contents.installed_in(version) {
             return None;
         }
         let dir = Target::Client.directory(version);
@@ -252,7 +272,7 @@ impl Evidence {
     /// The first seal of a build this launcher has just published: its installed mods are the
     /// plan's, it has no evidence yet, and its game can be captured.
     fn seal(version: &str, contents: &Contents<'_>, image: &Image) -> Option<Self> {
-        if !contents.installed_in(version) {
+        if image.tool == CompilerTool::Unavailable || !contents.installed_in(version) {
             return None;
         }
         let dir = Target::Client.directory(version);
