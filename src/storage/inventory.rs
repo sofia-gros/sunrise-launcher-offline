@@ -1149,8 +1149,12 @@ fn unused_jars_until(entries: &mut Vec<Entry>, home: &Root, cancel: &Cancel) -> 
             return Ok(());
         }
         let path = Entry::fixed(home, Path::new(directory), Category::OtherCaches)?.path;
-        let Some(packages) = sunrise_launcher_smod::find_until(&path, || cancel.is_cancelled())
+        // An unreadable mod directory or subfolder cannot prove a jar is unused. Retain all jars.
+        let Ok(packages) = sunrise_launcher_smod::try_find_until(&path, || cancel.is_cancelled())
         else {
+            return Ok(());
+        };
+        let Some(packages) = packages else {
             return Ok(());
         };
         for package in packages {

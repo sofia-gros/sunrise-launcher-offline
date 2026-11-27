@@ -1397,6 +1397,57 @@ pub fn find_until(dir: &Path, cancelled: impl Fn() -> bool) -> Option<Vec<PathBu
     Some(found)
 }
 
+/// Like [`find_until`], but propagates directory, entry, and manifest probe I/O errors instead of
+/// treating an unreadable mod folder as empty. Only a genuinely absent `dir` yields an empty list.
+pub fn try_find_until(
+    dir: &Path,
+    cancelled: impl Fn() -> bool,
+) -> std::io::Result<Option<Vec<PathBuf>>> {
+    if cancelled() {
+        return Ok(None);
+    }
+    let read = match std::fs::read_dir(dir) {
+        Ok(read) => read,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return match std::fs::symlink_metadata(dir) {
+                Err(meta_error) if meta_error.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(Some(Vec::new()))
+                }
+                Err(meta_error) => Err(meta_error),
+                Ok(_) => Err(error),
+            };
+        }
+        Err(error) => return Err(error),
+    };
+    let mut found = Vec::new();
+    for entry in read {
+        if cancelled() {
+            return Ok(None);
+        }
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "smod") {
+            found.push(path);
+            continue;
+        }
+        if entry.file_type()?.is_file() {
+            continue;
+        }
+        match std::fs::metadata(path.join(MANIFEST)) {
+            Ok(meta) if meta.is_file() => found.push(path),
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    found.sort();
+    Ok(Some(found))
+}
+
 #[cfg(test)]
 #[path = "manifest/runtime_files_tests.rs"]
 mod runtime_files_tests;
@@ -2490,5 +2541,35 @@ issues = \"http://example.org/issues\"
         });
         assert_eq!(result, None);
         assert_eq!(checks.get(), 3, "must stop inside the directory loop");
+    }
+
+    #[test]
+    fn try_find_until_errors_instead_of_treating_unreadable_dir_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            try_find_until(&dir.path().join("absent"), || false).unwrap(),
+            Some(Vec::new())
+        );
+        let not_a_dir = dir.path().join("file-not-dir");
+        std::fs::write(&not_a_dir, b"not a directory").unwrap();
+        assert!(try_find_until(&not_a_dir, || false).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = dir.path().join("mods");
+            let child = locked.join("hidden");
+            std::fs::create_dir_all(&child).unwrap();
+            std::fs::write(child.join(MANIFEST), b"id = 'x'\n").unwrap();
+            std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let probe_blocked = std::fs::metadata(child.join(MANIFEST)).is_err();
+            let result = try_find_until(&locked, || false);
+            std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o755)).unwrap();
+            if probe_blocked {
+                assert!(
+                    result.is_err(),
+                    "unreadable mod subfolder must fail closed instead of returning empty"
+                );
+            }
+        }
     }
 }

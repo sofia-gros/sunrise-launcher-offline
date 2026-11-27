@@ -163,6 +163,22 @@ fn referenced_jar_and_uninstrumented_unused_jar_are_kept() {
     assert!(unused.exists());
 }
 
+#[test]
+fn unreadable_mod_directory_retains_all_jars_instead_of_treating_references_as_empty() {
+    let home = Home::new();
+    let jar = home.seed("jars/referenced.jar");
+    // A regular file where sunrise-mods/ is expected makes directory enumeration fail on every OS.
+    home.seed("sunrise-mods");
+    let mut entries = Vec::new();
+    unused_jars(&mut entries, &Root::open(&home.0).unwrap()).unwrap();
+    assert!(
+        entries.is_empty(),
+        "failed jar-reference discovery must retain all jars instead of selecting {} entries",
+        entries.len()
+    );
+    assert!(jar.exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn capable_units_delete_only_after_the_last_game_lease_and_mixed_builds_stay_residual() {
