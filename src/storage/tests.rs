@@ -15,7 +15,10 @@ impl Home {
         Self(crate::backend::plain(path.canonicalize().unwrap()))
     }
     pub(super) fn seed(&self, path: &str) -> PathBuf {
-        let path = self.0.join(path);
+        let path = path
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .fold(self.0.clone(), |path, part| path.join(part));
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, vec![7; 8192]).unwrap();
         path
@@ -396,10 +399,10 @@ fn clear_mod_build_slots_unlinks_directory_links_without_touching_their_target()
     let outside = Home::new();
     let canary = outside.seed("sentinel/canary");
     home.seed("native/w/slot/output");
-    let work = home.0.join("native/w");
+    let work = home.0.join("native").join("w");
     let bytes = allocated_bytes(&work.join("slot")).unwrap();
     let sentinel = outside.0.join("sentinel");
-    for link in [work.join("slot/link"), work.join("linked-slot")] {
+    for link in [work.join("slot").join("link"), work.join("linked-slot")] {
         #[cfg(unix)]
         std::os::unix::fs::symlink(&sentinel, &link).unwrap();
         #[cfg(windows)]
