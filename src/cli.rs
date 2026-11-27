@@ -30,6 +30,41 @@ fn parse_storage_row(value: &str) -> Result<ClearStorage, String> {
             .ok_or_else(|| tr("Unknown").into())
     }
 }
+
+/// The `storage` report. Counting says on stderr when each row is done, so a big cache shows
+/// progress while stdout still gets the one finished report; a Clear needs no count first.
+fn storage_report(
+    storage: &Storage,
+    row: Option<Category>,
+    all: bool,
+) -> Result<sunrise_launcher::storage::Report, sunrise_launcher::storage::Error> {
+    use clap::ValueEnum;
+    if row.is_some() || all {
+        return storage.report(row, all);
+    }
+    storage.report_counting(|so_far| {
+        let Some(done) = so_far.rows.last() else {
+            return;
+        };
+        let name = done
+            .category
+            .to_possible_value()
+            .map_or_else(String::new, |value| value.get_name().to_owned());
+        eprintln!(
+            "{}",
+            trf(
+                "Counted {category}: {size}",
+                &[
+                    ("category", &name),
+                    (
+                        "size",
+                        &sunrise_launcher::storage::format_bytes(done.remaining_bytes)
+                    ),
+                ]
+            )
+        );
+    })
+}
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -686,7 +721,8 @@ enum Cmd {
         accept_eula: bool,
     },
     /// Show disposable storage by category as JSON, or clear a category by hand with `--clear`.
-    /// Read-only reports never block builds; `--clear` requires builds to be idle.
+    /// Read-only reports never block builds; `--clear` requires builds to be idle. A report counts
+    /// each row once and prints when done, with its progress on stderr; `--clear` needs no count first.
     ///
     /// Rust/Cargo/temp build-tool caches remain clearable. Game-accessible caches and installed-version
     /// removal retain files while any launch path lacks enforceable lifetime exclusion; an empty
@@ -1205,7 +1241,7 @@ fn execute(command: Cmd, as_json: bool) -> Result<i32, String> {
                 Some(ClearStorage::All) => (None, true),
                 None => (None, false),
             };
-            let report = storage.report(row, all).map_err(native_mods::cache_error)?;
+            let report = storage_report(&storage, row, all).map_err(native_mods::cache_error)?;
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
             if row.is_some() || all {
                 if let Some(kept) = report.rows.iter().flat_map(|row| &row.kept).next() {
