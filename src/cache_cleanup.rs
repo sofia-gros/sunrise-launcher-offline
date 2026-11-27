@@ -364,30 +364,74 @@ impl Plan {
 #[path = "cache_cleanup/tests.rs"]
 mod tests;
 
+struct DeleteOptions<'a> {
+    contexts: &'a [&'a Path],
+    expected: Option<(u64, u64)>,
+    idle: bool,
+    explicit_storage_clear: bool,
+    check_profile_pins: bool,
+}
+
 /// Game-visible units are detached whole while exclusively leased, never partially cleared.
 pub(crate) fn delete_game_unit(path: &Path) -> Result<(), Error> {
     delete_game_unit_observed(path, || {})
 }
 
-pub(crate) fn delete_game_unit_with_contexts(path: &Path, contexts: &[&Path]) -> Result<(), Error> {
-    delete_unit(path, contexts, false, false, true, || {}, || Ok(()))
+pub(crate) fn delete_game_unit_with_contexts(
+    path: &Path,
+    contexts: &[&Path],
+    expected: Option<(u64, u64)>,
+) -> Result<(), Error> {
+    delete_unit(
+        path,
+        DeleteOptions {
+            contexts,
+            expected,
+            idle: false,
+            explicit_storage_clear: false,
+            check_profile_pins: true,
+        },
+        || {},
+        || Ok(()),
+    )
 }
 
 pub(crate) fn delete_game_unit_observed(
     path: &Path,
     after_classification: impl FnOnce(),
 ) -> Result<(), Error> {
-    delete_unit(path, &[], false, false, true, after_classification, || {
-        Ok(())
-    })
+    delete_unit(
+        path,
+        DeleteOptions {
+            contexts: &[],
+            expected: None,
+            idle: false,
+            explicit_storage_clear: false,
+            check_profile_pins: true,
+        },
+        after_classification,
+        || Ok(()),
+    )
 }
 
 /// Explicit Storage Clear relies on the exclusive claim, not an executable marker.
 pub(crate) fn clear_claimed_unit_with_contexts(
     path: &Path,
     contexts: &[&Path],
+    expected: Option<(u64, u64)>,
 ) -> Result<(), Error> {
-    delete_unit(path, contexts, true, true, true, || {}, || Ok(()))
+    delete_unit(
+        path,
+        DeleteOptions {
+            contexts,
+            expected,
+            idle: true,
+            explicit_storage_clear: true,
+            check_profile_pins: true,
+        },
+        || {},
+        || Ok(()),
+    )
 }
 
 /// Remove an installed version after the caller's selection checks under the publication fence.
@@ -396,20 +440,39 @@ pub(crate) fn delete_version_checked(
     path: &Path,
     check: impl FnOnce() -> Result<(), Error>,
 ) -> Result<(), Error> {
-    delete_unit(path, &[], true, false, false, || {}, check)
+    delete_unit(
+        path,
+        DeleteOptions {
+            contexts: &[],
+            expected: None,
+            idle: true,
+            explicit_storage_clear: false,
+            check_profile_pins: false,
+        },
+        || {},
+        check,
+    )
 }
 
 /// Remove an installed version whose running processes have already been checked.
 pub(crate) fn delete_version(path: &Path, idle: bool) -> Result<(), Error> {
-    delete_unit(path, &[], idle, false, true, || {}, || Ok(()))
+    delete_unit(
+        path,
+        DeleteOptions {
+            contexts: &[],
+            expected: None,
+            idle,
+            explicit_storage_clear: false,
+            check_profile_pins: true,
+        },
+        || {},
+        || Ok(()),
+    )
 }
 
 fn delete_unit(
     path: &Path,
-    contexts: &[&Path],
-    idle: bool,
-    explicit_storage_clear: bool,
-    check_profile_pins: bool,
+    options: DeleteOptions<'_>,
     after_classification: impl FnOnce(),
     check: impl FnOnce() -> Result<(), Error>,
 ) -> Result<(), Error> {
@@ -419,42 +482,47 @@ fn delete_unit(
         crate::backend::plain(parent.to_path_buf())
             == crate::backend::plain(crate::backend::versions_dir())
     });
-    registry.remove_unit_with_contexts(path, contexts, |directory, is_directory| {
-        if !explicit_storage_clear {
-            match Access::for_unit(path)? {
-                Access::UninstrumentedGame if idle => (),
-                access => access.check()?,
+    registry.remove_unit_with_contexts(
+        path,
+        options.contexts,
+        options.expected,
+        |directory, is_directory| {
+            if !options.explicit_storage_clear {
+                match Access::for_unit(path)? {
+                    Access::UninstrumentedGame if options.idle => (),
+                    access => access.check()?,
+                }
+            } else if is_version_unit
+                && path
+                    .file_name()
+                    .is_some_and(crate::backend::installation::private_stage)
+            {
+                return Err(Error::UnpublishedGame);
             }
-        } else if is_version_unit
-            && path
-                .file_name()
-                .is_some_and(crate::backend::installation::private_stage)
-        {
-            return Err(Error::UnpublishedGame);
-        }
-        // remove_unit holds the same exclusive fence as journal publication and
-        // roster changes. Candidate selection alone can never authorize detaching.
-        if is_version_unit {
-            let tag = path
-                .file_name()
-                .and_then(std::ffi::OsStr::to_str)
-                .ok_or_else(|| Error::Unsafe(path.to_owned()))?;
-            // Traditional native builds also keep the resources of their base build.
-            if let Some(build) = crate::native_mods::resource_dependent(tag) {
-                return Err(Error::ResourceDependent(build));
+            // remove_unit holds the same exclusive fence as journal publication and
+            // roster changes. Candidate selection alone can never authorize detaching.
+            if is_version_unit {
+                let tag = path
+                    .file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .ok_or_else(|| Error::Unsafe(path.to_owned()))?;
+                // Traditional native builds also keep the resources of their base build.
+                if let Some(build) = crate::native_mods::resource_dependent(tag) {
+                    return Err(Error::ResourceDependent(build));
+                }
+                crate::managed_play::require_unreferenced_build(tag)?;
+                if options.check_profile_pins {
+                    crate::backend::version_storage::require_unpinned_by_profiles(tag)?;
+                }
             }
-            crate::managed_play::require_unreferenced_build(tag)?;
-            if check_profile_pins {
-                crate::backend::version_storage::require_unpinned_by_profiles(tag)?;
+            check()?;
+            after_classification();
+            if is_directory && contains_operational_locks(directory)? {
+                return Err(Error::IncompleteUnit);
             }
-        }
-        check()?;
-        after_classification();
-        if is_directory && contains_operational_locks(directory)? {
-            return Err(Error::IncompleteUnit);
-        }
-        Ok(())
-    })
+            Ok(())
+        },
+    )
 }
 
 fn contains_operational_locks(directory: &Dir) -> Result<bool, Error> {

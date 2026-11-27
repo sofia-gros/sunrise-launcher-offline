@@ -467,7 +467,7 @@ fn incomplete_build_retry_and_clear_recheck_enforce_ordinary_profile_pins() {
         "pinned incomplete build was deleted"
     );
     assert!(matches!(
-        crate::cache_cleanup::clear_claimed_unit_with_contexts(&incomplete, &[]),
+        crate::cache_cleanup::clear_claimed_unit_with_contexts(&incomplete, &[], None),
         Err(Error::ReferencedProfile)
     ));
 
@@ -485,8 +485,112 @@ fn incomplete_build_retry_and_clear_recheck_enforce_ordinary_profile_pins() {
         "unreadable instances.json must suppress incomplete-build retry selection"
     );
     assert!(matches!(
-        crate::cache_cleanup::clear_claimed_unit_with_contexts(&orphan, &[]),
+        crate::cache_cleanup::clear_claimed_unit_with_contexts(&orphan, &[], None),
         Err(Error::UnprovenReferences)
     ));
     assert_eq!(fs::read(orphan.join("game")).unwrap(), b"unproven");
+}
+
+#[test]
+fn clear_refuses_units_replaced_with_different_identity_after_selection() {
+    const TEST: &str = "storage::inventory::regressions::clear_refuses_units_replaced_with_different_identity_after_selection";
+    const ACTOR: &str = "STORAGE_IDENTITY_BIND_ACTOR";
+    if std::env::var_os(ACTOR).is_none() {
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(ACTOR, "1")
+            .env("SUNRISE_LAUNCHER_HOME", root.path().join("launcher"))
+            .env("SUNRISE_HOME", root.path().join("game"))
+            .env(
+                "SUNRISE_LAUNCHER_LOCATION_FILE",
+                root.path().join("location"),
+            )
+            .env("XDG_DATA_HOME", root.path().join("xdg-data"))
+            .env("XDG_CONFIG_HOME", root.path().join("xdg-config"))
+            .env("SUNRISE_NO_KEYCHAIN", "1")
+            .env("SUNRISE_LAUNCHER_NO_SELF_UPDATE", "1")
+            .env("SUNRISE_NO_AUDIO", "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let data = backend::data_dir();
+    let home = backend::game_home();
+    let hold = data.parent().unwrap().join("held-originals");
+    fs::create_dir_all(&hold).unwrap();
+
+    let version = backend::version_dir("v0.0.1");
+    fs::create_dir_all(&version).unwrap();
+    fs::write(version.join(".installed"), b"").unwrap();
+    fs::write(data.join("settings.json"), br#"{"selected":"v0.0.1"}"#).unwrap();
+
+    // 1. Directory and file units cleared via Registry::remove_unit_with_contexts.
+    let cache_dir = home.join(".sunrise-cache/mod-content");
+    fs::create_dir_all(&cache_dir).unwrap();
+    fs::write(cache_dir.join("original"), b"old dir").unwrap();
+    let cache_file = home.join(".sunrise-cache/behaviours-v8.bin");
+    fs::write(&cache_file, b"old file").unwrap();
+
+    // 2. Build-tool directory cleared via Storage::clear_entry_bound.
+    let rust_unit = data.join("rust/old");
+    fs::create_dir_all(&rust_unit).unwrap();
+    fs::write(rust_unit.join("payload"), b"old rust").unwrap();
+
+    let storage = Storage::at(&data).unwrap();
+    let report = storage
+        .clear_observed(None, true, |path| {
+            let plain = backend::plain(path.to_path_buf());
+            if plain == backend::plain(cache_dir.clone()) {
+                // Keep the original alive under `hold` so the filesystem cannot reuse its inode.
+                fs::rename(&cache_dir, hold.join("mod-content")).unwrap();
+                fs::create_dir_all(&cache_dir).unwrap();
+                fs::write(cache_dir.join("replacement"), b"new dir").unwrap();
+            } else if plain == backend::plain(cache_file.clone()) {
+                fs::rename(&cache_file, hold.join("behaviours-v8.bin")).unwrap();
+                fs::write(&cache_file, b"new file").unwrap();
+            } else if plain == backend::plain(rust_unit.clone()) {
+                fs::rename(&rust_unit, hold.join("rust-old")).unwrap();
+                fs::create_dir_all(&rust_unit).unwrap();
+                fs::write(rust_unit.join("replacement"), b"new rust").unwrap();
+            }
+        })
+        .unwrap();
+
+    let other = report
+        .rows
+        .iter()
+        .find(|row| row.category == Category::OtherCaches)
+        .unwrap();
+    assert_eq!(
+        other
+            .kept
+            .iter()
+            .filter(|unit| unit.kind == KeptKind::Unsafe)
+            .count(),
+        2,
+        "both swapped profile cache units must be refused as Unsafe"
+    );
+    assert_eq!(fs::read(cache_dir.join("replacement")).unwrap(), b"new dir");
+    assert_eq!(fs::read(&cache_file).unwrap(), b"new file");
+
+    let rust_row = report
+        .rows
+        .iter()
+        .find(|row| row.category == Category::RustCompiler)
+        .unwrap();
+    assert!(rust_row
+        .kept
+        .iter()
+        .any(|unit| unit.kind == KeptKind::Unsafe));
+    assert_eq!(
+        fs::read(rust_unit.join("replacement")).unwrap(),
+        b"new rust"
+    );
 }

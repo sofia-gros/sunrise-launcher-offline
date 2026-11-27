@@ -358,10 +358,10 @@ impl Entry {
 
     #[cfg(all(test, unix))]
     fn clear(&self) -> Result<(), Error> {
-        self.remove(false)
+        self.remove(false, None)
     }
 
-    fn remove(&self, explicit: bool) -> Result<(), Error> {
+    fn remove(&self, explicit: bool, expected: Option<(u64, u64)>) -> Result<(), Error> {
         let owns_links =
             self.category == Category::ModBuildCache || is_compiler_attempt(&self.relative);
         if !owns_links && !self.path.try_exists()? {
@@ -395,6 +395,7 @@ impl Entry {
                 return crate::cache_cleanup::delete_game_unit_with_contexts(
                     &self.path,
                     &context_roots,
+                    expected,
                 );
             }
             access.check()?;
@@ -411,6 +412,7 @@ impl Entry {
                 return crate::cache_cleanup::clear_claimed_unit_with_contexts(
                     &self.path,
                     &context_roots,
+                    expected,
                 );
             }
         }
@@ -432,6 +434,9 @@ impl Entry {
                 };
                 let attributes = meta.file_attributes();
                 let is_link = attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+                if is_link && expected.is_some() {
+                    return Err(Error::Unsafe(self.path.clone()));
+                }
                 if is_link && attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
                     return present(parent.remove_dir(name)).map(|_| ());
                 }
@@ -439,13 +444,19 @@ impl Entry {
             };
             #[cfg(not(windows))]
             let is_link = meta.file_type().is_symlink();
+            if is_link && expected.is_some() {
+                return Err(Error::Unsafe(self.path.clone()));
+            }
+            if let Some(expected) = expected {
+                check_entry_identity(&parent, name, meta.is_dir(), expected, &self.path)?;
+            }
             if is_link || meta.is_file() {
                 return present(parent.remove_file(name)).map(|_| ());
             }
             // Keep the no-follow parent as the boundary throughout recursive removal.
             return present(parent.remove_dir_all(name)).map(|_| ());
         }
-        Storage::clear_entry(root, &parent, name)
+        Storage::clear_entry_bound(root, &parent, name, expected)
     }
 }
 
@@ -906,7 +917,7 @@ impl Storage {
                 let result = if blocked_build_tools && entry.build_tool() {
                     Err(Error::Busy)
                 } else {
-                    entry.remove(retain)
+                    entry.remove(retain, trees[index].root_id)
                 };
                 match result {
                     // Only a cleared folder is walked again, to see what is left of it.

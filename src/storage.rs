@@ -275,14 +275,62 @@ impl Storage {
     }
 
     fn clear_entry(trash: &Dir, parent: &Dir, name: &Path) -> Result<(), Error> {
+        Self::clear_entry_bound(trash, parent, name, None)
+    }
+
+    fn clear_entry_bound(
+        trash: &Dir,
+        parent: &Dir,
+        name: &Path,
+        expected: Option<(u64, u64)>,
+    ) -> Result<(), Error> {
         let meta = parent.symlink_metadata(name)?;
         let plan = if meta.is_dir() && !meta.file_type().is_symlink() {
-            Plan::pin(&parent.open_dir_nofollow(name)?)?
+            let dir = parent.open_dir_nofollow(name)?;
+            if let Some(expected) = expected {
+                use cap_fs_ext::MetadataExt as _;
+                let dir_meta = dir.dir_metadata()?;
+                if (dir_meta.dev(), dir_meta.ino()) != expected {
+                    return Err(Error::Unsafe(name.to_owned()));
+                }
+            }
+            Plan::pin(&dir)?
         } else {
+            if let Some(expected) = expected {
+                check_entry_identity(parent, name, false, expected, name)?;
+            }
             Plan::pin_file(parent, name)?
         };
         plan.clear(trash)
     }
+}
+
+fn check_entry_identity(
+    parent: &Dir,
+    name: &Path,
+    is_dir: bool,
+    expected: (u64, u64),
+    path: &Path,
+) -> Result<(), Error> {
+    use cap_fs_ext::{FollowSymlinks, MetadataExt as _, OpenOptionsFollowExt};
+    use cap_std::fs::OpenOptions;
+    let actual = if is_dir {
+        let meta = parent.open_dir_nofollow(name)?.dir_metadata()?;
+        (meta.dev(), meta.ino())
+    } else {
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let file = parent.open_with(name, &options)?;
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(Error::Unsafe(path.to_owned()));
+        }
+        (meta.dev(), meta.ino())
+    };
+    if actual != expected {
+        return Err(Error::Unsafe(path.to_owned()));
+    }
+    Ok(())
 }
 
 pub fn allocated_bytes(path: &Path) -> Result<u64, Error> {
@@ -316,6 +364,7 @@ pub(crate) fn entries_calls() -> usize {
 /// Allocation identities from one validated walk, independent of directory shape.
 pub(crate) struct Tree {
     allocations: HashMap<(u64, u64), u64>,
+    root_id: Option<(u64, u64)>,
     present: bool,
     has_payload: bool,
 }
@@ -348,10 +397,11 @@ impl Tree {
         WALKS.with(|walks| walks.set(walks.get() + 1));
         let mut tree = Self {
             allocations: HashMap::new(),
+            root_id: None,
             present: false,
             has_payload: false,
         };
-        tree.present = tree.visit(path, cancel, skip_links)?;
+        tree.present = tree.visit(path, cancel, skip_links, true)?;
         Ok(tree)
     }
 
@@ -360,6 +410,7 @@ impl Tree {
         path: &Path,
         cancel: Option<&Cancel>,
         skip_links: bool,
+        is_root: bool,
     ) -> Result<bool, Error> {
         if cancel.is_some_and(Cancel::is_cancelled) {
             return Ok(false);
@@ -399,6 +450,9 @@ impl Tree {
             }
             Err(error) => return Err(error),
         };
+        if is_root {
+            self.root_id = Some(id);
+        }
         if meta.is_dir() {
             let entries = match fs::read_dir(path) {
                 Ok(entries) => entries,
@@ -414,7 +468,7 @@ impl Tree {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(error) => return Err(error.into()),
                 };
-                self.visit(&entry.path(), cancel, skip_links)?;
+                self.visit(&entry.path(), cancel, skip_links, false)?;
             }
         } else if path
             .file_name()
