@@ -394,23 +394,7 @@ impl Profile {
 
     /// Bring an already committed profile forward on the same base. The game may have
     /// changed packages and the enable list; failed fits never change the launcher pointer.
-    pub(crate) fn refresh(
-        &mut self,
-        mode: native_mods::Profile,
-        cancellation: &native_mods::Cancellation,
-        progress: impl Fn(native_mods::Step),
-        log: Option<&dyn Fn(std::sync::Arc<str>)>,
-        replacement: Option<Resources>,
-    ) -> Result<Option<Active>, native_mods::Failed> {
-        match self.refresh_for_play(mode, cancellation, progress, log, replacement) {
-            Ok(Some((active, _))) => Ok(Some(active)),
-            Ok(None) => Ok(None),
-            Err(RefreshError::Native(error)) => Err(error),
-            Err(RefreshError::Snapshot(error)) => Err(native_mods::Failed::Other(error)),
-        }
-    }
-
-    pub(super) fn refresh_for_play(
+    pub(crate) fn refresh_for_play(
         &mut self,
         mode: native_mods::Profile,
         cancellation: &native_mods::Cancellation,
@@ -549,7 +533,7 @@ impl Profile {
         drop(proof);
         match &verified {
             Ok(()) => checking.done(""),
-            Err(why) => checking.failed(&match why {
+            Err(why) => checking.failed(match why {
                 super::StartError::Snapshot(detail)
                 | super::StartError::UnknownSpawn(detail)
                 | super::StartError::Other(detail) => detail.as_str(),
@@ -842,7 +826,8 @@ fn publish_generation(
     Ok(active)
 }
 
-pub(super) enum RefreshError {
+#[derive(Debug)]
+pub(crate) enum RefreshError {
     Native(native_mods::Failed),
     Snapshot(String),
 }

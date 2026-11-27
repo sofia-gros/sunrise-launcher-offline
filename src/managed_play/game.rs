@@ -13,6 +13,13 @@ use sunrise_launcher_smod::{
     selection::{Argument, LaunchArguments},
 };
 
+struct SpawnHooks<'a, J, B> {
+    proof: Option<VerifiedSnapshot>,
+    prepare_jars: J,
+    hook: Option<(&'a crate::launch::Launch, &'a dyn Fn(String))>,
+    before_spawn: B,
+}
+
 impl Profile {
     /// The caller applies account, profile and player settings before this boundary. This
     /// method accepts the final, unwrapped game command; it never starts an outer wrapper.
@@ -29,7 +36,12 @@ impl Profile {
             command,
             &[],
             piped,
-            (None, |_| Ok(()), None, |_| Ok(())),
+            SpawnHooks {
+                proof: None,
+                prepare_jars: |_| Ok(()),
+                hook: None,
+                before_spawn: |_| Ok(()),
+            },
         )
         .map_err(String::from)
     }
@@ -75,24 +87,34 @@ impl Profile {
             command,
             &wrapper,
             piped,
-            (proof, prepare_jars, Some((launch, hook_log)), before_spawn),
+            SpawnHooks {
+                proof,
+                prepare_jars,
+                hook: Some((launch, hook_log)),
+                before_spawn,
+            },
         )
     }
 
-    fn spawn_selected(
+    fn spawn_selected<J, B>(
         &self,
         active: &Active,
         cancellation: &Cancellation,
         command: Command,
         wrapper: &[std::ffi::OsString],
         piped: bool,
-        (proof, prepare_jars, hook, before_spawn): (
-            Option<VerifiedSnapshot>,
-            impl FnOnce(&Command) -> Result<(), String>,
-            Option<(&crate::launch::Launch, &dyn Fn(String))>,
-            impl FnOnce(&mut Command) -> Result<(), StartError>,
-        ),
-    ) -> Result<(Child, RuntimeGuard), StartError> {
+        hooks: SpawnHooks<'_, J, B>,
+    ) -> Result<(Child, RuntimeGuard), StartError>
+    where
+        J: FnOnce(&Command) -> Result<(), String>,
+        B: FnOnce(&mut Command) -> Result<(), StartError>,
+    {
+        let SpawnHooks {
+            proof,
+            prepare_jars,
+            hook,
+            before_spawn,
+        } = hooks;
         let manifest = self.verify_handoff(active, proof, cancellation)?;
         let selection = validate_selection(self.home(), &active.resource_path(), &command)?;
         prepare_jars(&command)?;

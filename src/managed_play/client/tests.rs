@@ -1275,7 +1275,7 @@ fi
     assert_eq!(FULL_VERIFICATIONS.take(), 1);
     assert_eq!(profile.active().unwrap(), Some(advanced.clone()));
     let direct_error = profile
-        .refresh(
+        .refresh_for_play(
             instance.native_profile,
             &cancellation,
             |_| panic!("native build started over damaged cached resources"),
@@ -1284,7 +1284,7 @@ fi
         )
         .unwrap_err();
     assert!(
-        matches!(&direct_error, native_mods::Failed::Other(detail)
+        matches!(&direct_error, super::super::first::RefreshError::Snapshot(detail)
             if detail.contains("managed_play/resources.rs:")),
         "{direct_error:?}"
     );
@@ -1416,8 +1416,8 @@ fi
     let path = resources.path(BUILD);
     fs::create_dir(path.parent().unwrap()).unwrap();
     fs::rename(legacy_tree, &path).unwrap();
-    let server = profile
-        .refresh(
+    let (server, _) = profile
+        .refresh_for_play(
             instance.native_profile,
             &cancellation,
             |_| {},
@@ -1445,8 +1445,8 @@ fi
 
     // An intact ServerOnly upgrade that freshly seals the new client snapshot inside prepare
     // verifies the old snapshot once and does not run a second verify pass after the seal.
-    let server_again = profile
-        .refresh(
+    let (server_again, _) = profile
+        .refresh_for_play(
             instance.native_profile,
             &cancellation,
             |_| {},

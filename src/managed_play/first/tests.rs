@@ -192,8 +192,8 @@ fn game_replacements_leave_registry_rows_alone_and_advance_the_same_base() {
             .is_err());
         // Play adopts the new bytes as its input on the same base; the registry row stays as
         // it was, since only a registry install or update restamps it.
-        let current = profile
-            .refresh(
+        let (current, _) = profile
+            .refresh_for_play(
                 native_mods::Profile::Optimized,
                 &cancellation,
                 |_| {},
@@ -225,7 +225,7 @@ fn game_replacements_leave_registry_rows_alone_and_advance_the_same_base() {
     let before = serde_json::to_vec(&expected).unwrap();
     fs::write(&path, &before).unwrap();
     assert!(profile
-        .refresh(
+        .refresh_for_play(
             native_mods::Profile::Optimized,
             &cancellation,
             |_| {},
