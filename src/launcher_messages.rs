@@ -860,6 +860,29 @@ mod tests {
             "a subsequent Other error belongs to Start, not Build"
         );
         assert!(matches!(run.end, Some(crate::mods::build_run::End::Done)));
+
+        use crate::launch_state::{Act, Facts, Main};
+        let detail =
+            "Sunrise couldn't verify the profile's saved game build (managed_play/resources.rs:1)."
+                .to_owned();
+        let view = Facts {
+            client_error: Some(detail.clone()),
+            signed_in: true,
+            installed: true,
+            located: true,
+            ..Default::default()
+        }
+        .view();
+        assert_eq!(view.main, Main::Play);
+        assert!(view.enabled && view.failed);
+        assert_eq!(view.said.as_deref(), Some(tr("The game couldn't start.")));
+        assert_eq!(
+            view.act,
+            Some(Act::Notice {
+                text: detail,
+                way_out: None
+            })
+        );
     }
 
     #[test]

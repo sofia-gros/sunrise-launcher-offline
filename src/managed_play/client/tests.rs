@@ -974,6 +974,8 @@ fn play_hashes_the_prepared_files_once_and_still_refuses_damage() {
             io::ErrorKind::NotFound
         );
     }
+    let log_dir = fixture.join("logs");
+    crate::launcher_log::init(&log_dir);
     let home = backend::game_home();
     let build = backend::version_dir(BUILD);
     let prepared = backend::resources(BUILD);
@@ -1232,7 +1234,7 @@ fi
     write_package("4.0.0");
     fs::write(&program, b"changed client").unwrap();
     let error = ready(&mut profile).unwrap_err();
-    assert!(String::from(error).contains("managed_play.rs:"));
+    assert!(String::from(error).contains("managed_play/artifact.rs:"));
     assert_eq!(FULL_VERIFICATIONS.take(), 0);
     assert_eq!(profile.active().unwrap(), Some(advanced.clone()));
     write_package("3.0.0");
@@ -1240,12 +1242,12 @@ fi
     let (active, _, _) = ready(&mut profile).unwrap();
     fs::write(&program, b"changed client").unwrap();
     let (result, _) = handoff(&profile, &active, None);
-    assert!(result.unwrap_err().contains("managed_play.rs:"));
+    assert!(result.unwrap_err().contains("managed_play/artifact.rs:"));
     assert!(!spawned.get());
     fs::write(&program, client_bytes).unwrap();
     assert_eq!(intact(&mut profile), advanced);
 
-    // The capsule of saved image evidence includes both the preparer and the archive receipt.
+    // Saved image evidence covers both the preparer and the archive receipt.
     let archive = build.join(super::super::Artifact::ARCHIVE_RECEIPT);
     let receipt = fs::read(&archive).unwrap();
     let mut wrong_receipt: serde_json::Value = serde_json::from_slice(&receipt).unwrap();
@@ -1314,4 +1316,7 @@ fi
     result.unwrap();
     assert!(spawned.get());
     assert_eq!(replacement_verifications, 1);
+    let log = fs::read_to_string(log_dir.join("launcher.log")).unwrap();
+    assert!(log.contains("Verifying game files: done"));
+    assert!(!log.contains(&*fixture.to_string_lossy()));
 }
