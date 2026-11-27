@@ -2801,11 +2801,14 @@ fn probe_missing_extras(versions: &Path, tag: &str) -> Option<crate::preparer::E
     if read_json(&resources.join(RESOURCES_MANIFEST)).is_none_or(|m| server_profile(&m)) {
         return None;
     }
-    crate::preparer::binary(&root).and_then(|binary| {
-        crate::preparer::missing_extras(&binary, &root, &resources, None)
-            .ok()
-            .flatten()
-    })
+    let binary = crate::preparer::binary(&root)?;
+    match crate::preparer::missing_extras(&binary, &root, &resources, None) {
+        Ok(missing) => missing,
+        Err(error) => {
+            crate::elog!("{tag}: {}", crate::launcher_log::safe_error(&error));
+            None
+        }
+    }
 }
 
 /// Sunrise's own download (an owner's) may have stopped before the sounds and the languages,
@@ -9819,6 +9822,7 @@ esac"#
             "data.bin",
             "msg.txt",
             "stderr.log",
+            "probe.dat",
             "sounds.json",
             "extras.err",
             "extras.out",
@@ -9878,6 +9882,14 @@ esac"#
                     "launcher.log missing {expected}: {disk_log}"
                 );
             }
+            for log in [&*stderr, disk_log.as_str()] {
+                assert!(
+                    log.lines()
+                        .any(|line| line.contains("v-startup-probe:")
+                            && line.contains("(os error 2)")),
+                    "missing categorized startup probe failure: {log}"
+                );
+            }
             for word in SECRET_WORDS {
                 assert!(
                     !disk_log.contains(word),
@@ -9904,6 +9916,15 @@ esac"#
             fs::set_permissions(&preparer, fs::Permissions::from_mode(0o700)).unwrap();
             version
         };
+        make_version(
+            "v-startup-probe",
+            concat!(
+                "[ \"$1\" = missing-extras ] || exit 2\n",
+                "printf '%s\\n' '{\"format\":1,\"error\":{\"message\":\"could not open /home/ada/Private Client Backup/drafts/probe.dat (os error 2)\"}}'\n",
+                "exit 1",
+            ),
+        );
+        assert!(probe_missing_extras(&root.join("versions"), "v-startup-probe").is_none());
         let lacking =
             r#"{"format":1,"prepared":true,"missing":[{"kind":"sounds","what":"The sounds"}]}"#;
         make_version(
