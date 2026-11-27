@@ -280,13 +280,7 @@ impl Workspace {
 
     pub(super) fn isolate(&self, command: &mut std::process::Command) -> io::Result<()> {
         if self.slot.is_some() {
-            let work = self.work();
-            let log = work.join("build.log");
-            match regular_under(&work, &log) {
-                Ok(()) => fs::remove_file(log)?,
-                Err(err) if err.kind() == io::ErrorKind::NotFound => (),
-                Err(err) => return Err(err),
-            }
+            remove_slot_log(&self.work())?;
         }
         let path = self.path();
         let tmp = self.retry_tmp.clone().unwrap_or_else(|| path.join("tmp"));
@@ -612,6 +606,28 @@ fn times_handle(file: &Path) -> io::Result<fs::File> {
     {
         fs::File::open(file)
     }
+}
+
+fn remove_slot_log(work: &Path) -> io::Result<()> {
+    let dir = match sunrise_launcher_smod::runtime_leases::open_directory(work) {
+        Ok(dir) => dir,
+        Err(sunrise_launcher_smod::runtime_leases::Error::Io(err))
+            if err.kind() == io::ErrorKind::NotFound =>
+        {
+            return Ok(());
+        }
+        Err(sunrise_launcher_smod::runtime_leases::Error::Io(err)) => return Err(err),
+        Err(_) => return Err(invalid()),
+    };
+    let meta = match dir.symlink_metadata("build.log") {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    if crate::native_cache::cap_linked(&meta) || !meta.is_file() {
+        return Err(invalid());
+    }
+    dir.remove_file("build.log")
 }
 
 fn invalid() -> io::Error {

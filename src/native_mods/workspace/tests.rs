@@ -732,6 +732,17 @@ fn a_persistent_sdk_invocation_refuses_a_linked_build_log() {
     fs::write(&log, b"old diagnostics").unwrap();
     stage.isolate(&mut command).unwrap();
     assert!(!log.exists());
+
+    // Redirecting the slot directory itself to an outside folder refuses before deleting `build.log`.
+    let outside = dir.path().join("outside-slot");
+    fs::create_dir(&outside).unwrap();
+    let outside_log = outside.join("build.log");
+    fs::write(&outside_log, b"do not delete").unwrap();
+    let slot_dir = stage.work();
+    fs::remove_dir_all(&slot_dir).unwrap();
+    std::os::unix::fs::symlink(&outside, &slot_dir).unwrap();
+    assert!(stage.isolate(&mut command).is_err());
+    assert_eq!(fs::read(&outside_log).unwrap(), b"do not delete");
 }
 
 #[test]

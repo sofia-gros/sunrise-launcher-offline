@@ -35,6 +35,7 @@ impl From<io::Error> for Error {
 
 pub(crate) struct Cache {
     root: PathBuf,
+    build_dir: Dir,
     directory: Dir,
     _lease: Locked,
 }
@@ -111,22 +112,45 @@ fn single(name: &str) -> Result<&Path, Error> {
     }
 }
 
-/// Removes `path` itself without opening what a link there points to: a symlink or a junction
-/// goes as the link, and a folder with links inside goes with each of them unlinked.
-fn remove(path: &Path) -> io::Result<()> {
-    let meta = match fs::symlink_metadata(path) {
+/// Whether a `cap_std` metadata record represents a symlink or Windows reparse point.
+pub(crate) fn cap_linked(meta: &cap_std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use cap_std::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
+}
+
+/// Removes `name` under `parent` without opening what a link there points to: a symlink or a
+/// junction goes as the link, and a folder with links inside goes with each of them unlinked
+/// through the held `Dir` handle.
+fn remove_entry(parent: &Dir, name: &Path) -> io::Result<()> {
+    let meta = match parent.symlink_metadata(name) {
         Ok(meta) => meta,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
-    if linked(&meta) {
-        // A symlink to a file goes by `remove_file`; on Windows a junction or folder symlink
-        // only by `remove_dir`.
-        fs::remove_file(path).or_else(|_| fs::remove_dir(path))
+    if cap_linked(&meta) {
+        // On Windows a junction or folder symlink goes by `remove_dir`; a file symlink goes by
+        // `remove_file`.
+        #[cfg(windows)]
+        {
+            use cap_std::fs::MetadataExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+            if meta.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0 {
+                return parent.remove_dir(name);
+            }
+        }
+        parent.remove_file(name)
     } else if meta.is_dir() {
-        fs::remove_dir_all(path)
+        parent.remove_dir_all(name)
     } else {
-        fs::remove_file(path)
+        parent.remove_file(name)
     }
 }
 
@@ -182,17 +206,27 @@ impl Cache {
     pub(crate) fn acquire(build_dir: &Path) -> Result<Self, Error> {
         checked(build_dir, true)?;
         fs::create_dir_all(build_dir)?;
-        let root = build_dir.canonicalize()?.join("native");
+        let build_path = build_dir.canonicalize()?;
+        let root = build_path.join("native");
         checked(&root, true)?;
         fs::create_dir_all(&root)?;
-        let anchor = root.ancestors().last().expect("canonical root is absolute");
-        let mut directory = Dir::open_ambient_dir(anchor, cap_std::ambient_authority())?;
-        for component in root.strip_prefix(anchor).expect("root anchor").components() {
-            directory = directory.open_dir_nofollow(component.as_os_str())?;
+        let anchor = build_path
+            .ancestors()
+            .last()
+            .expect("canonical build root is absolute");
+        let mut build_handle = Dir::open_ambient_dir(anchor, cap_std::ambient_authority())?;
+        for component in build_path
+            .strip_prefix(anchor)
+            .expect("build root anchor")
+            .components()
+        {
+            build_handle = build_handle.open_dir_nofollow(component.as_os_str())?;
         }
+        let directory = build_handle.open_dir_nofollow("native")?;
         let lease = lock(&root.join(".build.lock"))?;
         Ok(Self {
             root,
+            build_dir: build_handle,
             directory,
             _lease: lease,
         })
@@ -203,20 +237,25 @@ impl Cache {
         self.process(None, false)
     }
 
-    /// `path` as a link-free folder of this cache, made when it is absent. Anything else there (a
-    /// link, a junction, a file) is removed as itself, never followed, and replaced by an empty
-    /// folder. The lease must be held; the parent of `path` is a folder this cache already owns.
-    fn own(&self, path: &Path) -> Result<(), Error> {
-        match checked(path, true) {
-            Ok(Some(_)) => (),
-            Ok(None) => fs::create_dir(path)?,
-            Err(Error::Unsafe(_)) => {
-                remove(path)?;
-                fs::create_dir(path)?;
+    /// `name` under `parent` as a link-free folder of this cache, made when it is absent. Anything
+    /// else there (a link, a junction, a file) is removed through `parent` as itself, never
+    /// followed, and replaced by an empty folder. The lease must be held; `parent` is a folder
+    /// this cache already owns.
+    fn own_in(&self, parent: &Dir, name: &Path, path: &Path) -> Result<Dir, Error> {
+        match parent.symlink_metadata(name) {
+            Ok(meta) if meta.is_dir() && !cap_linked(&meta) => (),
+            Ok(_) => {
+                remove_entry(parent, name)?;
+                parent.create_dir(name)?;
             }
-            Err(error) => return Err(error),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                parent.create_dir(name)?;
+            }
+            Err(error) => return Err(error.into()),
         }
-        self.unchanged_path(path)
+        let dir = parent.open_dir_nofollow(name)?;
+        self.unchanged_path(path)?;
+        Ok(dir)
     }
 
     /// Where [`Self::work_slot`] puts `slot`, before anything is made there.
@@ -230,15 +269,16 @@ impl Cache {
     /// builds cold once, with no repair of what was there.
     pub(crate) fn work_slot(&self, slot: &str) -> Result<Provisioned, Error> {
         let work = self.root.join(WORK);
-        let path = work.join(single(slot)?);
-        self.own(&work)?;
+        let leaf = single(slot)?;
+        let path = work.join(leaf);
+        let work_dir = self.own_in(&self.directory, Path::new(WORK), &work)?;
         match sdk_owned(&path) {
             Ok(()) => (),
-            Err(Error::Unsafe(_)) => remove(&path)?,
+            Err(Error::Unsafe(_)) => remove_entry(&work_dir, leaf)?,
             Err(error) => return Err(error),
         }
-        self.own(&path)?;
-        let cold = fs::read_dir(&path)?.next().is_none();
+        let slot_dir = self.own_in(&work_dir, leaf, &path)?;
+        let cold = slot_dir.entries()?.next().is_none();
         Ok(Provisioned {
             path: crate::backend::plain(path),
             cold,
@@ -251,10 +291,11 @@ impl Cache {
         let work = self.root.join(WORK);
         let leaf = single(slot)?;
         // A completed compiler could have changed this parent since the slot was attached.
-        // Check it from the held native directory before inspecting the slot by path.
-        let _parent = self.directory.open_dir_nofollow(WORK)?;
+        // Check and remove strictly through the held `native/w` directory handle.
+        let parent = self.directory.open_dir_nofollow(WORK)?;
         self.unchanged_path(&work)?;
-        remove(&work.join(leaf))?;
+        remove_entry(&parent, leaf)?;
+        drop(parent);
         self.work_slot(slot)
     }
 
@@ -267,7 +308,7 @@ impl Cache {
             .parent()
             .expect("the native folder is inside the build folder");
         let path = build.join("cargo");
-        self.own(&path)?;
+        let _dir = self.own_in(&self.build_dir, Path::new("cargo"), &path)?;
         Ok(crate::backend::plain(path))
     }
     pub(crate) fn clear(&self) -> Result<u64, Error> {
@@ -302,6 +343,7 @@ impl Cache {
             return Ok(0);
         }
         self.unchanged_path(&target)?;
+        let target_dir = self.directory.open_dir_nofollow("target")?;
         let mut locks = Vec::new();
         let mut folders = Vec::new();
         for profile in PROFILES {
@@ -309,22 +351,27 @@ impl Cache {
             if checked(&folder, true)?.is_some() {
                 // Also protects an older launcher's Cargo or one started outside our lease.
                 self.unchanged_path(&folder)?;
+                let profile_dir = target_dir.open_dir_nofollow(profile)?;
                 locks.push(lock(&folder.join(".cargo-lock"))?);
-                folders.push(folder);
+                folders.push((folder, profile_dir));
             }
         }
         // Validate ALL profiles and descendants before deleting ANY output. Never traverse links.
-        let mut entries = Vec::new();
+        let mut batches = Vec::new();
         let mut bytes = 0u64;
-        for folder in folders {
-            for entry in fs::read_dir(folder)? {
+        for (folder, profile_dir) in folders {
+            let mut names = Vec::new();
+            for entry in profile_dir.entries()? {
                 let entry = entry?;
-                if entry.file_name() == ".cargo-lock" {
+                let name = entry.file_name();
+                if name == ".cargo-lock" {
                     continue;
                 }
-                bytes = bytes.saturating_add(size(&entry.path())?);
-                entries.push(entry.path());
+                let path = folder.join(&name);
+                bytes = bytes.saturating_add(size(&path)?);
+                names.push((name, path));
             }
+            batches.push((profile_dir, names));
         }
         if !clear {
             return Ok(bytes);
@@ -334,18 +381,30 @@ impl Cache {
         }
         let records = self.root.join("built.json");
         let has_records = checked(&records, false)?.is_some();
-        for path in entries {
-            self.unchanged_path(&path)?;
-            // The launcher lease and all Cargo locks remain held through removal. These are
-            // fixed children of the two validated cache profiles, never caller-supplied paths.
-            if fs::symlink_metadata(&path)?.is_dir() {
-                fs::remove_dir_all(path)?;
-            } else {
-                fs::remove_file(path)?;
+        for (profile_dir, names) in batches {
+            for (name, path) in names {
+                self.unchanged_path(&path)?;
+                // The launcher lease and all Cargo locks remain held through removal. Remove
+                // strictly through the held profile `Dir` handle so an ambient swap cannot
+                // redirect deletion.
+                let meta = profile_dir.symlink_metadata(&name)?;
+                if cap_linked(&meta) {
+                    return Err(Error::Unsafe(path));
+                }
+                if meta.is_dir() {
+                    profile_dir.remove_dir_all(&name)?;
+                } else {
+                    profile_dir.remove_file(&name)?;
+                }
             }
         }
         if has_records {
-            fs::remove_file(records)?;
+            self.unchanged_path(&records)?;
+            let meta = self.directory.symlink_metadata("built.json")?;
+            if cap_linked(&meta) || !meta.is_file() {
+                return Err(Error::Unsafe(records));
+            }
+            self.directory.remove_file("built.json")?;
         }
         drop(locks);
         Ok(bytes)

@@ -427,3 +427,33 @@ fn real_cargo_build_is_protected_and_installed_copy_survives_cleanup() {
     holder.0.wait().unwrap();
     assert!(Cache::acquire(&dir.0).is_ok());
 }
+
+#[test]
+fn work_slot_fresh_slot_and_cargo_home_unlink_links_without_touching_targets() {
+    let dir = Temp::new();
+    let outside = dir.put("outside/canary", b"keep me");
+    let outside_dir = outside.parent().unwrap();
+    let cache = Cache::acquire(&dir.0).unwrap();
+
+    // A linked cargo/ or work slot entry is unlinked through the held Dir handle, never followed.
+    link_dir(outside_dir, &dir.0.join("cargo"));
+    let cargo = cache.cargo_home().unwrap();
+    assert!(cargo.is_dir());
+    assert_eq!(fs::read(&outside).unwrap(), b"keep me");
+
+    let slot = cache.work_slot("0123456789").unwrap();
+    assert!(slot.cold);
+    link_dir(outside_dir, &slot.path.join("nested-link"));
+    fs::write(slot.path.join("stale"), b"old").unwrap();
+    let fresh = cache.fresh_work_slot("0123456789").unwrap();
+    assert!(fresh.cold);
+    assert!(!fresh.path.join("stale").exists());
+    assert_eq!(fs::read(&outside).unwrap(), b"keep me");
+
+    // Replacing `native/w/<slot>` itself with a link is unlinked cleanly through held `native/w`.
+    fs::remove_dir_all(&fresh.path).unwrap();
+    link_dir(outside_dir, &fresh.path);
+    let replaced = cache.work_slot("0123456789").unwrap();
+    assert!(replaced.cold);
+    assert_eq!(fs::read(&outside).unwrap(), b"keep me");
+}
