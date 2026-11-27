@@ -109,13 +109,34 @@ impl Cancellation {
         state.publishing = true;
         Ok(())
     }
+}
 
+#[derive(Debug)]
+struct CancelledRead;
+
+impl std::fmt::Display for CancelledRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(super::CANCELLED)
+    }
+}
+
+impl std::error::Error for CancelledRead {}
+
+pub(crate) fn is_cancelled_io(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<CancelledRead>())
+}
+
+impl Cancellation {
     /// Check the attempt before each bounded download or extraction read.
     pub(crate) fn reader<R: std::io::Read>(&self, reader: R) -> impl std::io::Read + use<'_, R> {
         struct Reader<'a, R>(&'a Cancellation, R);
         impl<R: std::io::Read> std::io::Read for Reader<'_, R> {
             fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                self.0.check().map_err(std::io::Error::other)?;
+                if self.0.is_stopped() {
+                    return Err(std::io::Error::other(CancelledRead));
+                }
                 self.1.read(buf)
             }
         }

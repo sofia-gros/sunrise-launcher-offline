@@ -611,8 +611,6 @@ pub(super) fn slices(
     let side = side(target);
     let prebuilt = super::root().join("prebuilt");
     let package = slices_in(&prebuilt, sdk, base, route, host.target, side, progress)?;
-    crate::storage::mark_used(&prebuilt.join(unit(sdk.commit(), host.target, side)))
-        .map_err(|error| Refusal::Cache(super::cache_error(error)))?;
     Ok(package)
 }
 
@@ -661,7 +659,6 @@ pub(super) fn tool(sdk: &Sdk, base: &Base, progress: &dyn Fn(Fetched)) -> Result
     for name in &names {
         fetch_into(sdk, base, name, &into, &mut fetched, progress)?;
     }
-    crate::storage::mark_used(&into).map_err(|error| Refusal::Cache(super::cache_error(error)))?;
     Ok(into.join(super::tool::PROGRAM))
 }
 

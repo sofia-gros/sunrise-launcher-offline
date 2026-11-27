@@ -138,136 +138,7 @@ impl Entry {
         })
     }
 
-    /// Parse the exact revision-bearing names written by the cache constructors.
-    fn revision(&self) -> Option<&str> {
-        let name = self.relative.file_name()?.to_str()?;
-        let parent = self.relative.parent()?;
-        let revision = if parent == Path::new("native/tools") {
-            (name.len() == 12).then_some(name)?
-        } else if parent == Path::new("native/prebuilt") {
-            let (revision, rest) = name.split_once('-')?;
-            // A build's SDK slices (`<build id>-<target>[-server]`, a developer install's with
-            // `.developer`), and the older single-archive caches (`<commit>-sunrise-prebuilt-v<n>-
-            // <target>`), which native builds no longer read but eviction must still recognize.
-            let rest = rest.strip_suffix(".developer").unwrap_or(rest);
-            let current = sunrise_launcher_smod::index::native::prebuilt_prefix();
-            let target = [
-                "sunrise-prebuilt-v3-",
-                "sunrise-prebuilt-v4-",
-                "sunrise-prebuilt-v5-",
-                current.as_str(),
-            ]
-            .into_iter()
-            .find_map(|prefix| rest.strip_prefix(prefix))
-            .unwrap_or(rest);
-            let target = target.strip_suffix("-server").unwrap_or(target);
-            crate::rust_toolchain::hosts()
-                .iter()
-                .any(|host| host.target == target)
-                .then_some(revision)?
-        } else if parent == Path::new("native/internals-sync") {
-            if let Some(catalog) = name.strip_prefix("catalog-") {
-                let (revision, host) = catalog.split_once('-')?;
-                crate::rust_toolchain::hosts()
-                    .iter()
-                    .any(|candidate| candidate.target == host)
-                    .then_some(revision)?
-            } else {
-                name
-            }
-        } else if parent == Path::new("native/source") {
-            name
-        } else {
-            return None;
-        };
-        let expected = if parent == Path::new("native/tools") {
-            12
-        } else {
-            40
-        };
-        (revision.len() == expected
-            && revision
-                .bytes()
-                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
-        .then_some(revision)
-    }
-
-    /// What an interrupted unpack or download left beside the units of `native/prebuilt`: a
-    /// `.partial` folder, a `.lock` file, a `.download` archive. Nothing uses one while the build
-    /// lease is held, and eviction holds it, so a lock file is removed only under that lease.
-    fn leftover(&self) -> bool {
-        self.relative.parent() == Some(Path::new("native/prebuilt"))
-            && self
-                .relative
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    [".partial", ".lock", ".download"]
-                        .iter()
-                        .any(|suffix| name.ends_with(suffix))
-                })
-    }
-
-    fn unpublished_game(&self) -> bool {
-        self.relative.parent() == Some(Path::new("versions"))
-            && self
-                .relative
-                .file_name()
-                .is_some_and(crate::backend::installation::private_stage)
-    }
-
-    fn last_used(&self) -> Result<Option<std::time::SystemTime>, Error> {
-        if self.unpublished_game() {
-            return Ok(None); // Inventory never stamps a private publisher's staged directory.
-        }
-        let Some(root) = &self.directory else {
-            return Ok(None);
-        };
-        let meta = match fs::symlink_metadata(&self.path) {
-            Ok(meta) => meta,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        if linked(&meta) {
-            return Err(Error::Unsafe(self.path.clone()));
-        }
-        let (relative, stamp) = if meta.is_dir() {
-            (
-                self.relative.as_path(),
-                std::ffi::OsString::from(".last-used"),
-            )
-        } else {
-            let Some(name) = self.relative.file_name() else {
-                return Ok(None);
-            };
-            let mut stamp = std::ffi::OsString::from(".");
-            stamp.push(name);
-            stamp.push(".last-used");
-            (self.relative.parent().unwrap_or(Path::new("")), stamp)
-        };
-        let mut directory = root.try_clone()?;
-        for part in relative.components() {
-            directory = directory.open_dir_nofollow(part.as_os_str())?;
-        }
-        use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
-        let mut options = cap_std::fs::OpenOptions::new();
-        options
-            .write(true)
-            .create_new(true)
-            .follow(FollowSymlinks::No);
-        match directory.open_with(&stamp, &options) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
-        }
-        let meta = directory.symlink_metadata(&stamp)?;
-        if !meta.is_file() || meta.file_type().is_symlink() {
-            return Err(Error::Unsafe(self.path.join(stamp)));
-        }
-        Ok(Some(meta.modified()?.into_std()))
-    }
-
-    /// The lease integration changes this classification, not policy or deletion code.
+    /// The lease integration changes this classification, not deletion code.
     fn access(&self) -> Result<Access, Error> {
         match self.category {
             Category::RustCompiler => Ok(Access::BuildTools),
@@ -316,6 +187,8 @@ fn add(
 
 impl Storage {
     fn entries(&self) -> Result<Vec<Entry>, Error> {
+        #[cfg(test)]
+        ENTRIES.with(|calls| calls.set(calls.get() + 1));
         let mut entries = Vec::new();
         let build_root = Root::open(&self.root)?;
         for cache in BUILD_CACHES {
@@ -486,41 +359,6 @@ impl Storage {
         Ok(entries)
     }
 
-    pub(super) fn stamp_build(&self) -> Result<(), Error> {
-        for entry in self.entries()? {
-            if !entry.path.starts_with(&self.root) || !entry.path.is_dir() {
-                continue;
-            }
-            let relative = entry.path.strip_prefix(&self.root).unwrap();
-            if !(relative == Path::new("cargo")
-                || relative == Path::new("tmp")
-                || (relative.starts_with("rust")
-                    && entry.path.file_name().is_some_and(|name| {
-                        name.to_string_lossy()
-                            .starts_with(crate::rust_toolchain::VERSION)
-                    })))
-            {
-                continue;
-            }
-            let Some(root) = &entry.directory else {
-                continue;
-            };
-            let mut directory = root.try_clone()?;
-            for part in entry.relative.components() {
-                directory = directory.open_dir_nofollow(part.as_os_str())?;
-            }
-            use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
-            let mut options = cap_std::fs::OpenOptions::new();
-            options
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .follow(FollowSymlinks::No);
-            directory.open_with(".last-used", &options)?;
-        }
-        Ok(())
-    }
-
     /// Not deletion candidates: an unproved worker can still be writing to them.
     fn retained_compiler_bytes(
         &self,
@@ -544,192 +382,6 @@ impl Storage {
         Ok(bytes)
     }
 
-    pub(super) fn evict_inventory(
-        &self,
-        now: std::time::SystemTime,
-        max_bytes: Option<u64>,
-    ) -> Result<Report, Error> {
-        self.evict_inventory_observed(now, max_bytes, |_| {})
-    }
-
-    pub(crate) fn evict_inventory_observed(
-        &self,
-        now: std::time::SystemTime,
-        max_bytes: Option<u64>,
-        mut before_clear: impl FnMut(&Path),
-    ) -> Result<Report, Error> {
-        use super::policy::{self, Tier, Unit};
-        let entries = self.entries()?;
-        for entry in &entries {
-            entry.last_used()?;
-        }
-        let mut revisions = HashSet::new();
-        let mut unknown_revision = false;
-        let mut native_enabled = false;
-        for instance in instances::list() {
-            for bundle in crate::native_status::bundles_on(&instance.home) {
-                if let Some(native) = bundle.manifest.native {
-                    native_enabled = true;
-                    revisions.insert(native.sunrise);
-                }
-            }
-            match instance.resolve_version(None) {
-                Ok(version) => {
-                    if let Some(about) = native_mods::about(&version) {
-                        revisions.insert(about.sunrise);
-                    } else if let Some(nightly) = version.strip_prefix("nightly-") {
-                        revisions.insert(nightly.rsplit('-').next().unwrap_or(nightly).to_owned());
-                    } else {
-                        unknown_revision = true;
-                    }
-                }
-                Err(_) => unknown_revision = true,
-            }
-        }
-        // One walk of each folder serves its unit size, its row's bytes and its kept size.
-        let mut trees = entries
-            .iter()
-            .map(|entry| Tree::build(&entry.path))
-            .collect::<Result<Vec<_>, Error>>()?;
-        let mut seen = HashSet::new();
-        let retained = self.retained_compiler_bytes(&mut seen)?;
-        let mut units: Vec<_> = entries
-            .iter()
-            .zip(&trees)
-            .map(|(entry, tree)| {
-                let last_used = entry.last_used()?;
-                let tier = if entry.relative.starts_with("rust")
-                    && entry.path.file_name().is_some_and(|name| {
-                        name.to_string_lossy()
-                            .starts_with(crate::rust_toolchain::VERSION)
-                    })
-                    && native_enabled
-                {
-                    // Conservatively retain the whole toolchain set while a native mod is on.
-                    Tier::Protected
-                } else if entry.leftover() {
-                    Tier::Expiring
-                } else if [
-                    "native/source",
-                    "native/tools",
-                    "native/internals-sync",
-                    "native/prebuilt",
-                ]
-                .iter()
-                .any(|root| entry.relative.starts_with(root))
-                {
-                    let Some(unit_revision) = entry.revision() else {
-                        return Ok(Unit {
-                            eligible: false,
-                            bytes: tree.size(&mut seen),
-                            last_used,
-                            tier: Tier::Protected,
-                        });
-                    };
-                    let tool = entry.relative.starts_with("native/tools");
-                    let used = unknown_revision
-                        || (tool && native_mods::MIXINS_REV.get(..12) == Some(unit_revision))
-                        || revisions.iter().any(|revision| {
-                            let length = revision.len().min(unit_revision.len());
-                            revision.get(..length) == unit_revision.get(..length)
-                        });
-                    if used && entry.category == Category::PrebuiltGames {
-                        Tier::Lru
-                    } else if used {
-                        Tier::Protected
-                    } else {
-                        Tier::Expiring
-                    }
-                } else if entry.relative.starts_with("rust")
-                    || entry
-                        .path
-                        .file_name()
-                        .is_some_and(|name| name.to_string_lossy().starts_with(".trash-"))
-                {
-                    Tier::Expiring
-                } else {
-                    Tier::Lru
-                };
-                Ok(Unit {
-                    eligible: entry.access()?.check().is_ok(),
-                    bytes: tree.size(&mut seen),
-                    last_used,
-                    tier,
-                })
-            })
-            .collect::<Result<_, Error>>()?;
-        if let Some(bytes) = retained {
-            units.push(Unit {
-                bytes,
-                tier: Tier::Protected,
-                eligible: false,
-                last_used: None,
-            });
-        }
-        let selected = policy::select(&units, max_bytes, now);
-        let mut report = self.apply_retaining(Vec::new(), None, false, true)?;
-        for row in &mut report.rows {
-            row.bytes = allocated(&entries, &trees, row.category);
-        }
-        for (index, entry) in entries.iter().enumerate() {
-            let row = report
-                .rows
-                .iter_mut()
-                .find(|row| row.category == entry.category)
-                .unwrap();
-            if selected.contains(&index) {
-                before_clear(&entry.path);
-                let result = if entry.path == self.root.join("native/target") {
-                    self.lease.clear().map(|_| ())
-                } else {
-                    entry.clear()
-                };
-                match result {
-                    // Only a cleared folder is walked again, to see what is left of it.
-                    Ok(()) => trees[index] = Tree::build(&entry.path)?,
-                    // A refusal comes before any deletion: the folder is as it was walked.
-                    Err(
-                        error @ (Error::Busy
-                        | Error::UnprovenExclusion
-                        | Error::IncompleteUnit
-                        | Error::UnpublishedGame
-                        | Error::ResourceDependent(_)
-                        | Error::ReferencedProfile
-                        | Error::UnprovenReferences),
-                    ) => row.kept.push(Kept {
-                        bytes: trees[index].size(&mut HashSet::new()),
-                        reason: native_mods::cache_error(error),
-                    }),
-                    Err(error) => return Err(error),
-                }
-            }
-            let remaining = trees[index].size(&mut HashSet::new());
-            if !selected.contains(&index) && remaining > 0 {
-                row.kept.push(Kept {
-                    bytes: remaining,
-                    reason: if !units[index].eligible {
-                        native_mods::cache_error(
-                            entry
-                                .access()?
-                                .check()
-                                .err()
-                                .unwrap_or(Error::UnprovenExclusion),
-                        )
-                    } else {
-                        crate::i18n::tr("Protected, recently used, or last use unknown.").into()
-                    },
-                });
-            }
-        }
-        for row in &mut report.rows {
-            row.remaining_bytes = allocated(&entries, &trees, row.category);
-            row.freed_bytes = row.bytes.saturating_sub(row.remaining_bytes);
-        }
-        report.total_bytes = report.rows.iter().map(|row| row.bytes).sum();
-        report.include_retained_compiler(retained);
-        Ok(report)
-    }
-
     pub fn report(&self, clear: Option<Category>, all: bool) -> Result<Report, Error> {
         let registry_entries = match fs::read_dir(backend::data_dir().join("run-leases")) {
             Ok(mut entries) => entries.try_fold(0usize, |count, entry| entry.map(|_| count + 1))?,
@@ -743,9 +395,12 @@ impl Storage {
                 &[("count", &registry_entries.to_string())]
             )
         );
-        // Also refuse an external Cargo holding a target lock before starting a cleanup.
-        self.lease.bytes()?;
-        if clear.is_some() || all {
+        let clearing = clear.is_some() || all;
+        // Only manual clear takes the native build lease; read-only reports never make Play wait.
+        let lease = if clearing {
+            let lease = self.build_lease()?;
+            // Also refuse an external Cargo holding a target lock before starting a cleanup.
+            lease.bytes()?;
             use sunrise_launcher_smod::runtime_leases::{cleanup::Cleanup, Error as LeaseError};
             match Cleanup::existing(&backend::data_dir()) {
                 Ok(cleanup) => {
@@ -755,11 +410,14 @@ impl Storage {
                 Err(LeaseError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
-        }
+            Some(lease)
+        } else {
+            None
+        };
         let entries = self.entries()?;
-        let mut report = self.apply_retaining(entries, clear, all, true)?;
+        let mut report = self.apply_retaining(entries, clear, all, true, lease.as_ref())?;
         report.include_retained_compiler(self.retained_compiler_bytes(&mut HashSet::new())?);
-        if clear.is_none() && !all {
+        if !clearing {
             for entry in self.entries()? {
                 if let Err(error) = entry.access().and_then(|access| access.check()) {
                     // A refused unit already has its line.
@@ -792,7 +450,24 @@ impl Storage {
         clear: Option<Category>,
         all: bool,
     ) -> Result<Report, Error> {
-        self.apply_retaining(entries, clear, all, false)
+        let needs_target_lease = (clear.is_some() || all)
+            && entries
+                .iter()
+                .any(|entry| entry.path == self.root.join("native/target"));
+        let lease = needs_target_lease.then(|| self.build_lease()).transpose()?;
+        self.apply_retaining(entries, clear, all, false, lease.as_ref())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_observed(
+        &self,
+        clear: Option<Category>,
+        all: bool,
+        before_clear: impl FnMut(&Path),
+    ) -> Result<Report, Error> {
+        let lease = self.build_lease()?;
+        let entries = self.entries()?;
+        self.apply_retaining_observed(entries, clear, all, true, Some(&lease), before_clear)
     }
 
     fn apply_retaining(
@@ -801,6 +476,19 @@ impl Storage {
         clear: Option<Category>,
         all: bool,
         retain: bool,
+        lease: Option<&Cache>,
+    ) -> Result<Report, Error> {
+        self.apply_retaining_observed(entries, clear, all, retain, lease, |_| {})
+    }
+
+    fn apply_retaining_observed(
+        &self,
+        entries: Vec<Entry>,
+        clear: Option<Category>,
+        all: bool,
+        retain: bool,
+        lease: Option<&Cache>,
+        mut before_clear: impl FnMut(&Path),
     ) -> Result<Report, Error> {
         // Validate every descendant before any deletion and deduplicate allocated blocks per row.
         let mut rows: Vec<_> = Category::ALL
@@ -831,8 +519,12 @@ impl Storage {
         }
         for (index, entry) in entries.iter().enumerate() {
             if all || clear == Some(entry.category) {
+                before_clear(&entry.path);
                 let result = if entry.path == self.root.join("native/target") {
-                    self.lease.clear().map(|_| ())
+                    lease
+                        .expect("manual clear holds the build lease")
+                        .clear()
+                        .map(|_| ())
                 } else {
                     entry.clear()
                 };
@@ -1000,95 +692,9 @@ fn unused_jars(entries: &mut Vec<Entry>, home: &Root) -> Result<(), Error> {
 }
 
 #[cfg(test)]
-mod eviction_tests {
+mod manual_tests {
     use super::*;
-    #[test]
-    fn first_seen_stamp_ages_without_being_refreshed_by_inventory() {
-        let home = crate::storage::tests::Home::new();
-        home.seed("rust/old/payload");
-        let root = Root::open(&home.0).unwrap();
-        let entry = Entry::fixed(&root, Path::new("rust/old"), Category::RustCompiler).unwrap();
-        let used = entry.last_used().unwrap().unwrap();
-        assert_eq!(entry.last_used().unwrap(), Some(used));
-        let units = [policy::Unit {
-            bytes: 100,
-            eligible: true,
-            last_used: Some(used),
-            tier: policy::Tier::Expiring,
-        }];
-        assert!(policy::select(&units, None, used).is_empty());
-        assert_eq!(
-            policy::select(
-                &units,
-                None,
-                used + std::time::Duration::from_secs(7 * 86400)
-            ),
-            [0]
-        );
-    }
 
-    #[test]
-    fn revision_names_are_parsed_not_searched() {
-        let home = crate::storage::tests::Home::new();
-        let root = Root::open(&home.0).unwrap();
-        let sha = "0123456789abcdef0123456789abcdef01234567";
-        for (path, expected) in [
-            (format!("native/source/{sha}"), Some(sha)),
-            (format!("native/source/not-{sha}"), None),
-            (format!("native/tools/{}", &sha[..12]), Some(&sha[..12])),
-            (
-                format!("native/prebuilt/{sha}-sunrise-prebuilt-v3-x86_64-unknown-linux-gnu"),
-                Some(sha),
-            ),
-            (
-                format!("native/prebuilt/{sha}-sunrise-prebuilt-v3-x86_64-unknown-linux-gnu-server"),
-                Some(sha),
-            ),
-            (
-                format!("native/prebuilt/{sha}-sunrise-prebuilt-v4-x86_64-unknown-linux-gnu"),
-                Some(sha),
-            ),
-            (
-                format!("native/prebuilt/{sha}-sunrise-prebuilt-v4-x86_64-unknown-linux-gnu-server"),
-                Some(sha),
-            ),
-            (format!("native/prebuilt/{sha}-sunrise-prebuilt-v3-unknown-target"), None),
-            (format!("native/prebuilt/{sha}-sunrise-prebuilt-v4-unknown-target"), None),
-            (format!("native/prebuilt/{sha}-sunrise-prebuilt-v30-x86_64-unknown-linux-gnu"), None),
-            (format!("native/prebuilt/{sha}-sunrise-prebuilt-v4-x86_64-unknown-linux-gnu-server-server"), None),
-            (format!("native/prebuilt/{sha}-sunrise-prebuilt-v4-x86_64-unknown-linux-gnu.tar.gz"), None),
-            (format!("native/prebuilt/not-{sha}-sunrise-prebuilt-v4-x86_64-unknown-linux-gnu"), None),
-            // A build's SDK slices, and a developer install's laid-out game.
-            (format!("native/prebuilt/{sha}-x86_64-unknown-linux-gnu"), Some(sha)),
-            (format!("native/prebuilt/{sha}-x86_64-unknown-linux-gnu-server"), Some(sha)),
-            (format!("native/prebuilt/{sha}-x86_64-unknown-linux-gnu.developer"), Some(sha)),
-            (format!("native/prebuilt/{sha}-unknown-target"), None),
-            (format!("native/prebuilt/{sha}-x86_64-unknown-linux-gnu.partial"), None),
-            (
-                format!("native/internals-sync/catalog-{sha}-x86_64-unknown-linux-gnu"),
-                Some(sha),
-            ),
-            (format!("native/internals-sync/garbage-{sha}"), None),
-        ] {
-            assert_eq!(
-                Entry::fixed(&root, Path::new(&path), Category::BuildFiles)
-                    .unwrap()
-                    .revision(),
-                expected
-            );
-        }
-        // What an interrupted unpack or download left is known as such, and nothing else is.
-        for (path, leftover) in [
-            (format!("native/prebuilt/.{sha}-sunrise-prebuilt-v6-x86_64-unknown-linux-gnu.tar.gz.partial"), true),
-            (format!("native/prebuilt/{sha}-x86_64-unknown-linux-gnu.lock"), true),
-            ("native/prebuilt/runtime-x86_64-unknown-linux-gnu.tar.xz.download".to_owned(), true),
-            (format!("native/prebuilt/{sha}-x86_64-unknown-linux-gnu"), false),
-            (format!("native/source/{sha}.partial"), false),
-        ] {
-            let entry = Entry::fixed(&root, Path::new(&path), Category::BuildFiles).unwrap();
-            assert_eq!(entry.leftover(), leftover, "{path}");
-        }
-    }
     #[test]
     fn refused_units_are_residual_with_bytes_and_reason() {
         let home = crate::storage::tests::Home::new();
@@ -1116,7 +722,9 @@ mod eviction_tests {
                 .unwrap()
                 .map(|entry| own_bytes(&entry.unwrap().path()))
                 .sum::<u64>();
-        let report = storage.apply_retaining(entries, None, true, true).unwrap();
+        let report = storage
+            .apply_retaining(entries, None, true, true, None)
+            .unwrap();
         let row = report
             .rows
             .iter()
@@ -1145,7 +753,9 @@ mod eviction_tests {
             Entry::fixed(&root, Path::new("cache"), Category::OtherCaches).unwrap(),
             Entry::fixed(&root, Path::new("rust/old"), Category::RustCompiler).unwrap(),
         ];
-        let report = storage.apply_retaining(entries, None, true, true).unwrap();
+        let report = storage
+            .apply_retaining(entries, None, true, true, None)
+            .unwrap();
         let row = |category| {
             report
                 .rows
@@ -1164,60 +774,13 @@ mod eviction_tests {
         assert!(!good.exists());
     }
 
-    /// The walk the eviction pass made before one walk served every figure: a fresh recursive
-    /// walk with its own set of counted blocks, as `allocated` and `allocated_bytes` made it.
-    fn legacy_walk(path: &Path, seen: &mut HashSet<(u64, u64)>) -> u64 {
-        let meta = match fs::symlink_metadata(path) {
-            Ok(meta) => meta,
-            Err(_) => return 0,
-        };
-        let (id, bytes) = super::super::allocation(path, &meta).unwrap();
-        if !seen.insert(id) {
-            return 0;
-        }
-        let mut total = bytes;
-        if meta.is_dir() {
-            for entry in fs::read_dir(path).unwrap() {
-                total += legacy_walk(&entry.unwrap().path(), seen);
-            }
-        }
-        total
-    }
-
-    fn legacy_allocated(entries: &[Entry], category: Category) -> u64 {
-        let mut seen = HashSet::new();
-        entries
-            .iter()
-            .filter(|entry| entry.category == category)
-            .map(|entry| legacy_walk(&entry.path, &mut seen))
-            .sum()
-    }
-
     #[test]
-    fn retained_compiler_bytes_use_budget_but_cannot_be_cleared() {
+    fn retained_compiler_bytes_cannot_be_cleared() {
         let home = crate::storage::tests::Home::new();
-        let cache = home.seed("cargo/registry/download");
-        let storage = Storage::at(&home.0).unwrap();
-        let now = std::time::SystemTime::now();
-        let ordinary = storage.evict_inventory(now, None).unwrap();
-        assert!(ordinary.total_bytes > 0 && cache.exists());
         let old_worker = home.seed("native/.nb-old/compiler/w");
         let older_launchers = home.seed("native/.native-attempt-older/compiler/work");
-        let report = storage
-            .evict_inventory(now, Some(ordinary.total_bytes))
-            .unwrap();
-        assert!(
-            !cache.exists(),
-            "retained worker must count toward the cache limit"
-        );
-        assert!(
-            old_worker.is_file(),
-            "the old worker is never a deletion candidate"
-        );
-        assert!(
-            older_launchers.is_file(),
-            "nor is one an earlier launcher left"
-        );
+        let storage = Storage::at(&home.0).unwrap();
+        let report = storage.report(None, false).unwrap();
         let protected = &report.rows[0];
         assert_eq!(protected.category, Category::BuildFiles);
         assert!(protected.remaining_bytes > 0);
@@ -1227,75 +790,7 @@ mod eviction_tests {
         let manual = storage.report(Some(Category::BuildFiles), false).unwrap();
         assert_eq!(manual.rows[0].clearable_bytes(), 0);
         assert!(old_worker.is_file());
-    }
-
-    #[test]
-    fn one_walk_per_folder_reports_what_the_repeated_walks_did() {
-        let home = crate::storage::tests::Home::new();
-        let shared = home.seed("rust/old/payload");
-        home.seed("rust/old/deep/more");
-        // A file shared by a cleared compiler folder and a kept build folder, and one shared by
-        // two folders of the same row: each row counts a block once, whatever the other rows hold.
-        fs::create_dir_all(home.0.join("native/source/not-a-revision")).unwrap();
-        fs::hard_link(&shared, home.0.join("native/source/not-a-revision/shared")).unwrap();
-        let twin = home.seed("rust/old2/own");
-        fs::hard_link(&twin, home.0.join("rust/old2/twin")).unwrap();
-        // Kept: recently used (cargo) and protected (a source folder with no revision in its name).
-        home.seed("cargo/registry/crate");
-        home.seed("native/source/not-a-revision/file");
-        let storage = Storage::at(&home.0).unwrap();
-        let before_entries = storage.entries().unwrap();
-        let count = before_entries.len();
-        let sizes: Vec<u64> = before_entries
-            .iter()
-            .map(|entry| legacy_walk(&entry.path, &mut HashSet::new()))
-            .collect();
-        let before: Vec<u64> = Category::ALL
-            .iter()
-            .map(|category| legacy_allocated(&before_entries, *category))
-            .collect();
-        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(8 * 86400);
-        let walks_before = crate::storage::walks();
-        let report = storage.evict_inventory(later, Some(25 << 30)).unwrap();
-        let walked = crate::storage::walks() - walks_before;
-        let entries = storage.entries().unwrap();
-        let cleared = before_entries
-            .iter()
-            .zip(&sizes)
-            .filter(|(entry, size)| {
-                **size > 0 && legacy_walk(&entry.path, &mut HashSet::new()) != **size
-            })
-            .count();
-        // Each folder once, and once more only the folders that were cleared.
-        assert_eq!(walked, count + cleared);
-        let mut total = 0;
-        let mut kept_any = false;
-        for (row, bytes) in report.rows.iter().zip(&before) {
-            let remaining = legacy_allocated(&entries, row.category);
-            assert_eq!(row.bytes, *bytes, "{:?}", row.category);
-            assert_eq!(row.remaining_bytes, remaining, "{:?}", row.category);
-            assert_eq!(row.freed_bytes, bytes.saturating_sub(remaining));
-            // A folder left as it was (not cleared) and holding something is kept.
-            let kept: Vec<u64> = before_entries
-                .iter()
-                .zip(&sizes)
-                .filter(|(entry, _)| entry.category == row.category)
-                .map(|(entry, size)| (legacy_walk(&entry.path, &mut HashSet::new()), *size))
-                .filter(|(now, size)| now == size && *now > 0)
-                .map(|(now, _)| now)
-                .collect();
-            assert_eq!(
-                row.kept.iter().map(|kept| kept.bytes).collect::<Vec<_>>(),
-                kept,
-                "{:?}",
-                row.category
-            );
-            kept_any |= !kept.is_empty();
-            total += bytes;
-        }
-        assert_eq!(report.total_bytes, total);
-        assert!(kept_any);
-        assert!(home.0.join("cargo/registry/crate").exists());
+        assert!(older_launchers.is_file());
     }
 
     #[test]
@@ -1316,86 +811,14 @@ mod eviction_tests {
         entries.push(Entry::fixed(&root, Path::new("cache"), Category::OtherCaches).unwrap());
         let count = entries.len();
         let walks = crate::storage::walks();
-        let report = storage.apply_retaining(entries, None, true, true).unwrap();
+        let report = storage
+            .apply_retaining(entries, None, true, true, None)
+            .unwrap();
         // The refused folder was walked once (and stopped there); the sound one once, then once
         // more after it was cleared.
         assert_eq!(crate::storage::walks() - walks, count + 1);
         assert!(report.rows[3].freed_bytes > 0);
         #[cfg(unix)]
         assert_eq!(report.rows[4].kept.len(), 1);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    #[ignore = "manual allocated 40 GiB proof; requires SUNRISE_EVICTION_PROOF_ROOT in checkout scratch"]
-    fn allocated_forty_gib_cleanup_proof() {
-        let path = PathBuf::from(
-            std::env::var_os("SUNRISE_EVICTION_PROOF_ROOT").expect("isolated proof root"),
-        );
-        fs::create_dir_all(&path).unwrap();
-        let home = crate::storage::tests::Home(path.canonicalize().unwrap());
-        for (folder, gib) in [
-            ("rust/old", 12),
-            ("cargo", 12),
-            ("tmp", 4),
-            ("native/patched/proof", 4),
-            ("versions/native-leased", 4),
-            ("versions/native-legacy", 4),
-        ] {
-            let file = home.seed(&format!("{folder}/payload"));
-            assert!(std::process::Command::new("fallocate")
-                .args(["-l", &format!("{gib}G")])
-                .arg(file)
-                .status()
-                .unwrap()
-                .success());
-        }
-        assert_eq!(backend::data_dir().canonicalize().unwrap(), home.0);
-        let leased = home.0.join("versions/native-leased");
-        let legacy = home.0.join("versions/native-legacy");
-        for directory in [&leased, &legacy] {
-            fs::write(directory.join(".installed"), b"").unwrap();
-        }
-        fs::write(
-            leased.join(backend::CLIENT),
-            sunrise_launcher_smod::holder::CAPABILITY,
-        )
-        .unwrap();
-        fs::write(legacy.join(backend::CLIENT), b"pre-holder game").unwrap();
-        crate::run_leases::publish(&leased).unwrap();
-        let registry = sunrise_launcher_smod::runtime_leases::Registry::existing(&home.0).unwrap();
-        let _game = registry
-            .lock(
-                &sunrise_launcher_smod::runtime_leases::open_directory(&leased).unwrap(),
-                sunrise_launcher_smod::locks::LockMode::Shared,
-            )
-            .unwrap();
-        let storage = Storage::at(&home.0).unwrap();
-        assert!(matches!(Cache::acquire(&home.0), Err(Error::Busy)));
-        let before = allocated_bytes(&home.0).unwrap();
-        let now = std::time::SystemTime::now();
-        let first = storage.evict_inventory(now, Some(25 << 30)).unwrap();
-        let later = now + std::time::Duration::from_secs(8 * 86400);
-        let second = storage.evict_inventory(later, Some(25 << 30)).unwrap();
-        let freed: u64 = first
-            .rows
-            .iter()
-            .chain(&second.rows)
-            .map(|row| row.freed_bytes)
-            .sum();
-        let residual = allocated_bytes(&home.0).unwrap();
-        println!("allocated_before={before} inventoried_before={} freed={freed} allocated_residual={residual}", first.total_bytes);
-        assert!(before >= 40 * (1 << 30));
-        assert!(freed >= 28 * (1 << 30));
-        assert!(residual >= 12 * (1 << 30));
-        assert!(residual < 25 * (1 << 30));
-        assert!(leased.join("payload").exists());
-        assert!(legacy.join("payload").exists());
-        assert!(home.0.join("native/patched/proof/payload").exists());
-        assert!(second.rows.iter().any(|row| row
-            .kept
-            .iter()
-            .any(|kept| kept.bytes >= 4 * (1 << 30) && !kept.reason.is_empty())));
-        assert!(matches!(Cache::acquire(&home.0), Err(Error::Busy)));
     }
 }

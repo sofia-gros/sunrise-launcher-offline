@@ -1622,9 +1622,13 @@ fn write_checked(
     let mut hash = sunrise_launcher_release_verify::Sha256::default();
     let (mut done, mut buf) = (0u64, vec![0u8; 1 << 16]);
     loop {
-        let n = reader
-            .read(&mut buf)
-            .map_err(|e| SaveCheckedError::Download(format!("Download interrupted: {e}")))?;
+        let n = reader.read(&mut buf).map_err(|e| {
+            if crate::native_mods::is_cancelled_io(&e) {
+                SaveCheckedError::Download(crate::native_mods::CANCELLED.into())
+            } else {
+                SaveCheckedError::Download(format!("Download interrupted: {e}"))
+            }
+        })?;
         if n == 0 {
             break;
         }
@@ -1895,7 +1899,14 @@ fn played_in(versions: &Path, selected: Option<&str>, field: &str) -> String {
 /// The version whose folder holds `tag`'s prepared resources: a native build shares its base's
 /// (`copy_base` leaves `.local` out), any other version keeps its own.
 pub fn resources_owner(tag: &str) -> String {
-    crate::native_mods::about(tag).map_or_else(|| tag.to_owned(), |about| about.base)
+    resources_owner_in(&versions_dir(), tag)
+}
+
+fn resources_owner_in(versions: &Path, tag: &str) -> String {
+    crate::native_mods::is_native(tag)
+        .then(|| crate::native_mods::about_in(&versions.join(tag)))
+        .flatten()
+        .map_or_else(|| tag.to_owned(), |about| about.base)
 }
 
 pub fn resources(tag: &str) -> PathBuf {
@@ -2413,13 +2424,19 @@ fn reuse_prepared_cancellable(
     stop: Option<&crate::native_mods::Cancellation>,
 ) -> Option<String> {
     let stopped = || stop.is_some_and(crate::native_mods::Cancellation::is_stopped);
+    if resources_owner_in(versions, tag) != tag {
+        return None;
+    }
     let target = versions.join(tag);
     let to = resources_at(&target);
     if to.join(RESOURCES_MANIFEST).exists() {
         return None;
     }
     let version = game_version_at(&target);
-    for other in installed_in(versions).into_iter().filter(|t| t != tag) {
+    for other in installed_in(versions)
+        .into_iter()
+        .filter(|t| t != tag && resources_owner_in(versions, t) == *t)
+    {
         if stopped() {
             return None;
         }
@@ -2599,20 +2616,29 @@ pub fn reuse_prepared_everywhere() -> Vec<(String, String)> {
     let versions = versions_dir();
     let reused = reuse_prepared_in(&versions);
     forget_prepared();
-    for tag in installed_in(&versions) {
+    for tag in installed_in(&versions)
+        .into_iter()
+        .filter(|tag| resources_owner(tag) == *tag)
+    {
+        let was_reused = reused.iter().any(|(prepared, _)| prepared == &tag);
+        // Probe unlocked once; lock only when this base was reused or actually lacks extras.
+        let missing = probe_missing_extras(&versions, &tag);
+        if !was_reused && missing.as_ref().is_none_or(Vec::is_empty) {
+            continue;
+        }
         // Here, on the start-up thread, and not in `complete_assets`, which Play also runs: a
         // download of thousands of files is not for the moment the game is waited for.
         let Ok(preparation) = prepare_lock(&tag) else {
             continue;
         };
         let handoff = preparation.handoff(None);
-        refill_own_store(&tag, &handoff);
-        if reused.iter().any(|(prepared, _)| prepared == &tag) {
-            if let Err(error) = finish_preparation(&tag, &preparation) {
+        refill_own_store(&tag, missing.as_ref());
+        if was_reused {
+            if let Err(error) = finish_preparation_with_missing(&tag, &preparation, missing) {
                 crate::elog!("{tag}: {error}");
             }
-        } else {
-            complete_assets_staged(&tag, &handoff);
+        } else if let Some(lacking) = missing {
+            complete_assets_lacking_staged(&tag, &handoff, lacking);
         }
     }
     reused
@@ -2622,8 +2648,14 @@ fn reuse_prepared_in(versions: &Path) -> Vec<(String, String)> {
     let mut tags = installed_in(versions);
     tags.reverse();
     tags.into_iter()
+        .filter(|tag| resources_owner_in(versions, tag) == *tag)
         .filter_map(|tag| {
-            let _preparation = prepare_lock_at(&versions.join(&tag), &tag).ok()?;
+            let target = versions.join(&tag);
+            let to = resources_at(&target);
+            if to.join(RESOURCES_MANIFEST).exists() && has_runtime_reports(&to) {
+                return None;
+            }
+            let _preparation = prepare_lock_at(&target, &tag).ok()?;
             let from = reuse_prepared(versions, &tag);
             complete_reports(versions, &tag);
             from.map(|from| (tag, from))
@@ -2634,6 +2666,12 @@ fn reuse_prepared_in(versions: &Path) -> Vec<(String, String)> {
 /// The data generator reports the game reads at run time: the built-in registries' network ids
 /// (without them no server can be joined or hosted) and the command tree.
 const RUNTIME_REPORTS: [&str; 2] = ["registries.json", "commands.json"];
+
+fn has_runtime_reports(resources: &Path) -> bool {
+    RUNTIME_REPORTS
+        .iter()
+        .all(|name| resources.join(name).is_file())
+}
 
 /// Puts the data generator reports the game reads at run time (`RUNTIME_REPORTS`) into a prepared version's
 /// resources when they are missing. Preparers before they shipped there left them only in the
@@ -2670,7 +2708,10 @@ pub(crate) fn complete_reports_at(versions: &Path, tag: &str, target: &Path, to:
     let reports = |dir: &Path| dir.join(".local/datagen/out/reports");
     let mut sources = vec![reports(target)];
     let mut source_claims = Vec::new();
-    for other in installed_in(versions).into_iter().filter(|t| t != tag) {
+    for other in installed_in(versions)
+        .into_iter()
+        .filter(|t| t != tag && resources_owner_in(versions, t) == *t)
+    {
         let dir = versions.join(&other);
         if server(&dir).as_ref() == Some(&pins) {
             if let Ok(preparation) = prepare_lock_at(&dir, &other) {
@@ -2724,6 +2765,21 @@ pub(crate) fn complete_assets_staged(tag: &str, handoff: &crate::preparer::Hando
     );
 }
 
+pub(crate) fn complete_assets_lacking_staged(
+    tag: &str,
+    handoff: &crate::preparer::Handoff<'_>,
+    lacking: crate::preparer::Extras,
+) {
+    complete_assets_with(
+        &versions_dir(),
+        tag,
+        Some(lacking),
+        minecraft_folders,
+        &|line| crate::elog!("{line}"),
+        Some(handoff),
+    );
+}
+
 /// Whether Sunrise's own store is asked to download again: it has an asset index, the version
 /// lacks some extra (any kind: the download fetches the whole asset index, which holds the
 /// sounds, languages, fonts, panorama and built-in packs) and it was not asked this run yet.
@@ -2737,28 +2793,29 @@ fn refill_wanted(
         && !asked.swap(true, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Read-only check for missing extras, run without `.preparing.lock`. A stale "nothing missing"
+/// only postpones repair to the next start.
+fn probe_missing_extras(versions: &Path, tag: &str) -> Option<crate::preparer::Extras> {
+    let root = versions.join(tag);
+    let resources = resources_at(&root);
+    if read_json(&resources.join(RESOURCES_MANIFEST)).is_none_or(|m| server_profile(&m)) {
+        return None;
+    }
+    crate::preparer::binary(&root).and_then(|binary| {
+        crate::preparer::missing_extras(&binary, &root, &resources, None)
+            .ok()
+            .flatten()
+    })
+}
+
 /// Sunrise's own download (an owner's) may have stopped before the sounds and the languages,
 /// and the copies of `complete_assets` read them from its store: asked again, once per run, through
 /// the same owner gate as any download from Mojang (`download_for_owner`), which keeps the files
 /// already whole. Called where a download is expected (`reuse_prepared_everywhere`), never on Play.
-fn refill_own_store(tag: &str, handoff: &crate::preparer::Handoff<'_>) {
+fn refill_own_store(tag: &str, missing: Option<&crate::preparer::Extras>) {
     static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let own = data_dir().join("minecraft");
-    let root = versions_dir().join(tag);
-    let resources = resources_at(&root);
-    if read_json(&resources.join(RESOURCES_MANIFEST)).is_none_or(|m| server_profile(&m)) {
-        return;
-    }
-    let missing = crate::preparer::binary(&root).and_then(|binary| {
-        crate::preparer::missing_extras(&binary, &root, &resources, Some(handoff))
-            .ok()
-            .flatten()
-    });
-    if !refill_wanted(
-        own.join("assets/indexes").is_dir(),
-        missing.as_ref(),
-        &ASKED,
-    ) {
+    if !refill_wanted(own.join("assets/indexes").is_dir(), missing, &ASKED) {
         return;
     }
     let Some(pins) = read_json(&version_dir(tag).join("research-lock.json"))
@@ -2787,6 +2844,17 @@ fn complete_assets_in(
     log: &dyn Fn(String),
     handoff: Option<&crate::preparer::Handoff<'_>>,
 ) {
+    complete_assets_with(versions, tag, None, folders, log, handoff);
+}
+
+fn complete_assets_with(
+    versions: &Path,
+    tag: &str,
+    probed: Option<crate::preparer::Extras>,
+    folders: impl Fn() -> Vec<PathBuf>,
+    log: &dyn Fn(String),
+    handoff: Option<&crate::preparer::Handoff<'_>>,
+) {
     let stopped = || {
         handoff
             .and_then(crate::preparer::Handoff::stop)
@@ -2806,17 +2874,23 @@ fn complete_assets_in(
     let Some(binary) = crate::preparer::binary(&root) else {
         return;
     };
-    let checking = crate::launcher_log::step("Checking game files");
-    let lacking = match crate::preparer::missing_extras(&binary, &root, &resources, handoff) {
-        Ok(Some(lacking)) if !lacking.is_empty() => {
-            checking.done(format!("{} to fetch", lacking.len()));
-            lacking
-        }
-        Ok(Some(_)) => return checking.done("nothing to fetch"),
-        Ok(None) => return checking.done("this version's preparer cannot check"),
-        Err(e) => {
-            checking.failed(&e);
-            return log(format!("{tag}: {e}"));
+    let lacking = match probed {
+        Some(lacking) if !lacking.is_empty() => lacking,
+        Some(_) => return,
+        None => {
+            let checking = crate::launcher_log::step("Checking game files");
+            match crate::preparer::missing_extras(&binary, &root, &resources, handoff) {
+                Ok(Some(lacking)) if !lacking.is_empty() => {
+                    checking.done(format!("{} to fetch", lacking.len()));
+                    lacking
+                }
+                Ok(Some(_)) => return checking.done("nothing to fetch"),
+                Ok(None) => return checking.done("this version's preparer cannot check"),
+                Err(e) => {
+                    checking.failed(&e);
+                    return log(format!("{tag}: {}", crate::launcher_log::safe_error(&e)));
+                }
+            }
         }
     };
     if stopped() {
@@ -2827,17 +2901,28 @@ fn complete_assets_in(
         return;
     }
     if let Err(error) = Resources::invalidate(&root) {
-        return log(format!("{tag}: {error}"));
+        return log(format!(
+            "{tag}: {}",
+            crate::launcher_log::safe_error(&error.to_string())
+        ));
     }
     let kinds: Vec<String> = lacking.iter().map(|(kind, _)| kind.clone()).collect();
     let fetching = crate::launcher_log::step(format!(
         "Fetching missing game files ({})",
         kinds.join(", ")
     ));
-    let result =
-        crate::preparer::add_extras(&binary, &root, &resources, &kinds, &folders(), log, handoff);
+    let result = crate::preparer::add_extras(
+        &binary,
+        &root,
+        &resources,
+        &kinds,
+        &folders(),
+        &|_| {},
+        handoff,
+    );
     match &result {
-        Ok(_) => fetching.done(""),
+        Ok(Some(added)) => fetching.done(format!("{} added", added.added.len())),
+        Ok(None) => fetching.done("this version's preparer cannot add extras"),
         Err(e) => fetching.failed(e),
     }
     if !stopped() {
@@ -2852,12 +2937,16 @@ fn complete_assets_in(
                     .map_or(kind.as_str(), |(_, what)| what.as_str());
                 log(crate::i18n::trf(
                     "{version}: {what} not added: {error}",
-                    &[("version", tag), ("what", what), ("error", &error)],
+                    &[
+                        ("version", tag),
+                        ("what", what),
+                        ("error", &crate::launcher_log::safe_error(&error)),
+                    ],
                 ));
             }
         }
         Ok(None) => {}
-        Err(e) => log(format!("{tag}: {e}")),
+        Err(e) => log(format!("{tag}: {}", crate::launcher_log::safe_error(&e))),
     }
 }
 
@@ -3377,6 +3466,14 @@ fn finish_preparation_cancellable(
     stop: Option<&crate::native_mods::Cancellation>,
 ) -> Result<(), String> {
     Resources::prepare_cancellable(&resources_owner(tag), preparation, None, stop).map(drop)
+}
+
+fn finish_preparation_with_missing(
+    tag: &str,
+    preparation: &crate::preparer::Preparation,
+    missing: Option<crate::preparer::Extras>,
+) -> Result<(), String> {
+    Resources::prepare_with_missing(&resources_owner(tag), preparation, None, missing).map(drop)
 }
 
 /// Makes sure `jar` holds the server jar `manifest` names: one already cached whose sha1 is not
@@ -5148,23 +5245,8 @@ impl RuntimeGuard {
 pub use crate::run_leases::control::startup_cleanup;
 
 pub fn prepare_command(cmd: Command) -> Result<(Command, RuntimeGuard), String> {
-    prepare_runtime(cmd, None)
-}
-
-pub(crate) fn prepare_managed_command(
-    cmd: Command,
-    resources: &Path,
-) -> Result<(Command, RuntimeGuard), String> {
-    prepare_runtime(cmd, Some(resources))
-}
-
-fn prepare_runtime(
-    cmd: Command,
-    read_only_resources: Option<&Path>,
-) -> Result<(Command, RuntimeGuard), String> {
     crate::developer_offline::validate(&cmd)?;
-    let leases = crate::run_leases::shared(&cmd, read_only_resources)
-        .map_err(crate::native_mods::cache_error)?;
+    let leases = crate::run_leases::shared(&cmd).map_err(crate::native_mods::cache_error)?;
     #[cfg(windows)]
     let cmd = crate::windows_runtime::redirect(cmd);
     #[cfg(windows)]
@@ -5621,9 +5703,6 @@ pub struct Settings {
     pub language: Option<crate::i18n::Language>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_mod_grants: Vec<SourceModGrant>,
-    /// Managed cache limit in GiB (unset: 25; zero: no automatic cleanup). Player data isn't cache.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_limit_gib: Option<u64>,
     /// The accent picked under each launcher theme, by its id (`themes::TWILIGHT` for Twilight's
     /// own), so going back to a theme brings back its colour. A launcher older than this map
     /// drops it when it saves: the themes then only start from their own accents again.
@@ -8181,6 +8260,7 @@ pub fn {f}("
             .join("drafts")
             .join("dev-2026-11-27-ccccccc")
             .join("sunrise-linux-x86_64.tar.gz");
+        fs::create_dir_all(archive.parent().unwrap()).unwrap();
         let before = crate::launcher_log::since(0).0;
         let error = logged("Installing a private draft".into(), || {
             open_draft(&archive).map(drop)
@@ -8795,10 +8875,10 @@ esac"#
         complete_assets_in(&versions, "v1", folders, &log, None);
         assert_eq!(
             *lines.borrow(),
-            [
-                "Built-in packs ready",
-                "v1: The sounds not added: no sound index"
-            ]
+            [format!(
+                "v1: The sounds not added: {}",
+                crate::launcher_log::safe_error("no sound index")
+            )]
         );
         assert_eq!(asked.get(), 1, "one try per run");
         let calls = fs::read_to_string(root.join("extras-calls")).unwrap();
@@ -9292,6 +9372,685 @@ esac"#
             "stalled read should cancel promptly, took {elapsed:?}"
         );
         assert!(!dest.exists());
+    }
+
+    #[test]
+    fn reuse_prepared_skips_native_builds_without_creating_local_or_resealing_base() {
+        const CHILD: &str = "SUNRISE_REUSE_NATIVE_SKIP_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "backend::tests::reuse_prepared_skips_native_builds_without_creating_local_or_resealing_base",
+                ])
+                .env(CHILD, "1")
+                .env("SUNRISE_LAUNCHER_HOME", home.path().join("launcher"))
+                .env("SUNRISE_HOME", home.path().join("game"))
+                .env("XDG_DATA_HOME", home.path().join("xdg-data"))
+                .env("XDG_CONFIG_HOME", home.path().join("xdg-config"))
+                .env(
+                    "SUNRISE_LAUNCHER_LOCATION_FILE",
+                    home.path().join("location"),
+                )
+                .env("SUNRISE_LAUNCHER_TRASH", home.path().join("trash"))
+                .env("SUNRISE_LAUNCHER_CLIPBOARD", home.path().join("clipboard"))
+                .env("SUNRISE_LAUNCHER_DESKTOP", home.path().join("desktop"))
+                .env("SUNRISE_LAUNCHER_NO_SELF_UPDATE", "1")
+                .env("SUNRISE_NO_AUDIO", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let versions = versions_dir();
+        let base = "dev-2026-11-26-ba1f24e";
+        let native = "native-aaaaaaaaaaaa-fixture";
+        let write = |tag: &str, path: &str, text: &str| {
+            let path = versions.join(tag).join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        };
+        let lock = r#"{"minecraft":{"version":"26.3","client_sha1":"c","server_sha1":"s"}}"#;
+        let seed_common = |tag: &str| {
+            write(tag, COMPLETE, "");
+            write(tag, "research-lock.json", lock);
+            write(tag, "crates/sunrise-prepare/Cargo.toml", "[package]");
+            write(tag, "crates/sunrise-prepare/build.rs", "fn main() {}");
+            write(
+                tag,
+                "crates/sunrise-prepare/src/lib.rs",
+                "pub const OUTPUT_VERSION: u32 = 1;\n",
+            );
+        };
+
+        seed_common(base);
+        write(
+            base,
+            &format!(".local/sunrise-client/26.3/{RESOURCES_MANIFEST}"),
+            "{}",
+        );
+        write(
+            base,
+            &format!(".local/sunrise-client/26.3/{PREPARATION_STAMP}"),
+            r#"{"output_version":1}"#,
+        );
+        for report in RUNTIME_REPORTS {
+            write(base, &format!(".local/sunrise-client/26.3/{report}"), "{}");
+        }
+        {
+            let preparation = prepare_lock(base).unwrap();
+            crate::managed_play::Resources::prepare(base, &preparation, None).unwrap();
+        }
+        let receipt = version_dir(base).join(".local/launcher-prepared/current.json");
+        let receipt_bytes = fs::read(&receipt).unwrap();
+        let old_mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&receipt)
+            .unwrap()
+            .set_modified(old_mtime)
+            .unwrap();
+        let stamped_mtime = fs::metadata(&receipt).unwrap().modified().unwrap();
+
+        // Native client build shares the base's resources (`copy_base` copies research-lock.json and
+        // sunrise-prepare sources but omits `.local`).
+        seed_common(native);
+        write(
+            native,
+            crate::native_mods::RECORD,
+            &serde_json::json!({
+                "base": base,
+                "sunrise": "a".repeat(40),
+                "target": "client",
+                "mods": [],
+            })
+            .to_string(),
+        );
+
+        let before = (crate::storage::walks(), crate::storage::entries_calls());
+        let reused = reuse_prepared_everywhere();
+        assert!(reused.is_empty(), "{reused:?}");
+        assert!(
+            !version_dir(native).join(".local").exists(),
+            "reuse_prepared_everywhere must not copy .local into a native build"
+        );
+        assert_eq!(fs::read(&receipt).unwrap(), receipt_bytes);
+        assert_eq!(
+            fs::metadata(&receipt).unwrap().modified().unwrap(),
+            stamped_mtime,
+            "sealed base must not be re-sealed"
+        );
+        assert_eq!(
+            (crate::storage::walks(), crate::storage::entries_calls()),
+            before,
+            "desktop startup must perform zero storage tree walks"
+        );
+
+        // A native build that still carries a leftover `.local` from an older launcher is never used
+        // as a donor for an unprepared base either.
+        let donor_root = tempfile::tempdir().unwrap();
+        let donor_versions = donor_root.path();
+        let write_at = |tag: &str, path: &str, text: &str| {
+            let path = donor_versions.join(tag).join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        };
+        for tag in [native, "dev-2026-11-27-target"] {
+            write_at(tag, COMPLETE, "");
+            write_at(tag, "research-lock.json", lock);
+            write_at(tag, "crates/sunrise-prepare/Cargo.toml", "[package]");
+            write_at(tag, "crates/sunrise-prepare/build.rs", "fn main() {}");
+            write_at(
+                tag,
+                "crates/sunrise-prepare/src/lib.rs",
+                "pub const OUTPUT_VERSION: u32 = 1;\n",
+            );
+        }
+        write_at(
+            native,
+            crate::native_mods::RECORD,
+            &serde_json::json!({
+                "base": base,
+                "sunrise": "a".repeat(40),
+                "target": "client",
+                "mods": [],
+            })
+            .to_string(),
+        );
+        write_at(
+            native,
+            &format!(".local/sunrise-client/26.3/{RESOURCES_MANIFEST}"),
+            "{}",
+        );
+        write_at(
+            native,
+            &format!(".local/sunrise-client/26.3/{PREPARATION_STAMP}"),
+            r#"{"output_version":1}"#,
+        );
+        assert_eq!(
+            reuse_prepared(donor_versions, "dev-2026-11-27-target"),
+            None
+        );
+        assert!(reuse_prepared_in(donor_versions).is_empty());
+
+        // Runtime-report repair also skips resource-borrowing native builds even if they carry
+        // leftover `.local` files or datagen reports.
+        let report_target = "dev-2026-11-27-report-target";
+        write_at(report_target, COMPLETE, "");
+        write_at(report_target, "research-lock.json", lock);
+        write_at(
+            report_target,
+            &format!(".local/sunrise-client/26.3/{RESOURCES_MANIFEST}"),
+            "{}",
+        );
+        write_at(
+            report_target,
+            ".local/sunrise-client/26.3/registries.json",
+            "{}",
+        );
+        write_at(
+            native,
+            ".local/sunrise-client/26.3/commands.json",
+            r#"{"from":"native"}"#,
+        );
+        write_at(
+            native,
+            ".local/datagen/out/reports/commands.json",
+            r#"{"from":"native-datagen"}"#,
+        );
+        assert!(!complete_reports(donor_versions, report_target));
+        assert!(
+            !donor_versions
+                .join(report_target)
+                .join(".local/sunrise-client/26.3/commands.json")
+                .exists(),
+            "complete_reports must not read reports from a resource-borrowing native build"
+        );
+    }
+
+    #[test]
+    fn startup_does_not_lock_or_write_a_complete_base_even_while_preparing_lock_is_held() {
+        const CHILD: &str = "SUNRISE_STARTUP_LOCKED_BASE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "backend::tests::startup_does_not_lock_or_write_a_complete_base_even_while_preparing_lock_is_held",
+                ])
+                .env(CHILD, "1")
+                .env("SUNRISE_LAUNCHER_HOME", home.path().join("launcher"))
+                .env("SUNRISE_HOME", home.path().join("game"))
+                .env("XDG_DATA_HOME", home.path().join("xdg-data"))
+                .env("XDG_CONFIG_HOME", home.path().join("xdg-config"))
+                .env(
+                    "SUNRISE_LAUNCHER_LOCATION_FILE",
+                    home.path().join("location"),
+                )
+                .env("SUNRISE_LAUNCHER_TRASH", home.path().join("trash"))
+                .env("SUNRISE_LAUNCHER_CLIPBOARD", home.path().join("clipboard"))
+                .env("SUNRISE_LAUNCHER_DESKTOP", home.path().join("desktop"))
+                .env("SUNRISE_LAUNCHER_NO_SELF_UPDATE", "1")
+                .env("SUNRISE_NO_AUDIO", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let base = "dev-2026-11-26-ba1f24e";
+        let dir = version_dir(base);
+        let write = |path: &str, text: &str| {
+            let path = dir.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        };
+        write(COMPLETE, "");
+        write(
+            "research-lock.json",
+            r#"{"minecraft":{"version":"26.3","client_sha1":"c","server_sha1":"s"}}"#,
+        );
+        write("crates/sunrise-prepare/Cargo.toml", "[package]");
+        write("crates/sunrise-prepare/build.rs", "fn main() {}");
+        write(
+            "crates/sunrise-prepare/src/lib.rs",
+            "pub const OUTPUT_VERSION: u32 = 1;\n",
+        );
+        write(
+            &format!(".local/sunrise-client/26.3/{RESOURCES_MANIFEST}"),
+            "{}",
+        );
+        write(
+            &format!(".local/sunrise-client/26.3/{PREPARATION_STAMP}"),
+            r#"{"output_version":1}"#,
+        );
+        for report in RUNTIME_REPORTS {
+            write(&format!(".local/sunrise-client/26.3/{report}"), "{}");
+        }
+        {
+            let preparation = prepare_lock(base).unwrap();
+            crate::managed_play::Resources::prepare(base, &preparation, None).unwrap();
+        }
+        let receipt = dir.join(".local/launcher-prepared/current.json");
+        let receipt_bytes = fs::read(&receipt).unwrap();
+        let old_mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&receipt)
+            .unwrap()
+            .set_modified(old_mtime)
+            .unwrap();
+        let stamped_mtime = fs::metadata(&receipt).unwrap().modified().unwrap();
+
+        #[cfg(unix)]
+        let (probe_log, mutated_marker) = {
+            use std::os::unix::fs::PermissionsExt;
+            let probe_log = data_dir().join("probe.log");
+            let mutated = data_dir().join("mutated");
+            let binary = dir.join(crate::preparer::BINARY);
+            fs::write(
+                &binary,
+                format!(
+                    "#!/bin/sh\nset -eu\ncmd=$1\nprintf '%s\\n' \"$cmd\" >> \"{}\"\nif [ \"$cmd\" = missing-extras ]; then\n  printf '%s\\n' '{{\"format\":1,\"missing\":[]}}'\nelse\n  : > \"{}\"\n  exit 2\nfi\n",
+                    probe_log.display(),
+                    mutated.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+            (probe_log, mutated)
+        };
+
+        let held = prepare_lock(base).unwrap();
+        let before = (crate::storage::walks(), crate::storage::entries_calls());
+        let reused = reuse_prepared_everywhere();
+        assert!(reused.is_empty(), "{reused:?}");
+        assert_eq!(fs::read(&receipt).unwrap(), receipt_bytes);
+        assert_eq!(
+            fs::metadata(&receipt).unwrap().modified().unwrap(),
+            stamped_mtime
+        );
+        assert_eq!(
+            (crate::storage::walks(), crate::storage::entries_calls()),
+            before
+        );
+        #[cfg(unix)]
+        {
+            assert!(
+                !mutated_marker.exists(),
+                "startup ran a mutating preparer step"
+            );
+            assert_eq!(
+                fs::read_to_string(&probe_log)
+                    .unwrap()
+                    .lines()
+                    .collect::<Vec<_>>(),
+                ["missing-extras"],
+                "Pass 2 should probe missing-extras once, unlocked"
+            );
+        }
+        // need_prepared keeps its non-blocking probe while a real writer holds .preparing.lock.
+        let error = need_prepared(base).unwrap_err();
+        assert!(error.contains("already being prepared"), "{error}");
+        drop(held);
+        need_prepared(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_probes_missing_extras_once_even_when_repair_runs() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "SUNRISE_STARTUP_REPAIR_PROBE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "backend::tests::startup_probes_missing_extras_once_even_when_repair_runs",
+                ])
+                .env(CHILD, "1")
+                .env("SUNRISE_LAUNCHER_HOME", home.path().join("launcher"))
+                .env("SUNRISE_HOME", home.path().join("game"))
+                .env("XDG_DATA_HOME", home.path().join("xdg-data"))
+                .env("XDG_CONFIG_HOME", home.path().join("xdg-config"))
+                .env(
+                    "SUNRISE_LAUNCHER_LOCATION_FILE",
+                    home.path().join("location"),
+                )
+                .env("SUNRISE_LAUNCHER_TRASH", home.path().join("trash"))
+                .env("SUNRISE_LAUNCHER_CLIPBOARD", home.path().join("clipboard"))
+                .env("SUNRISE_LAUNCHER_DESKTOP", home.path().join("desktop"))
+                .env("SUNRISE_LAUNCHER_NO_SELF_UPDATE", "1")
+                .env("SUNRISE_NO_AUDIO", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let direct = "dev-2026-11-26-direct";
+        let reused_target = "dev-2026-11-27-reused";
+        let lock = r#"{"minecraft":{"version":"26.3","client_sha1":"c","server_sha1":"s"}}"#;
+        let write = |tag: &str, path: &str, text: &str| {
+            let path = version_dir(tag).join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        };
+        let install_preparer = |tag: &str, log_path: &Path| {
+            let binary = version_dir(tag).join(crate::preparer::BINARY);
+            fs::write(
+                &binary,
+                format!(
+                    "#!/bin/sh\nset -eu\ncmd=$1\nprintf '%s\\n' \"$cmd\" >> \"{}\"\ncase \"$cmd\" in\n  missing-extras) printf '%s\\n' '{{\"format\":1,\"missing\":[{{\"kind\":\"sounds\",\"what\":\"sounds\"}}]}}';;\n  extras) printf '%s\\n' '{{\"format\":1,\"added\":[\"sounds\"]}}';;\n  data-file) printf '%s\\n' '{{\"format\":1,\"written\":false}}';;\n  *) exit 2;;\nesac\n",
+                    log_path.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        for tag in [direct, reused_target] {
+            write(tag, COMPLETE, "");
+            write(tag, "research-lock.json", lock);
+            write(tag, "crates/sunrise-prepare/Cargo.toml", "[package]");
+            write(tag, "crates/sunrise-prepare/build.rs", "fn main() {}");
+            write(
+                tag,
+                "crates/sunrise-prepare/src/lib.rs",
+                "pub const OUTPUT_VERSION: u32 = 1;\n",
+            );
+        }
+        write(
+            direct,
+            &format!(".local/sunrise-client/26.3/{RESOURCES_MANIFEST}"),
+            "{}",
+        );
+        write(
+            direct,
+            &format!(".local/sunrise-client/26.3/{PREPARATION_STAMP}"),
+            r#"{"output_version":1}"#,
+        );
+        for report in RUNTIME_REPORTS {
+            write(
+                direct,
+                &format!(".local/sunrise-client/26.3/{report}"),
+                "{}",
+            );
+        }
+        let direct_log = data_dir().join("direct.log");
+        let reused_log = data_dir().join("reused.log");
+        install_preparer(direct, &direct_log);
+        install_preparer(reused_target, &reused_log);
+
+        let reused = reuse_prepared_everywhere();
+        assert_eq!(reused, [(reused_target.to_string(), direct.to_string())]);
+        assert_eq!(
+            fs::read_to_string(&direct_log)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["missing-extras", "extras"],
+            "direct repair must feed the unlocked missing-extras probe without probing again under lock"
+        );
+        assert_eq!(
+            fs::read_to_string(&reused_log)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["missing-extras", "extras", "data-file"],
+            "finish_preparation must feed the unlocked missing-extras probe without probing again under lock"
+        );
+    }
+
+    /// A preparer reply whose error message, progress message, or stderr names a local path keeps
+    /// that path out of the on-disk `launcher.log`, stderr, and an active switch operation's log
+    /// while still reporting the categorized failure (review of #615).
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_preparer_reply_logs_no_path_in_the_switch_log() {
+        use std::os::unix::fs::PermissionsExt;
+        const SECRET_WORDS: &[&str] = &[
+            "Private",
+            "Client",
+            "Backup",
+            "drafts",
+            "secret.jar",
+            "data.bin",
+            "msg.txt",
+            "stderr.log",
+            "sounds.json",
+            "extras.err",
+            "extras.out",
+        ];
+        let Some(root) = std::env::var_os("PREPARER_ERROR_LOG_ROOT") else {
+            let root = tempfile::tempdir().unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "backend::tests::a_failed_preparer_reply_logs_no_path_in_the_switch_log",
+                    "--nocapture",
+                ])
+                .env("PREPARER_ERROR_LOG_ROOT", root.path())
+                .env("SUNRISE_LAUNCHER_HOME", root.path())
+                .env("SUNRISE_HOME", root.path().join("home"))
+                .env("XDG_DATA_HOME", root.path().join("xdg-data"))
+                .env("XDG_CONFIG_HOME", root.path().join("xdg-config"))
+                .env("SUNRISE_LAUNCHER_NO_SELF_UPDATE", "1")
+                .env("SUNRISE_NO_AUDIO", "1")
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "child failed:\nstdout:\n{}\nstderr:\n{stderr}",
+                String::from_utf8_lossy(&output.stdout),
+            );
+            for expected in [
+                "(os error 2)",
+                "(os error 13)",
+                "(os error 5)",
+                "(os error 28)",
+                "v-invalidate:",
+            ] {
+                assert!(
+                    stderr.contains(expected),
+                    "stderr missing categorized failure {expected}: {stderr}"
+                );
+            }
+            for word in SECRET_WORDS {
+                assert!(!stderr.contains(word), "{word} leaked to stderr: {stderr}");
+            }
+            let disk_log = fs::read_to_string(root.path().join("logs/launcher.log")).unwrap();
+            for expected in [
+                "Checking game files: failed after",
+                "(os error 2)",
+                "Packing game data cache: failed after",
+                "(os error 13)",
+                "v-extras-partial: The sounds not added:",
+                "(os error 5)",
+                "Fetching missing game files (sounds): failed after",
+                "(os error 28)",
+                "v-invalidate:",
+            ] {
+                assert!(
+                    disk_log.contains(expected),
+                    "launcher.log missing {expected}: {disk_log}"
+                );
+            }
+            for word in SECRET_WORDS {
+                assert!(
+                    !disk_log.contains(word),
+                    "{word} leaked to launcher.log: {disk_log}"
+                );
+            }
+            return;
+        };
+        let root = PathBuf::from(root);
+        crate::launcher_log::init(&root.join("logs"));
+        let make_version = |tag: &str, script: &str| {
+            let version = root.join("versions").join(tag);
+            let resources = version.join(".local/sunrise-client/26.3");
+            fs::create_dir_all(&resources).unwrap();
+            fs::write(
+                version.join("research-lock.json"),
+                r#"{"minecraft":{"version":"26.3"}}"#,
+            )
+            .unwrap();
+            fs::write(version.join(COMPLETE), "").unwrap();
+            fs::write(resources.join(RESOURCES_MANIFEST), "{}").unwrap();
+            let preparer = version.join("sunrise-prepare");
+            fs::write(&preparer, format!("#!/bin/sh\n{script}\n")).unwrap();
+            fs::set_permissions(&preparer, fs::Permissions::from_mode(0o700)).unwrap();
+            version
+        };
+        let lacking =
+            r#"{"format":1,"prepared":true,"missing":[{"kind":"sounds","what":"The sounds"}]}"#;
+        make_version(
+            "v-missing",
+            concat!(
+                "case \"$1\" in\n",
+                "  missing-extras) printf '%s\\n' '{\"format\":1,\"error\":{\"message\":\"could not open /home/ada/Private Client Backup/drafts/secret.jar (os error 2)\"}}'; exit 1;;\n",
+                "  data-file) printf '%s\\n' '{\"format\":1,\"error\":{\"message\":\"could not write /home/ada/Private Client Backup/drafts/data.bin (os error 13)\"}}'; exit 1;;\n",
+                "  *) exit 2;;\n",
+                "esac",
+            ),
+        );
+        make_version(
+            "v-extras-partial",
+            &format!(
+                concat!(
+                    "case \"$1\" in\n",
+                    "  missing-extras) printf '%s\\n' '{lacking}';;\n",
+                    "  extras)\n",
+                    "    printf '%s\\n' '{{\"message\":\"could not inspect /home/ada/Private Client Backup/drafts/msg.txt (os error 1)\"}}'\n",
+                    "    printf '%s\\n' 'failed reading /home/ada/Private Client Backup/drafts/stderr.log (os error 22)' >&2\n",
+                    "    printf '%s\\n' '{{\"format\":1,\"added\":[],\"failed\":[{{\"kind\":\"sounds\",\"error\":\"could not read /home/ada/Private Client Backup/drafts/sounds.json (os error 5)\"}}],\"missing\":[{{\"kind\":\"sounds\",\"what\":\"The sounds\"}}]}}'\n",
+                    "    exit 1;;\n",
+                    "  data-file) printf '%s\\n' '{{\"format\":1,\"written\":false}}';;\n",
+                    "  *) exit 2;;\n",
+                    "esac",
+                ),
+                lacking = lacking,
+            ),
+        );
+        make_version(
+            "v-extras-err",
+            &format!(
+                concat!(
+                    "case \"$1\" in\n",
+                    "  missing-extras) printf '%s\\n' '{lacking}';;\n",
+                    "  extras)\n",
+                    "    printf '%s\\n' 'failed in /home/ada/Private Client Backup/drafts/extras.err (os error 17)' >&2\n",
+                    "    printf '%s\\n' '{{\"format\":1,\"error\":{{\"message\":\"could not write /home/ada/Private Client Backup/drafts/extras.out (os error 28)\"}}}}'\n",
+                    "    exit 1;;\n",
+                    "  data-file) printf '%s\\n' '{{\"format\":1,\"written\":false}}';;\n",
+                    "  *) exit 2;;\n",
+                    "esac",
+                ),
+                lacking = lacking,
+            ),
+        );
+        let invalidate = make_version(
+            "v-invalidate",
+            &format!(
+                concat!(
+                    "case \"$1\" in\n",
+                    "  missing-extras) printf '%s\\n' '{lacking}';;\n",
+                    "  *) exit 2;;\n",
+                    "esac",
+                ),
+                lacking = lacking,
+            ),
+        );
+        fs::create_dir_all(invalidate.join(".local/launcher-prepared/current.json")).unwrap();
+
+        let op = crate::launcher_log::Operation::new(|_| {});
+        let _guard = op.enter();
+        let before = crate::launcher_log::since(0).0;
+        for tag in ["v-missing", "v-extras-partial", "v-extras-err"] {
+            let preparation = prepare_lock(tag).unwrap();
+            Resources::prepare(tag, &preparation, None).unwrap();
+        }
+        let inv_lock = prepare_lock("v-invalidate").unwrap();
+        complete_assets_staged("v-invalidate", &inv_lock.handoff(None));
+
+        let (_, mine) = crate::launcher_log::since_in(before, op.id());
+        for expected in [
+            ("Checking game files: failed after", "(os error 2)"),
+            ("v-missing:", "(os error 2)"),
+            ("Packing game data cache: failed after", "(os error 13)"),
+            ("v-extras-partial: The sounds not added:", "(os error 5)"),
+            (
+                "Fetching missing game files (sounds): failed after",
+                "(os error 28)",
+            ),
+            ("v-extras-err:", "(os error 28)"),
+            ("v-invalidate:", "(os error "),
+        ] {
+            assert!(
+                mine.iter()
+                    .any(|line| line.contains(expected.0) && line.contains(expected.1)),
+                "switch log missing {expected:?}: {mine:?}"
+            );
+        }
+        for word in SECRET_WORDS {
+            assert!(
+                mine.iter().all(|line| !line.contains(word)),
+                "{word} leaked to switch log: {mine:?}"
+            );
+        }
+    }
+
+    /// Cancelling a local draft archive copy mid-read returns `native_mods::CANCELLED` (so a
+    /// switch closes quietly), while an unrelated read failure with a cancel pending keeps its own
+    /// read error instead of being hidden (review of #615).
+    #[test]
+    fn cancelling_a_local_draft_copy_mid_read_preserves_cancel_without_hiding_read_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("draft.tar.gz");
+        let dst = dir.path().join("out.tar.gz");
+        let payload = vec![b'a'; 256 * 1024];
+        fs::write(&src, &payload).unwrap();
+
+        let stop = crate::native_mods::Cancellation::default();
+        let file = fs::File::open(&src).unwrap();
+        let error = save_checked(
+            stop.reader(file),
+            payload.len() as u64,
+            "draft.tar.gz",
+            "0".repeat(64).as_str(),
+            &dst,
+            &|_| stop.stop(),
+        )
+        .unwrap_err();
+        assert_eq!(String::from(error), crate::native_mods::CANCELLED);
+        assert!(!dst.exists(), "cancelled copy must not publish destination");
+
+        // An unrelated read error that arrives while a cancel is also set keeps its own error.
+        struct FailingReader(crate::native_mods::Cancellation);
+        impl std::io::Read for FailingReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0.stop();
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "disk read failed",
+                ))
+            }
+        }
+        let stop = crate::native_mods::Cancellation::default();
+        let error = save_checked(
+            stop.reader(FailingReader(stop.clone())),
+            payload.len() as u64,
+            "draft.tar.gz",
+            "0".repeat(64).as_str(),
+            &dst,
+            &|_| {},
+        )
+        .unwrap_err();
+        let text = String::from(error);
+        assert_ne!(text, crate::native_mods::CANCELLED);
+        assert!(text.contains("disk read failed"), "{text}");
     }
 }
 
