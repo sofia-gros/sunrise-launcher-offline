@@ -35,7 +35,7 @@ impl From<io::Error> for Error {
 
 pub(crate) struct Cache {
     root: PathBuf,
-    _directory: Dir,
+    directory: Dir,
     _lease: Locked,
 }
 
@@ -193,7 +193,7 @@ impl Cache {
         let lease = lock(&root.join(".build.lock"))?;
         Ok(Self {
             root,
-            _directory: directory,
+            directory,
             _lease: lease,
         })
     }
@@ -247,7 +247,13 @@ impl Cache {
     /// [`Self::work_slot`] after removing what the slot held: the one cold build a slot that
     /// failed gets.
     pub(crate) fn fresh_work_slot(&self, slot: &str) -> Result<Provisioned, Error> {
-        remove(&self.root.join(WORK).join(single(slot)?))?;
+        let work = self.root.join(WORK);
+        let leaf = single(slot)?;
+        // A completed compiler could have changed this parent since the slot was attached.
+        // Check it from the held native directory before inspecting the slot by path.
+        let _parent = self.directory.open_dir_nofollow(WORK)?;
+        self.unchanged_path(&work)?;
+        remove(&work.join(leaf))?;
         self.work_slot(slot)
     }
 

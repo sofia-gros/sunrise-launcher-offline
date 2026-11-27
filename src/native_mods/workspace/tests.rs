@@ -784,6 +784,28 @@ fn a_failed_kept_slot_is_emptied_and_built_cold_once_after_a_proved_stop() {
     assert!(stage.work().join("partial").is_file());
 }
 
+#[cfg(unix)]
+#[test]
+fn cold_retry_refuses_a_redirected_slot_parent() {
+    let (dir, lease, build) = leased();
+    let native = build.join("native");
+    let key = key(crate::native_mods::Target::Client);
+    let mut stage = Workspace::new(&native).unwrap();
+    assert!(stage.attach(&lease, key.clone()).unwrap());
+    fs::write(stage.work().join("warm"), b"old output").unwrap();
+    assert!(stage.attach(&lease, key.clone()).unwrap());
+
+    let outside = dir.path().join("outside");
+    let matching = outside.join(key.as_str());
+    fs::create_dir_all(&matching).unwrap();
+    let canary = matching.join("canary");
+    fs::write(&canary, b"untouched").unwrap();
+    fs::rename(native.join("w"), native.join("original-work")).unwrap();
+    std::os::unix::fs::symlink(&outside, native.join("w")).unwrap();
+    assert!(stage.retry_cold(&lease).is_err());
+    assert_eq!(fs::read(&canary).unwrap(), b"untouched");
+}
+
 #[test]
 fn an_unproved_exit_skips_the_slot_in_memory_only_until_the_next_start() {
     let (_dir, lease, build) = leased();
