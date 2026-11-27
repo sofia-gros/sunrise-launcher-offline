@@ -298,7 +298,11 @@ impl GameDownload {
             tag,
             proof,
             InstallIntent::Exact,
-            progress,
+            |phase| {
+                if let InstallPhase::Downloading(fraction) = phase {
+                    progress(fraction);
+                }
+            },
             crate::signed::asset_url,
         )?;
         if let Some(warning) = outcome.receipt_warning() {
@@ -320,7 +324,7 @@ impl GameDownload {
         tag: &str,
         proof: &GameProof,
         stop: Option<&crate::native_mods::Cancellation>,
-        progress: impl Fn(f32),
+        progress: impl Fn(InstallPhase),
     ) -> Result<InstallOutcome, String> {
         self.publish_cancellable(
             tag,
@@ -351,7 +355,7 @@ impl GameDownload {
         tag: &str,
         proof: &GameProof,
         intent: InstallIntent,
-        progress: impl Fn(f32),
+        progress: impl Fn(InstallPhase),
         asset_url: impl Fn(&str, &str) -> String,
     ) -> Result<InstallOutcome, String> {
         self.publish_cancellable(tag, proof, intent, None, progress, asset_url)
@@ -363,7 +367,7 @@ impl GameDownload {
         proof: &GameProof,
         intent: InstallIntent,
         stop: Option<&crate::native_mods::Cancellation>,
-        progress: impl Fn(f32),
+        progress: impl Fn(InstallPhase),
         asset_url: impl Fn(&str, &str) -> String,
     ) -> Result<InstallOutcome, String> {
         self.publish_with(
@@ -384,7 +388,7 @@ impl GameDownload {
         tag: &str,
         proof: &GameProof,
         intent: InstallIntent,
-        transfer: super::Transfer<'_, impl Fn(f32)>,
+        transfer: super::Transfer<'_, impl Fn(InstallPhase)>,
         asset_url: impl Fn(&str, &str) -> String,
         (base, keys): (&Base, &[PublicKey]),
     ) -> Result<InstallOutcome, String> {
@@ -395,7 +399,6 @@ impl GameDownload {
         // A saved binding can reuse an archive regardless of which preference previously
         // installed it. Repair is explicit: it must also prove the new request marker.
         if intent == InstallIntent::Exact && self.is_installed(tag, proof) {
-            progress(1.0);
             return Ok(InstallOutcome::AlreadyInstalled(None));
         }
         let home = version_dir(tag);
@@ -419,6 +422,7 @@ impl GameDownload {
                     InstallOutcome::AlreadyInstalled(None)
                 } else {
                     let retry = crate::nightly::failed_install_receipt(&versions, tag);
+                    progress(InstallPhase::Finishing);
                     let warning = super::save_nightly_receipt(&versions, tag)
                         .map(|failure| self.receipt_warning(tag, proof, failure));
                     if retry {
@@ -427,7 +431,6 @@ impl GameDownload {
                         InstallOutcome::AlreadyInstalled(warning)
                     }
                 };
-                progress(1.0);
                 return Ok(outcome);
             }
         }
@@ -457,7 +460,6 @@ impl GameDownload {
                 tag,
                 intent,
                 stop,
-                &progress,
                 |target| self.installed_at(target, tag, proof, intent).is_ok(),
                 |stage| {
                     if let Some(stop) = stop {
@@ -485,7 +487,7 @@ impl GameDownload {
                         ),
                         other => other.to_string(),
                     })?;
-                    progress(0.97);
+                    progress(InstallPhase::Finishing);
                     super::finish_image(&top, self.architecture(), Some((&facts, facts_sha)))?;
                     Artifact::record_sdk(&top, tag, slices)?;
                     Ok(top)
@@ -892,12 +894,13 @@ mod tests {
 
                 fs::remove_dir_all(&receipt).unwrap();
                 fs::write(&receipt, "nightly-2026-11-20-bbbbbbb").unwrap();
+                let phases = std::cell::RefCell::new(Vec::new());
                 let retry = download
                     .publish(
                         ROLLING,
                         &proof,
                         InstallIntent::Repair,
-                        |_| {},
+                        |phase| phases.borrow_mut().push(phase),
                         |_, _| panic!("receipt retry must not request any assets"),
                     )
                     .unwrap();
@@ -905,6 +908,7 @@ mod tests {
                     matches!(retry, InstallOutcome::ReceiptOnly(None)),
                     "{retry:?}"
                 );
+                assert_eq!(phases.into_inner(), [InstallPhase::Finishing]);
                 assert_eq!(fs::read_to_string(&receipt).unwrap(), ROLLING);
                 assert!(!crate::nightly::failed_install_receipt(&versions, ROLLING));
                 // Exercise the Storage action with no release lookup.

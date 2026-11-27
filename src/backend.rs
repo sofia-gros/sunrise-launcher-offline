@@ -1430,7 +1430,9 @@ pub(crate) fn download(
     to: &Path,
     progress: &impl Fn(f32),
 ) -> Result<(), String> {
-    download_cancellable(url, size, sha256, to, None, progress)
+    download_cancellable(url, size, sha256, to, None, &|done, total| {
+        progress((done as f32 / total.max(1) as f32).min(1.0) * 0.9);
+    })
 }
 
 /// A draft release's file: its error names the whole path, for the window's error view.
@@ -1444,7 +1446,7 @@ pub(crate) fn download_cancellable(
     sha256: &str,
     to: &Path,
     stop: Option<&crate::native_mods::Cancellation>,
-    progress: &impl Fn(f32),
+    progress: &impl Fn(u64, u64),
 ) -> Result<(), String> {
     if let Some(path) = crate::draft_releases::local(url)? {
         if let Some(stop) = stop {
@@ -1454,8 +1456,8 @@ pub(crate) fn download_cancellable(
         let size = file.metadata().map_or(size, |meta| meta.len());
         let name = url.rsplit('/').next().unwrap_or(url);
         let saved = match stop {
-            Some(stop) => save_checked(stop.reader(file), size, name, sha256, to, progress),
-            None => save_checked(file, size, name, sha256, to, progress),
+            Some(stop) => save_checked_bytes(stop.reader(file), size, name, sha256, to, &|_, _| {}),
+            None => save_checked_bytes(file, size, name, sha256, to, &|_, _| {}),
         };
         return saved.map_err(Into::into);
     }
@@ -1469,7 +1471,7 @@ pub(crate) fn download_cancellable(
             n => n,
         };
         let name = url.rsplit('/').next().unwrap_or(url);
-        return save_checked(response.into_reader(), size, name, sha256, to, progress)
+        return save_checked_bytes(response.into_reader(), size, name, sha256, to, progress)
             .map_err(Into::into);
     };
     stop.check()?;
@@ -1567,7 +1569,7 @@ pub(crate) fn download_cancellable(
         buf: Vec::new(),
         pos: 0,
     };
-    if let Err(error) = save_checked(reader, size, name, sha256, to, progress) {
+    if let Err(error) = save_checked_bytes(reader, size, name, sha256, to, progress) {
         stop.check()?;
         return Err(error.into());
     }
@@ -1599,6 +1601,19 @@ pub(crate) fn save_checked(
     to: &Path,
     progress: &impl Fn(f32),
 ) -> Result<(), SaveCheckedError> {
+    save_checked_bytes(reader, size, name, sha256, to, &|done, total| {
+        progress((done as f32 / total.max(1) as f32).min(1.0) * 0.9);
+    })
+}
+
+pub(crate) fn save_checked_bytes(
+    reader: impl Read,
+    size: u64,
+    name: &str,
+    sha256: &str,
+    to: &Path,
+    progress: &impl Fn(u64, u64),
+) -> Result<(), SaveCheckedError> {
     let mut temp = to.as_os_str().to_owned();
     temp.push(format!(".part-{}", std::process::id()));
     let temp = PathBuf::from(temp);
@@ -1616,7 +1631,7 @@ fn write_checked(
     name: &str,
     sha256: &str,
     to: &Path,
-    progress: &impl Fn(f32),
+    progress: &impl Fn(u64, u64),
 ) -> Result<(), SaveCheckedError> {
     let mut file = fs::File::create(to).map_err(SaveCheckedError::Local)?;
     let mut hash = sunrise_launcher_release_verify::Sha256::default();
@@ -1635,7 +1650,7 @@ fn write_checked(
         hash.update(&buf[..n]);
         file.write_all(&buf[..n]).map_err(SaveCheckedError::Local)?;
         done += n as u64;
-        progress((done as f32 / size.max(1) as f32).min(1.0) * 0.9);
+        progress(done, size);
     }
     sunrise_launcher_release_verify::check(name, sha256, &hash.hex())
         .map_err(SaveCheckedError::Download)
@@ -1700,20 +1715,35 @@ impl std::io::Seek for CancellableFile<'_> {
 
 pub use installation::{InstallOutcome, NightlyReceiptWarning};
 
+/// What a game install is doing. Only archive bytes have a determinate fraction.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum InstallPhase {
+    Checking,
+    Downloading(f32),
+    Unpacking,
+    Finishing,
+    Preparing,
+}
+
 /// Installs one signed release or reuses its proved rolling Nightly image. Only a retry of
 /// a known receipt failure skips the normal post-install actions.
 pub fn install(release: &Release, progress: impl Fn(f32)) -> Result<InstallOutcome, String> {
-    install_cancellable(release, None, progress)
+    install_cancellable(release, None, |phase| {
+        if let InstallPhase::Downloading(fraction) = phase {
+            progress(fraction);
+        }
+    })
 }
 
 pub fn install_cancellable(
     release: &Release,
     stop: Option<&crate::native_mods::Cancellation>,
-    progress: impl Fn(f32),
+    progress: impl Fn(InstallPhase),
 ) -> Result<InstallOutcome, String> {
     if let Some(stop) = stop {
         stop.check()?;
     }
+    progress(InstallPhase::Checking);
     let tag = &release.tag;
     installation::recover_replacement(tag)?;
     let download = installation::GameDownload::select(release)?;
@@ -1721,12 +1751,12 @@ pub fn install_cancellable(
         download.prove_cancellable(tag, stop)
     })?;
     let outcome = logged(format!("Installing {tag}"), || {
-        download.repair_cancellable(tag, &proof, stop, progress)
+        download.repair_cancellable(tag, &proof, stop, &progress)
     })?;
     if matches!(outcome, InstallOutcome::Installed(_)) {
         // Preparation has its own admission. Never hold the cache publication lock here;
         // managed First Play instead prepares through its profile-owned staged handoff.
-        reuse_prepared_for_cancellable(tag, stop);
+        reuse_prepared_for_cancellable(tag, stop, progress);
         if let Some(stop) = stop {
             stop.check()?;
         }
@@ -2529,10 +2559,15 @@ fn reuse_prepared_cancellable(
 /// another installed version's resources if it has none, whatever its resources lack, then its
 /// data file.
 pub(crate) fn reuse_prepared_for(tag: &str) {
-    reuse_prepared_for_cancellable(tag, None);
+    reuse_prepared_for_cancellable(tag, None, |_| {});
 }
 
-fn reuse_prepared_for_cancellable(tag: &str, stop: Option<&crate::native_mods::Cancellation>) {
+fn reuse_prepared_for_cancellable(
+    tag: &str,
+    stop: Option<&crate::native_mods::Cancellation>,
+    progress: impl Fn(InstallPhase),
+) {
+    progress(InstallPhase::Preparing);
     reuse_prepared_within(tag, stop, DATA_FILE_DEADLINE);
 }
 
@@ -8330,7 +8365,12 @@ pub fn {f}("
         )
         .unwrap();
         fs::set_permissions(&preparer, fs::Permissions::from_mode(0o700)).unwrap();
-        reuse_prepared_for_cancellable(TAG, None);
+        let phases = std::cell::RefCell::new(Vec::new());
+        reuse_prepared_for_cancellable(TAG, None, |phase| {
+            assert!(!version.join("data-file-done").exists());
+            phases.borrow_mut().push(phase);
+        });
+        assert_eq!(phases.into_inner(), [InstallPhase::Preparing]);
         assert!(
             version.join("data-file-done").exists(),
             "the writer finished before the install returned"
@@ -8499,7 +8539,7 @@ pub fn {f}("
             later.stop();
         });
         let started = std::time::Instant::now();
-        reuse_prepared_for_cancellable(TAG, Some(&stop));
+        reuse_prepared_for_cancellable(TAG, Some(&stop), |_| {});
         let took = started.elapsed();
         canceller.join().unwrap();
         assert!(
@@ -8647,9 +8687,30 @@ pub fn {f}("
             "written for v2026.10.13",
         );
         release("v2026.10.13.1", "26.3");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let op = crate::launcher_log::Operation::new(move |detail| {
+            let _ = tx.send(detail);
+        });
+        let in_operation = op.enter();
         assert_eq!(
             reuse_prepared(&versions, "v2026.10.13.1"),
             Some("v2026.10.13".into())
+        );
+        drop(in_operation);
+        let details: Vec<_> = rx.try_iter().collect();
+        let counted = |done| {
+            crate::i18n::trf(
+                "Copying the prepared game files: {done} of {total}",
+                &[("done", done), ("total", "2")],
+            )
+        };
+        assert_eq!(
+            details,
+            [
+                crate::i18n::tr("Copying the prepared game files").to_owned(),
+                counted("1"),
+                counted("2"),
+            ]
         );
         assert!(is_prepared("v2026.10.13.1"));
         assert!(resources_at(&versions.join("v2026.10.13.1"))
@@ -9409,8 +9470,8 @@ esac"#
             &"0".repeat(64),
             &dest,
             Some(&stop),
-            &|fraction| {
-                if fraction > 0.0 {
+            &|done, _| {
+                if done > 0 {
                     stop_on_progress.stop();
                     let _ = release_on_progress.send(());
                 }
@@ -9519,7 +9580,7 @@ esac"#
             &"0".repeat(64),
             &dest,
             Some(&stop),
-            &|_| {},
+            &|_, _| {},
         );
         let elapsed = started.elapsed();
         stopper.join().unwrap();

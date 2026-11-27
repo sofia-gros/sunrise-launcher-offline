@@ -3228,8 +3228,8 @@ mod tests {
                 return result.map(|_| ());
             }
             let inventoried = std::cell::Cell::new(false);
-            install_as(&release, tag, &sha256, None, None, intent, |fraction| {
-                if fraction != 0.97 {
+            install_as(&release, tag, &sha256, None, None, intent, |phase| {
+                if phase != backend::InstallPhase::Finishing {
                     return;
                 }
                 let versions = backend::versions_dir();

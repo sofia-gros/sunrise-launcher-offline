@@ -168,7 +168,9 @@ fn first_play_proves_and_installs_the_two_sdk_slices() {
                 (names[1].as_str(), SLICES[1]),
             ];
             let game = version_dir(DEV);
+            let phases = std::cell::RefCell::new(Vec::new());
             let install = |files: &[(&str, &[u8])], sdk_rust: &str, tamper: bool| {
+                phases.borrow_mut().clear();
                 // A playable runtime does not need a matching launcher Rust toolchain.
                 let index = index_of(files, "1.0.0").to_json();
                 publish(
@@ -206,7 +208,7 @@ fn first_play_proves_and_installs_the_two_sdk_slices() {
                     InstallIntent::Exact,
                     crate::backend::installation::Transfer {
                         stop: None,
-                        progress: |_| {},
+                        progress: |phase| phases.borrow_mut().push(phase),
                     },
                     |_, _| unreachable!("SDK reads from the mirror"),
                     (&base, &keys),
@@ -238,6 +240,29 @@ fn first_play_proves_and_installs_the_two_sdk_slices() {
                 installed.unwrap(),
                 InstallOutcome::Installed(None)
             ));
+            assert_eq!(
+                *phases.borrow(),
+                [
+                    InstallPhase::Unpacking,
+                    InstallPhase::Unpacking,
+                    InstallPhase::Finishing
+                ],
+                "a local mirror extracts both slices without claiming a download"
+            );
+            let cached = download
+                .publish_with(
+                    DEV,
+                    &proof,
+                    InstallIntent::Exact,
+                    crate::backend::installation::Transfer {
+                        stop: None,
+                        progress: |phase| panic!("cache hit unexpectedly reported {phase:?}"),
+                    },
+                    |_, _| unreachable!("cache hit needs no assets"),
+                    (&base, &keys),
+                )
+                .unwrap();
+            assert!(matches!(cached, InstallOutcome::AlreadyInstalled(None)));
             assert!(download.is_installed(DEV, &proof));
             assert!(crate::managed_play::FirstBuild::installed(DEV).is_ok());
             let (library, std) = match std::env::consts::OS {
@@ -277,11 +302,85 @@ fn first_play_proves_and_installs_the_two_sdk_slices() {
                 .unwrap();
             assert!(native.join(crate::preparer::BINARY).is_file());
             assert!(!native.join(Artifact::SDK_RECEIPT).exists());
+            fs::remove_dir_all(&game).unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let remote = Base::Url(format!("http://{}", listener.local_addr().unwrap()));
+            let server = serve_sdk_files(listener, mirror);
+            let phases = std::cell::RefCell::new(Vec::new());
+            let installed = download
+                .publish_with(
+                    DEV,
+                    &proof,
+                    InstallIntent::Exact,
+                    crate::backend::installation::Transfer {
+                        stop: None,
+                        progress: |phase| phases.borrow_mut().push(phase),
+                    },
+                    |_, _| unreachable!("SDK reads from its base"),
+                    (&remote, &keys),
+                )
+                .unwrap();
+            assert!(matches!(installed, InstallOutcome::Installed(None)));
+            server.join().unwrap();
+            let phases = phases.into_inner();
+            let (finishing, transfers) = phases.split_last().unwrap();
+            assert_eq!(*finishing, InstallPhase::Finishing);
+            let slices_progress: Vec<_> =
+                transfers.split(|p| *p == InstallPhase::Unpacking).collect();
+            let [first, second, after_unpack] = slices_progress.as_slice() else {
+                panic!("expected two slice extractions: {phases:?}");
+            };
+            let total = (SLICES[0].len() + SLICES[1].len()) as f32;
+            let first_fraction = SLICES[0].len() as f32 / total;
+            assert_eq!(
+                first.last(),
+                Some(&InstallPhase::Downloading(first_fraction))
+            );
+            assert!(first.iter().all(
+                |p| matches!(p, InstallPhase::Downloading(f) if (0.0..=first_fraction).contains(f))
+            ));
+            assert_eq!(second.last(), Some(&InstallPhase::Downloading(1.0)));
+            assert!(second.iter().all(
+                |p| matches!(p, InstallPhase::Downloading(f) if (first_fraction..=1.0).contains(f))
+            ));
+            assert!(after_unpack.is_empty());
             fs::write(game.join(library), b"swapped library").unwrap();
             assert!(!download.is_installed(DEV, &proof));
             assert!(crate::managed_play::FirstBuild::installed(DEV).is_err());
         },
     );
+}
+
+fn serve_sdk_files(
+    listener: std::net::TcpListener,
+    mirror: PathBuf,
+) -> std::thread::JoinHandle<()> {
+    use std::io::{BufRead, BufReader, Write};
+    std::thread::spawn(move || {
+        // The game's index and facts, then the SDK's index, sums, signature and two slices.
+        for _ in 0..7 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            let mut reader = BufReader::new(&stream);
+            reader.read_line(&mut request).unwrap();
+            let path = request.split_whitespace().nth(1).unwrap();
+            let bytes = fs::read(mirror.join(path.strip_prefix('/').unwrap())).unwrap();
+            let mut header = String::new();
+            loop {
+                if reader.read_line(&mut header).unwrap() == 0 || header == "\r\n" {
+                    break;
+                }
+                header.clear();
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                bytes.len()
+            )
+            .unwrap();
+            stream.write_all(&bytes).unwrap();
+        }
+    })
 }
 
 #[test]
@@ -329,6 +428,7 @@ fn player_archive_still_installs_when_the_index_is_listed() {
                 })
                 .unwrap();
             let (url, server) = serve_archive(asset, bytes);
+            let phases = std::cell::RefCell::new(Vec::new());
             download
                 .publish_with(
                     TAG,
@@ -336,13 +436,23 @@ fn player_archive_still_installs_when_the_index_is_listed() {
                     InstallIntent::Exact,
                     crate::backend::installation::Transfer {
                         stop: None,
-                        progress: |_| {},
+                        progress: |phase| phases.borrow_mut().push(phase),
                     },
                     |_, _| url.clone(),
                     (&base, &keys),
                 )
                 .unwrap();
             server.join().unwrap();
+            let phases = phases.into_inner();
+            let [download @ .., InstallPhase::Unpacking, InstallPhase::Finishing] =
+                phases.as_slice()
+            else {
+                panic!("expected transfer, extraction, then publication: {phases:?}");
+            };
+            assert!(download
+                .iter()
+                .all(|p| matches!(p, InstallPhase::Downloading(f) if (0.0..=1.0).contains(f))));
+            assert_eq!(download.last(), Some(&InstallPhase::Downloading(1.0)));
             let game = version_dir(TAG);
             assert_eq!(fs::read(game.join(CLIENT)).unwrap(), b"static client");
             assert!(game.join(Artifact::ARCHIVE_RECEIPT).is_file());
