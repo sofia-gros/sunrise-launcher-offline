@@ -50,9 +50,10 @@ pub(crate) fn stop_storage_counts(
     *storage_confirm = None;
 }
 
-/// Whether Clear can start independently of any count in flight.
-pub(crate) fn clear_offered(work: Option<&Work>) -> bool {
-    !work.is_some_and(|work| work.clearing)
+/// Whether Clear can start independently of any count in flight. Clear is never offered when
+/// the configured data folder is unavailable and Storage opened on fallback roots.
+pub(crate) fn clear_offered(work: Option<&Work>, location_unavailable: bool) -> bool {
+    !location_unavailable && !work.is_some_and(|work| work.clearing)
 }
 
 /// Unknown rows can be cleared without waiting for counting; a link-only candidate can
@@ -147,6 +148,10 @@ impl Launcher {
     /// A Clear overtakes a count in flight and never waits for one.
     pub(super) fn refresh_storage(&mut self, clear: Option<Category>, all: bool) {
         let clearing = clear.is_some() || all;
+        if clearing && self.location_unavailable {
+            self.storage_confirm = None;
+            return;
+        }
         match self.ui.settings.storage_work.take() {
             Some(work) if work.clearing || !clearing => {
                 self.ui.settings.storage_work = Some(work);
@@ -263,7 +268,8 @@ fn storage_busy_follows_the_active_worker_slot() {
             clearing,
         });
         assert!(view.storage_busy());
-        assert_eq!(clear_offered(view.storage_work.as_ref()), !clearing);
+        assert_eq!(clear_offered(view.storage_work.as_ref(), false), !clearing);
+        assert!(!clear_offered(view.storage_work.as_ref(), true));
         view.storage_work.take();
         assert!(!view.storage_busy());
     }

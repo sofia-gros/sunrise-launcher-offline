@@ -892,7 +892,10 @@ impl Launcher {
         let total =
             complete.map(|report| report.rows.iter().map(|r| r.remaining_bytes).sum::<u64>());
         // Clear needs no size: a row not counted yet can be cleared like any other.
-        let offered = glass_storage::clear_offered(self.ui.settings.storage_work.as_ref());
+        let offered = glass_storage::clear_offered(
+            self.ui.settings.storage_work.as_ref(),
+            self.location_unavailable,
+        );
         // Counting that failed is not still counting.
         let uncounted = if self.storage_error.is_some() && !busy {
             tr("Not counted")

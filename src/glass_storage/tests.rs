@@ -9,11 +9,26 @@ fn work(clearing: bool) -> Work {
 
 #[test]
 fn clear_is_offered_whatever_is_known_of_sizes() {
-    assert!(clear_offered(None), "nothing counted yet");
-    assert!(clear_offered(Some(&work(false))), "a count is in flight");
+    assert!(clear_offered(None, false), "nothing counted yet");
     assert!(
-        !clear_offered(Some(&work(true))),
+        clear_offered(Some(&work(false)), false),
+        "a count is in flight"
+    );
+    assert!(
+        !clear_offered(Some(&work(true)), false),
         "a Clear is already running"
+    );
+    assert!(
+        !clear_offered(None, true),
+        "configured data folder is unavailable"
+    );
+    assert!(
+        !clear_offered(Some(&work(false)), true),
+        "unavailable location must not offer Clear during a count"
+    );
+    assert!(
+        !clear_offered(Some(&work(true)), true),
+        "unavailable location never offers Clear"
     );
 }
 
