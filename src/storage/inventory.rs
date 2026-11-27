@@ -63,25 +63,14 @@ impl Row {
     }
 
     fn keep(&mut self, bytes: u64, error: Error, log: bool) {
+        let reason = error_message(error);
         if log {
-            // Log each refusal without printing paths, build names, or OS error text.
-            let reason = match &error {
-                Error::Unsafe(_) => "unexpected file or link".into(),
-                Error::ResourceDependent(_) => "another build needs these resources".into(),
-                Error::Io(error) => {
-                    format!("{:?}, OS error {:?}", error.kind(), error.raw_os_error())
-                }
-                _ => format!("{error:?}"),
-            };
             crate::launcher_log::line(format!(
                 "Storage Clear kept {:?} unit ({bytes} bytes): {reason}",
                 self.category
             ));
         }
-        self.kept.push(Kept {
-            bytes,
-            reason: native_mods::cache_error(error),
-        });
+        self.kept.push(Kept { bytes, reason });
     }
 }
 
@@ -297,11 +286,17 @@ impl Entry {
                 return crate::cache_cleanup::delete_game_unit(&self.path);
             }
             access.check()?;
-        } else if !self.build_tool() && !self.relative.starts_with("native/target") {
+        } else if matches!(
+            self.category,
+            Category::PrebuiltGames | Category::SpareGameBuilds | Category::OtherCaches
+        ) {
             let data = present(backend::data_dir().canonicalize())?;
-            if data.as_ref().is_some_and(|data| {
-                self.path.starts_with(data) || self.path.starts_with(backend::plain(data.clone()))
-            }) {
+            if self.profile.is_some()
+                || data.as_ref().is_some_and(|data| {
+                    self.path.starts_with(data)
+                        || self.path.starts_with(backend::plain(data.clone()))
+                })
+            {
                 return crate::cache_cleanup::clear_claimed_unit(&self.path);
             }
         }
@@ -390,23 +385,6 @@ fn present<T>(result: std::io::Result<T>) -> Result<Option<T>, Error> {
     }
 }
 
-/// Says how many runtime lease registry entries there are, on stderr, before a report starts.
-fn note_lease_registry() -> Result<(), Error> {
-    let registry_entries = match fs::read_dir(backend::data_dir().join("run-leases")) {
-        Ok(mut entries) => entries.try_fold(0usize, |count, entry| entry.map(|_| count + 1))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(error) => return Err(error.into()),
-    };
-    eprintln!(
-        "{}",
-        crate::i18n::trf(
-            "Runtime lease registry entries: {count}",
-            &[("count", &registry_entries.to_string())]
-        )
-    );
-    Ok(())
-}
-
 fn usage_stamp(name: &Path) -> bool {
     let name = name.as_os_str().to_string_lossy();
     name == ".last-used" || (name.starts_with('.') && name.ends_with(".last-used"))
@@ -427,65 +405,64 @@ impl Storage {
     /// builds and each profile's caches, and detached trash beside any of them.
     #[cfg(test)]
     fn entries(&self) -> Result<Vec<Entry>, Error> {
-        self.entries_until(&Cancel::default())
+        self.entries_until(&Cancel::default(), None)
     }
 
-    fn entries_until(&self, cancel: &Cancel) -> Result<Vec<Entry>, Error> {
+    fn entries_until(
+        &self,
+        cancel: &Cancel,
+        selected: Option<Category>,
+    ) -> Result<Vec<Entry>, Error> {
         #[cfg(test)]
         ENTRIES.with(|calls| calls.set(calls.get() + 1));
+        let includes = |category| selected.is_none_or(|selected| selected == category);
         let mut entries = Vec::new();
-        self.build_entries(&mut entries, &Root::open(&self.root)?, cancel)?;
-        if cancel.is_cancelled() {
+        if selected != Some(Category::OtherCaches) {
+            self.build_entries(&mut entries, &Root::open(&self.root)?, cancel, selected)?;
+        }
+        if cancel.is_cancelled()
+            || !(includes(Category::SpareGameBuilds) || includes(Category::OtherCaches))
+        {
             return Ok(entries);
         }
         let data = Root::open(&backend::data_dir())?;
-        // One read-only snapshot of the profiles says both which builds they play and where
-        // their folders are. An unreadable one proves neither, so it offers no spare build and
-        // no profile cache.
+        // One read-only profile snapshot proves both which versions are played and where
+        // their caches are. An unreadable snapshot proves neither.
         let profiles = instances::list_for_storage().ok();
-        if let Some(profiles) = &profiles {
-            spare_builds(&mut entries, &data, profiles, cancel)?;
+        if cancel.is_cancelled() {
+            return Ok(entries);
         }
-        // Interrupted removal deliberately loses completion. Keep the remaining unit
-        // visible for residual reporting and a safe retry, even though installed() omits it.
-        for child in children_until(&data.path.join("versions"), cancel)? {
-            if cancel.is_cancelled() {
-                break;
+        if includes(Category::SpareGameBuilds) {
+            if let Some(profiles) = &profiles {
+                spare_builds(&mut entries, &data, profiles, cancel)?;
             }
-            if present(child.file_type())?.is_some_and(|kind| kind.is_dir())
-                && !child.path().join(".installed").is_file()
-                && !child.file_name().to_string_lossy().starts_with(".trash-")
-            {
-                entries.push(Entry::fixed(
-                    &data,
-                    &Path::new("versions").join(child.file_name()),
-                    Category::SpareGameBuilds,
-                )?);
+            // Interrupted removal loses completion; keep those units visible for retry.
+            for child in children_until(&data.path.join("versions"), cancel)? {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                if present(child.file_type())?.is_some_and(|kind| kind.is_dir())
+                    && !child.path().join(".installed").is_file()
+                    && !child.file_name().to_string_lossy().starts_with(".trash-")
+                {
+                    entries.push(Entry::fixed(
+                        &data,
+                        &Path::new("versions").join(child.file_name()),
+                        Category::SpareGameBuilds,
+                    )?);
+                }
             }
         }
-        let game = backend::game_home();
-        let overlaps_profile = |path: &Path| {
-            backend::plain(path.to_owned()) == backend::plain(game.clone())
-                || profiles.as_ref().is_some_and(|profiles| {
-                    profiles.iter().any(|profile| {
-                        backend::plain(path.to_owned()) == backend::plain(profile.home.clone())
-                    })
-                })
-        };
-        if !overlaps_profile(&data.path) {
+        if includes(Category::OtherCaches) && !cancel.is_cancelled() {
+            let profiles = profiles.as_deref().unwrap_or(&[]);
             for relative in ["cache/github", "mod-browser", "profile-heads"] {
-                add(&mut entries, &data, relative, Category::OtherCaches)?;
+                if !overlaps_profile(&data.path.join(relative), profiles) {
+                    add(&mut entries, &data, relative, Category::OtherCaches)?;
+                }
             }
-        }
-        if let Some(profiles) = &profiles {
             profile_caches(&mut entries, profiles, cancel)?;
+            self.detached_trash(&mut entries, &data, profiles, cancel)?;
         }
-        self.detached_trash(
-            &mut entries,
-            &data,
-            profiles.as_deref().unwrap_or(&[]),
-            cancel,
-        )?;
         Ok(entries)
     }
 
@@ -494,11 +471,14 @@ impl Storage {
         entries: &mut Vec<Entry>,
         build_root: &Root,
         cancel: &Cancel,
+        selected: Option<Category>,
     ) -> Result<(), Error> {
-        let native = Entry::fixed(build_root, Path::new("native"), Category::BuildFiles)?;
         for cache in BUILD_CACHES {
             if cancel.is_cancelled() {
-                break;
+                return Ok(());
+            }
+            if selected.is_some_and(|selected| selected != cache.category()) {
+                continue;
             }
             if matches!(
                 cache,
@@ -510,7 +490,8 @@ impl Storage {
                     | BuildCache::InternalsSync
                     | BuildCache::ModBuildCache
             ) {
-                let parent = self.root.join(cache.relative());
+                let parent =
+                    Entry::fixed(build_root, Path::new(cache.relative()), cache.category())?.path;
                 if checked(&parent, true)?.is_some() {
                     for child in children_until(&parent, cancel)? {
                         if cancel.is_cancelled() {
@@ -535,6 +516,10 @@ impl Storage {
             }
         }
         let build_files = Category::BuildFiles;
+        if selected.is_some_and(|selected| selected != build_files) {
+            return Ok(());
+        }
+        let native = Entry::fixed(build_root, Path::new("native"), build_files)?;
         for child in children_until(&native.path, cancel)? {
             if cancel.is_cancelled() {
                 break;
@@ -609,33 +594,24 @@ impl Storage {
         profiles: &[instances::Instance],
         cancel: &Cancel,
     ) -> Result<(), Error> {
-        let parents: HashSet<_> = entries
-            .iter()
-            .filter(|entry| {
-                entry.profile.is_none()
-                    && !PROFILE_GAME_CACHES
-                        .iter()
-                        .any(|relative| entry.relative == Path::new(relative))
-            })
-            .filter_map(|entry| entry.path.parent().map(Path::to_owned))
-            .chain([
-                self.root.clone(),
-                data.path.clone(),
-                data.path.join("versions"),
-            ])
-            .collect();
-        let work = self.root.join(BuildCache::ModBuildCache.relative());
+        // Plan detaches into its held build root; runtime-claimed units detach beside the
+        // original unit. Do not infer trash parents from profile or arbitrary row entries.
+        let parents: HashSet<_> = [
+            self.root.clone(),
+            data.path.clone(),
+            data.path.join("versions"),
+            data.path.join("cache"),
+        ]
+        .into_iter()
+        .collect();
         for parent in parents {
             if cancel.is_cancelled() {
                 break;
             }
-            // Detached slots inside `native/w` are already inventoried as Mod build cache.
-            let plain = backend::plain(parent.clone());
-            if parent == work
-                || plain == backend::plain(backend::game_home())
-                || profiles
-                    .iter()
-                    .any(|profile| plain == backend::plain(profile.home.clone()))
+            if profile_home(&parent, profiles)
+                || parent
+                    .parent()
+                    .is_some_and(|outer| profile_home(outer, profiles))
             {
                 continue;
             }
@@ -661,6 +637,7 @@ impl Storage {
                         .next()
                         .is_none_or(|counter| counter.parse::<u64>().is_ok())
                     && numbers.next().is_none()
+                    && !overlaps_profile(&entry.path(), profiles)
                 {
                     entries.push(Entry::fixed(
                         &root,
@@ -678,22 +655,15 @@ impl Storage {
         if clear.is_none() && !all {
             return self.report_counting(|_| {});
         }
-        note_lease_registry()?;
-        // Only manual clear takes the native build lease; read-only reports never make Play wait.
-        let lease = self.build_lease()?;
-        // Also refuse an external Cargo holding a target lock before starting a cleanup.
-        lease.bytes()?;
-        use sunrise_launcher_smod::runtime_leases::{cleanup::Cleanup, Error as LeaseError};
-        match Cleanup::existing(&backend::data_dir()) {
-            Ok(cleanup) => {
-                cleanup.collect_records()?;
-            }
-            Err(LeaseError::Busy) => {} // Other cache classes can still be reported/retained.
-            Err(LeaseError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        let entries = self.entries_until(&Cancel::default())?;
-        self.apply_retaining(entries, clear, all, true, Some(&lease))
+        // Only manual Clear takes the build lease; its selected units take their own
+        // Cargo locks or runtime claim at removal, with no whole-target sizing preflight.
+        let selection = if all { None } else { clear };
+        let result = (|| {
+            let lease = self.build_lease()?;
+            let entries = self.entries_until(&Cancel::default(), selection)?;
+            self.apply_retaining(entries, clear, all, true, Some(&lease))
+        })();
+        result.map_err(redact_error)
     }
 
     #[cfg(test)]
@@ -719,7 +689,7 @@ impl Storage {
         before_clear: impl FnMut(&Path),
     ) -> Result<Report, Error> {
         let lease = self.build_lease()?;
-        let entries = self.entries_until(&Cancel::default())?;
+        let entries = self.entries_until(&Cancel::default(), if all { None } else { clear })?;
         self.apply_retaining_observed(entries, clear, all, true, Some(&lease), before_clear)
     }
 
@@ -879,6 +849,18 @@ fn refused(
         }
     }
     Ok((sound, trees))
+}
+
+fn overlaps_profile(path: &Path, profiles: &[instances::Instance]) -> bool {
+    let path = backend::plain(path.to_owned());
+    let overlaps = |home: PathBuf| {
+        let home = backend::plain(home);
+        path.starts_with(&home) || home.starts_with(&path)
+    };
+    overlaps(backend::game_home())
+        || profiles
+            .iter()
+            .any(|profile| overlaps(profile.home.clone()))
 }
 
 /// Native builds no profile plays and nothing is running or building from.

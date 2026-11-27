@@ -86,3 +86,87 @@ fn the_worlds_setting_picks_rows_or_tiles() {
     assert_eq!(settings.world_layout, WorldLayout::Rows);
     assert!(Cli::try_parse_from(["sunrise-launcher", "settings", "worlds", "tiles"]).is_ok());
 }
+
+#[cfg(unix)]
+#[test]
+fn storage_scopes_clear_and_redacts_cli_errors() {
+    const ACTOR: &str = "SUNRISE_STORAGE_CLI_TEST";
+    if let Ok(mode) = std::env::var(ACTOR) {
+        let clear = match mode.as_str() {
+            "scoped" => Some(ClearStorage::Row(Category::RustCompiler)),
+            "fatal" => Some(ClearStorage::Row(Category::ModBuildCache)),
+            "kept" => Some(ClearStorage::Row(Category::BuildFiles)),
+            _ => None,
+        };
+        std::process::exit(execute(Cmd::Storage { clear }, true).unwrap());
+    }
+    let scratch = tempfile::tempdir().unwrap();
+    let private = scratch.path().join("private-home-canary");
+    let launcher = private.join("launcher");
+    let child = |mode: &str| {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "cli::storage_tests::storage_scopes_clear_and_redacts_cli_errors",
+                "--quiet",
+            ])
+            .env(ACTOR, mode)
+            .env("SUNRISE_LAUNCHER_HOME", &launcher)
+            .env("SUNRISE_HOME", private.join("game"))
+            .env("SUNRISE_LAUNCHER_LOCATION_FILE", private.join("location"))
+            .env("SUNRISE_NO_KEYCHAIN", "1");
+        command
+    };
+    let run = |mode| child(mode).output().unwrap();
+    let rust = launcher.join("rust/old/output");
+    let native = launcher.join("native");
+    let outside = private.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::create_dir_all(rust.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&native).unwrap();
+    std::fs::write(&rust, b"output").unwrap();
+    std::os::unix::fs::symlink(&outside, native.join("w")).unwrap();
+    let output = run("scoped");
+    assert!(output.status.success(), "{output:?}");
+    assert!(!rust.exists());
+    let output = run("fatal");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("unexpected file or link"), "{stderr}");
+    assert!(!stderr.contains("private-home-canary"), "{stderr}");
+    std::fs::remove_file(native.join("w")).unwrap();
+    let attempt = native.join("source/revision");
+    std::fs::create_dir_all(&attempt).unwrap();
+    std::os::unix::fs::symlink(&outside, attempt.join("unexpected")).unwrap();
+    let output = run("kept");
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(&stdout[stdout.find('{').unwrap()..]).unwrap();
+    assert_eq!(body["rows"][0]["category"], "build-files");
+    assert_eq!(body["rows"][0]["kept"].as_array().unwrap().len(), 1);
+    assert!(!stdout.contains("private-home-canary"), "{stdout}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("Build files"), "{stderr}");
+    assert!(!stderr.contains("private-home-canary"), "{stderr}");
+    let output = run("count");
+    assert!(output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("Counted Rust compiler:"), "{stderr}");
+
+    use std::os::{fd::OwnedFd, unix::net::UnixStream};
+    let (reader, writer) = UnixStream::pair().unwrap();
+    drop(reader);
+    let output = child("count")
+        .stderr(std::process::Stdio::from(OwnedFd::from(writer)))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let body = String::from_utf8(output.stdout).unwrap();
+    let report: serde_json::Value = serde_json::from_str(&body[body.find('{').unwrap()..]).unwrap();
+    assert_eq!(
+        report["rows"].as_array().unwrap().len(),
+        Category::ALL.len()
+    );
+}

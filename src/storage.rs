@@ -13,6 +13,43 @@ use std::sync::Arc;
 mod inventory;
 pub use inventory::{Report, Row};
 
+/// Path-free presentation for Storage surfaces, including fatal errors and kept units.
+pub fn error_message(error: Error) -> String {
+    use crate::i18n::{tr, trf};
+    match error {
+        Error::Unsafe(_) => tr("Storage found an unexpected file or link.").into(),
+        Error::ResourceDependent(_) => {
+            tr("Another build needs these resources, so they were kept.").into()
+        }
+        Error::Io(error) => trf(
+            "Storage could not access a file or folder ({kind}, OS error {code}).",
+            &[
+                ("kind", &format!("{:?}", error.kind())),
+                (
+                    "code",
+                    &error
+                        .raw_os_error()
+                        .map_or_else(|| "—".into(), |code| code.to_string()),
+                ),
+            ],
+        ),
+        error => crate::native_mods::cache_error(error),
+    }
+}
+
+// Do not let a caller accidentally disclose raw path data with a general cache formatter.
+fn redact_error(error: Error) -> Error {
+    match error {
+        Error::Unsafe(_) => Error::Unsafe(PathBuf::new()),
+        Error::ResourceDependent(_) => Error::ResourceDependent(String::new()),
+        Error::Io(error) => Error::Io(error.raw_os_error().map_or_else(
+            || std::io::Error::from(error.kind()),
+            std::io::Error::from_raw_os_error,
+        )),
+        error => error,
+    }
+}
+
 /// Stops a count running on a worker: whoever started it keeps a clone and sets it when the
 /// count is no longer wanted. It is never reset, so each count gets its own.
 #[derive(Clone, Debug, Default)]
@@ -52,6 +89,20 @@ pub enum Category {
     RustCompiler,
     ModBuildCache,
     OtherCaches,
+}
+
+impl Category {
+    pub fn label(self) -> &'static str {
+        use crate::i18n::tr;
+        match self {
+            Self::BuildFiles => tr("Build files"),
+            Self::PrebuiltGames => tr("Prebuilt games"),
+            Self::SpareGameBuilds => tr("Spare game builds"),
+            Self::RustCompiler => tr("Rust compiler"),
+            Self::ModBuildCache => tr("Mod build cache"),
+            Self::OtherCaches => tr("Other caches"),
+        }
+    }
 }
 
 /// Fixed build-home caches. Instance and version inventory adds its protected entries separately.
@@ -118,7 +169,7 @@ pub struct Storage {
 
 impl Storage {
     pub fn open() -> Result<Self, Error> {
-        Self::at(&crate::backend::build_dir())
+        Self::at(&crate::backend::build_dir()).map_err(redact_error)
     }
 
     fn at(root: &Path) -> Result<Self, Error> {

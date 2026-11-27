@@ -38,7 +38,7 @@ fn storage_report(
     row: Option<Category>,
     all: bool,
 ) -> Result<sunrise_launcher::storage::Report, sunrise_launcher::storage::Error> {
-    use clap::ValueEnum;
+    use std::io::{self, Write};
     if row.is_some() || all {
         return storage.report(row, all);
     }
@@ -46,16 +46,13 @@ fn storage_report(
         let Some(done) = so_far.rows.last() else {
             return;
         };
-        let name = done
-            .category
-            .to_possible_value()
-            .map_or_else(String::new, |value| value.get_name().to_owned());
-        eprintln!(
+        let _ = writeln!(
+            io::stderr(),
             "{}",
             trf(
                 "Counted {category}: {size}",
                 &[
-                    ("category", &name),
+                    ("category", done.category.label()),
                     (
                         "size",
                         &sunrise_launcher::storage::format_bytes(done.remaining_bytes)
@@ -65,6 +62,7 @@ fn storage_report(
         );
     })
 }
+
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -724,17 +722,12 @@ enum Cmd {
     /// Read-only reports never block builds; `--clear` requires builds to be idle. A report counts
     /// each row once and prints when done, with its progress on stderr; `--clear` needs no count first.
     ///
-    /// Rust/Cargo/temp build-tool caches remain clearable. Game-accessible caches and installed-version
-    /// removal retain files while any launch path lacks enforceable lifetime exclusion; an empty
-    /// process scan is not authorization. Read-only reports stay available.
-    /// Private launch records and raw captures are collected together only after all participating owners
-    /// exit, under the exclusive permanent namespace gate. Published unit keys persist until exclusive
-    /// unit removal. Registry entry counts are logged; lock entries are not age-collected.
+    /// Clear checks only the requested caches and keeps files in use.
     #[command(
         after_help = "Close the game before clearing. Use `storage --clear mod-build-cache` to remove compiled parts kept between native mod builds. Sunrise builds them again when needed."
     )]
     Storage {
-        /// Request cleanup of build-files, prebuilt-games, spare-game-builds, rust-compiler, mod-build-cache, other-caches or all rows; game-accessible caches refuse cleanup without enforceable lifetime exclusion
+        /// Clear only build-files, prebuilt-games, spare-game-builds, rust-compiler, mod-build-cache, other-caches or all rows
         #[arg(long, value_parser = parse_storage_row)]
         clear: Option<ClearStorage>,
     },
@@ -1238,19 +1231,32 @@ fn execute(command: Cmd, as_json: bool) -> Result<i32, String> {
             }
         }
         Cmd::Storage { clear } => {
-            let storage = Storage::open().map_err(native_mods::cache_error)?;
+            use std::io::{self, Write};
+            use sunrise_launcher::storage::error_message;
             let (row, all) = match clear {
                 Some(ClearStorage::Row(row)) => (Some(row), false),
                 Some(ClearStorage::All) => (None, true),
                 None => (None, false),
             };
-            let report = storage_report(&storage, row, all).map_err(native_mods::cache_error)?;
+            let report =
+                match Storage::open().and_then(|storage| storage_report(&storage, row, all)) {
+                    Ok(report) => report,
+                    Err(error) => {
+                        let message = error_message(error);
+                        let _ = writeln!(io::stderr(), "{message}");
+                        sunrise_launcher::launcher_log::line(&message);
+                        return Ok(1);
+                    }
+                };
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
-            if row.is_some() || all {
-                if let Some(kept) = report.rows.iter().flat_map(|row| &row.kept).next() {
-                    return Err(kept.reason.clone());
+            let mut kept_any = false;
+            for row in report.rows.iter().filter(|row| row.after_clear) {
+                if let Some(kept) = row.kept.first() {
+                    kept_any = true;
+                    let _ = writeln!(io::stderr(), "{}: {}", row.category.label(), kept.reason);
                 }
             }
+            return Ok(i32::from(kept_any));
         }
         Cmd::NativeLock {
             folder,

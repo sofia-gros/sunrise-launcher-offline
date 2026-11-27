@@ -21,12 +21,11 @@ impl Storage {
         if cancel.is_cancelled() {
             return Ok(None);
         }
-        note_lease_registry()?;
-        let discovery = self.entries_until(cancel);
+        let discovery = self.entries_until(cancel, None);
         if cancel.is_cancelled() {
             return Ok(None);
         }
-        let mut remaining = discovery?;
+        let mut remaining = discovery.map_err(redact_error)?;
         let mut report = Report::new(Vec::new()).tagged(cancel);
         for category in Category::ALL {
             let (units, rest): (Vec<_>, Vec<_>) = remaining
@@ -38,7 +37,7 @@ impl Storage {
             if cancel.is_cancelled() {
                 return Ok(None);
             }
-            let (units, trees) = measured?;
+            let (units, trees) = measured.map_err(redact_error)?;
             row.bytes = allocated(&units, &trees, category);
             row.remaining_bytes = row.bytes;
             if cancel.is_cancelled() {
