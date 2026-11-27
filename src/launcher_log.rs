@@ -18,6 +18,17 @@ const RING_LINES: usize = 5000;
 const FILE_LIMIT: u64 = 1 << 20;
 /// How many rotated files are kept: `launcher.1.log` to `launcher.3.log`.
 const OLD_FILES: u32 = 3;
+fn rotation_name(index: u32) -> String {
+    match index {
+        0 => "launcher.log".into(),
+        n => format!("launcher.{n}.log"),
+    }
+}
+
+pub(crate) fn is_rotation_file(name: &std::ffi::OsStr) -> bool {
+    (0..=OLD_FILES).any(|index| name == std::ffi::OsStr::new(&rotation_name(index)))
+}
+
 /// What replaces a secret.
 const SECRET: &str = "<secret>";
 /// Query, form and JSON keys whose values are secrets. A key matches as the end of a longer
@@ -90,7 +101,7 @@ impl LogFile {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(dir.join("launcher.log"))
+            .open(dir.join(rotation_name(0)))
             .ok();
         let size = file
             .as_ref()
@@ -126,10 +137,7 @@ impl LogFile {
     fn rotate(&mut self) {
         // Windows can't rename an open file, nor onto an existing one.
         self.file = None;
-        let name = |n: u32| match n {
-            0 => self.dir.join("launcher.log"),
-            n => self.dir.join(format!("launcher.{n}.log")),
-        };
+        let name = |n| self.dir.join(rotation_name(n));
         for n in (0..OLD_FILES).rev() {
             let _ = fs::remove_file(name(n + 1));
             let _ = fs::rename(name(n), name(n + 1));
@@ -224,8 +232,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// Starts the file: `dir/launcher.log`, rotated at 1 MiB into launcher.1.log .. launcher.3.log
-/// (oldest dropped). Called once by `main()` before anything else logs, for the window and the
-/// command line alike. Without it (tests, other tools) lines go only to the ring.
+/// (oldest dropped). Called after the data location and carry-over settle, for the window and the
+/// command line alike. Until then, lines go only to the ring.
 pub fn init(dir: &Path) {
     {
         let mut file = lock(&FILE);
