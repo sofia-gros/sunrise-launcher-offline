@@ -1720,6 +1720,7 @@ pub use installation::{InstallOutcome, NightlyReceiptWarning};
 pub enum InstallPhase {
     Checking,
     Downloading(f32),
+    DownloadingUnknownLength,
     Unpacking,
     Finishing,
     Preparing,

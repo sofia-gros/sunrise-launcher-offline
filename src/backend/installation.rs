@@ -228,12 +228,15 @@ pub(crate) fn install_as_cancellable(
         |target| Artifact::matches_archive(target, tag, sha256),
         |stage| {
             let archive = stage.join("download");
+            let reported_unknown_length = std::cell::Cell::new(false);
             logged(format!("Downloading {tag} ({size} bytes)"), || {
                 download_cancellable(url, *size, sha256, &archive, stop, &|done, total| {
                     if total > 0 {
                         progress(InstallPhase::Downloading(
                             (done as f32 / total as f32).min(1.0),
                         ));
+                    } else if !reported_unknown_length.replace(true) {
+                        progress(InstallPhase::DownloadingUnknownLength);
                     }
                 })
             })?;
