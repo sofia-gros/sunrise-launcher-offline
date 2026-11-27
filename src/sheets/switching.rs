@@ -1514,9 +1514,6 @@ impl Launcher {
     }
 }
 
-/// Whether a picker selection can be saved directly to `instances.json` without running a build
-/// switch: the profile must be ordinary, have no pending transaction recovery or first-Play
-/// bootstrap, and already be on `tag`.
 /// How a switch begins.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SwitchStart {
@@ -1545,6 +1542,9 @@ fn switch_start(
     }
 }
 
+/// Whether a picker selection can be saved directly to `instances.json` without running a build
+/// switch: the profile must be ordinary, have no pending transaction recovery or first-Play
+/// bootstrap, and already be on `tag`.
 fn can_fast_save_choice(
     instance: &instances::Instance,
     tag: &str,
@@ -1652,7 +1652,7 @@ mod tests {
         settings.instance = Some(profile.id.clone());
         settings.save().unwrap();
         let mut app = gpui::TestAppContext::single();
-        let (shell, cx) = app.add_window_view(crate::window_root::Shell::new);
+        let (shell, cx) = app.add_window_view(crate::window_root::Shell::new_for_test);
         let launcher = shell.read_with(cx, |shell, _| shell.launcher());
         cx.run_until_parked();
         launcher.update(cx, |l, _| {
@@ -1710,6 +1710,7 @@ mod tests {
         {
             return;
         }
+        crate::wake::UNDER_TEST_SCHEDULER.store(true, std::sync::atomic::Ordering::Relaxed);
         const TAG: &str = "26.3-0.1.0";
         let build = sunrise_launcher::backend::version_dir(TAG);
         std::fs::create_dir_all(&build).unwrap();
@@ -1735,7 +1736,7 @@ mod tests {
         settings.instance = Some(profile.id.clone());
         settings.save().unwrap();
         let mut app = gpui::TestAppContext::single();
-        let (shell, cx) = app.add_window_view(crate::window_root::Shell::new);
+        let (shell, cx) = app.add_window_view(crate::window_root::Shell::new_for_test);
         let launcher = shell.read_with(cx, |shell, _| shell.launcher());
         cx.run_until_parked();
         let started = launcher.update(cx, |l, _| {
@@ -1763,6 +1764,7 @@ mod tests {
         if !in_scratch_child("homes_switch_to_the_build_a_profile_already_plays_saves_nothing") {
             return;
         }
+        crate::wake::UNDER_TEST_SCHEDULER.store(true, std::sync::atomic::Ordering::Relaxed);
         const TAG: &str = "26.3-0.1.0";
         let build = sunrise_launcher::backend::version_dir(TAG);
         std::fs::create_dir_all(&build).unwrap();
@@ -1772,7 +1774,7 @@ mod tests {
         settings.instance = Some(profile.id.clone());
         settings.save().unwrap();
         let mut app = gpui::TestAppContext::single();
-        let (shell, cx) = app.add_window_view(crate::window_root::Shell::new);
+        let (shell, cx) = app.add_window_view(crate::window_root::Shell::new_for_test);
         let launcher = shell.read_with(cx, |shell, _| shell.launcher());
         cx.run_until_parked();
         launcher.update(cx, |l, _| {
