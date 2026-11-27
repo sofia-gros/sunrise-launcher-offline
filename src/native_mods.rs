@@ -16,9 +16,12 @@ mod build_log;
 mod bundle;
 use build_log::log_warning;
 pub(crate) use build_log::root;
-pub use build_log::{
-    append_log, clear_log, compiling as compiling_mod, failure, log_path, Refusal, CANCELLED,
-};
+pub use build_log::{clear_log, compiling as compiling_mod, failure, log_path, Refusal, CANCELLED};
+
+/// Appends scrubbed `message` (with a newline) to the native build log.
+pub fn append_log(message: &str) -> Result<(), String> {
+    build_log::append_scrubbed(message)
+}
 use bundle::{bundle_files, is_revision};
 pub use bundle::{
     bundle_in, bundles, copy_bundle, digest, scan_bundles, source_digest, Bundle, Target,
@@ -4930,7 +4933,9 @@ mod tests {
         .unwrap_err();
         let err = String::from(err);
         assert!(err.contains("already exists"), "{err}");
-        assert!(fs::read_to_string(log_path()).unwrap().contains(&err));
+        assert!(fs::read_to_string(log_path())
+            .unwrap()
+            .contains(&crate::launcher_log::scrub(&err)));
         let managed = root().join("forbidden-export");
         let err = build_server(
             "v0.0.0-not-installed",
@@ -5290,6 +5295,70 @@ printf ']}}\n'
             let log = fs::read_to_string(log_path()).unwrap();
             assert_eq!(log, format!("{line}warning: could not stamp cache\n"));
         }
+    }
+
+    #[test]
+    fn shareable_build_log_scrubs_writes_warnings_and_snapshots() {
+        const CHILD: &str = "SUNRISE_TEST_BUILD_LOG_SCRUB_CHILD";
+        const TEST: &str =
+            "native_mods::tests::shareable_build_log_scrubs_writes_warnings_and_snapshots";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .env("SUNRISE_LAUNCHER_HOME", root.path().join("launcher"))
+                .env("SUNRISE_HOME", root.path().join("game"))
+                .env(
+                    "SUNRISE_LAUNCHER_LOCATION_FILE",
+                    root.path().join("location"),
+                )
+                .env("SUNRISE_NO_KEYCHAIN", "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let private_root = root().join("private-build-log-root");
+        crate::launcher_log::hide("private-build-log-root");
+        clear_log().unwrap();
+        append_log(&format!(
+            "sdk at {} from 198.51.100.7 access_token=topsecret_t20",
+            private_root.join("sdk.json").display()
+        ))
+        .unwrap();
+        log_warning(&format!(
+            "warn at {} access_token=warnsecret_t20",
+            private_root.join("warn.toml").display()
+        ));
+        let on_disk = fs::read_to_string(log_path()).unwrap();
+        for leaked in [
+            "private-build-log-root",
+            "198.51.100.7",
+            "topsecret_t20",
+            "warnsecret_t20",
+        ] {
+            assert!(!on_disk.contains(leaked), "{leaked} leaked in {on_disk}");
+        }
+        assert!(on_disk.contains("access_token=<secret>"), "{on_disk}");
+        assert!(on_disk.contains("<ip>"), "{on_disk}");
+
+        // Even raw bytes written directly to `build.log` are scrubbed when snapshotted for Copy/Save.
+        build_log::append_log(&format!(
+            "raw {} access_token=rawsecret_t20",
+            private_root.join("raw.rs").display()
+        ))
+        .unwrap();
+        let snap = build_log::snapshot().expect("build log snapshot");
+        for leaked in ["private-build-log-root", "rawsecret_t20"] {
+            assert!(!snap.contains(leaked), "{leaked} leaked in {snap}");
+        }
+        assert!(snap.contains("access_token=<secret>"), "{snap}");
     }
 
     /// A build that finds the build folder held by another build or a cleanup waits for it,
