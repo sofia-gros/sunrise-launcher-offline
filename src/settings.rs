@@ -877,11 +877,9 @@ impl Launcher {
 
         let busy = self.storage_pending;
         // The total waits for every row; a row shows its own size as soon as it is counted.
-        let total = self
-            .storage_report
-            .as_ref()
-            .filter(|report| report.is_complete())
-            .map(|report| report.rows.iter().map(|r| r.remaining_bytes).sum::<u64>());
+        let complete = self.storage_report.as_ref().filter(|r| r.is_complete());
+        let total =
+            complete.map(|report| report.rows.iter().map(|r| r.remaining_bytes).sum::<u64>());
         // Clear needs no size: a row not counted yet can be cleared like any other.
         let offered = glass_storage::clear_offered(self.ui.settings.storage_work.as_ref());
         // Counting that failed is not still counting.
@@ -913,14 +911,19 @@ impl Launcher {
                         },
                     )),
                 )
-                .child(if offered {
-                    clear_all.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.storage_confirm = Some(None);
-                        cx.notify();
-                    }))
-                } else {
-                    off(clear_all)
-                }),
+                .child(
+                    if offered
+                        && complete
+                            .is_none_or(|r| r.rows.iter().any(|row| row.clearable_bytes() > 0))
+                    {
+                        clear_all.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.storage_confirm = Some(None);
+                            cx.notify();
+                        }))
+                    } else {
+                        off(clear_all)
+                    },
+                ),
         )];
         // A problem no row owns is said once, quietly, under the total.
         if let Some(error) = self.storage_error.clone() {
@@ -942,7 +945,11 @@ impl Launcher {
                 .flat_map(|report| &report.rows)
                 .filter(|r| asked.is_none_or(|category| r.category == category))
                 .collect();
-            let wanted = if asked.is_none() { Category::ALL.len() } else { 1 };
+            let wanted = if asked.is_none() {
+                Category::ALL.len()
+            } else {
+                1
+            };
             let bytes = (counted.len() == wanted)
                 .then(|| counted.iter().map(|r| r.clearable_bytes()).sum());
             let question = glass_storage::clear_question(asked, bytes);
@@ -984,44 +991,37 @@ impl Launcher {
                 trf(
                     "{category} · {size}",
                     &[
-                        ("category", tr(glass_storage::category_label(category))),
+                        ("category", glass_storage::category_label(category)),
                         ("size", &size),
                     ],
                 ),
-                tr(glass_storage::category_about(category)),
-                div().child(if offered {
-                    clear.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.storage_confirm = Some(Some(category));
-                        cx.notify();
-                    }))
-                } else {
-                    off(clear)
-                }),
+                glass_storage::category_about(category),
+                div().child(
+                    if offered && found.is_none_or(|r| r.clearable_bytes() > 0) {
+                        clear.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.storage_confirm = Some(Some(category));
+                            cx.notify();
+                        }))
+                    } else {
+                        off(clear)
+                    },
+                ),
             );
-            let kept: Vec<Div> = found
-                .iter()
-                .flat_map(|r| &r.kept)
-                .map(|k| {
-                    // A unit that was refused whole was not counted either.
-                    if k.bytes == 0 {
-                        return hint(k.reason.clone());
-                    }
-                    hint(trf(
-                        "Space it couldn't free: {bytes}. {reason}",
-                        &[
-                            ("bytes", &storage::format_bytes(k.bytes)),
-                            ("reason", &k.reason),
-                        ],
-                    ))
-                })
-                .collect();
-            if !kept.is_empty() {
+            if let Some(kept) = found.and_then(|r| {
+                glass_storage::kept_line(
+                    r.remaining_bytes,
+                    r.clearable_bytes(),
+                    r.after_clear,
+                    !r.kept.is_empty(),
+                    r.older_build_kept,
+                )
+            }) {
                 line = div()
                     .flex()
                     .flex_col()
                     .gap(px(6.))
                     .child(line)
-                    .children(kept);
+                    .child(hint(kept));
             }
             cache.push(line);
         }

@@ -730,8 +730,11 @@ enum Cmd {
     /// Private launch records and raw captures are collected together only after all participating owners
     /// exit, under the exclusive permanent namespace gate. Published unit keys persist until exclusive
     /// unit removal. Registry entry counts are logged; lock entries are not age-collected.
+    #[command(
+        after_help = "Close the game before clearing. Use `storage --clear mod-build-cache` to remove compiled parts kept between native mod builds. Sunrise builds them again when needed."
+    )]
     Storage {
-        /// Request cleanup of build-files, prebuilt-games, spare-game-builds, rust-compiler, other-caches or all rows; game-accessible caches refuse cleanup without enforceable lifetime exclusion
+        /// Request cleanup of build-files, prebuilt-games, spare-game-builds, rust-compiler, mod-build-cache, other-caches or all rows; game-accessible caches refuse cleanup without enforceable lifetime exclusion
         #[arg(long, value_parser = parse_storage_row)]
         clear: Option<ClearStorage>,
     },

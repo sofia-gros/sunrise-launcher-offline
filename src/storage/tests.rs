@@ -388,3 +388,49 @@ fn allocated_total_includes_directory_metadata() {
     );
     eprintln!("independent directory allocation: {directory_bytes} bytes");
 }
+
+#[cfg(any(unix, windows))]
+#[test]
+fn clear_mod_build_slots_unlinks_directory_links_without_touching_their_target() {
+    let home = Home::new();
+    let outside = Home::new();
+    let canary = outside.seed("sentinel/canary");
+    home.seed("native/w/slot/output");
+    let work = home.0.join("native/w");
+    let bytes = allocated_bytes(&work.join("slot")).unwrap();
+    let sentinel = outside.0.join("sentinel");
+    for link in [work.join("slot/link"), work.join("linked-slot")] {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&sentinel, &link).unwrap();
+        #[cfg(windows)]
+        assert!(std::process::Command::new("cmd.exe")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(crate::backend::plain(link))
+            .arg(crate::backend::plain(sentinel.clone()))
+            .status()
+            .unwrap()
+            .success());
+    }
+    let storage = Storage::at(&home.0).unwrap();
+    let report = storage.report(None, false).unwrap();
+    let row = report
+        .rows
+        .iter()
+        .find(|row| row.category == Category::ModBuildCache)
+        .unwrap();
+    assert_eq!(row.bytes, bytes);
+    assert!(bytes > 0);
+    let report = storage
+        .report(Some(Category::ModBuildCache), false)
+        .unwrap();
+    let row = report
+        .rows
+        .iter()
+        .find(|row| row.category == Category::ModBuildCache)
+        .unwrap();
+    assert_eq!(row.remaining_bytes, 0);
+    assert_eq!(row.freed_bytes, bytes);
+    assert!(!work.join("slot").exists());
+    assert!(fs::symlink_metadata(work.join("linked-slot")).is_err());
+    assert_eq!(fs::read(canary).unwrap(), vec![7; 8192]);
+}
