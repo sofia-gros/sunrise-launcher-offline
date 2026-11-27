@@ -1625,3 +1625,186 @@ fn pre_launch_hook_runs_outside_the_manifest_lock_and_reacquires_before_spawn() 
         assert_eq!(FULL_VERIFICATIONS.take(), expected_verifies);
     }
 }
+
+#[test]
+fn successful_mutating_pre_launch_hook_is_refused_before_spawn_with_one_verify() {
+    use super::super::FULL_VERIFICATIONS;
+    const TEST: &str = "managed_play::client::tests::successful_mutating_pre_launch_hook_is_refused_before_spawn_with_one_verify";
+    const ACTOR: &str = "PLAY_MUTATING_HOOK_ACTOR";
+    const BUILD: &str = "v0.1.10";
+    let Ok(role) = std::env::var(ACTOR) else {
+        let root = tempfile::Builder::new()
+            .prefix("play-mutating-hook-")
+            .tempdir()
+            .unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(ACTOR, "scenario")
+            .env("SUNRISE_HOME", root.path().join("game"))
+            .env("SUNRISE_LAUNCHER_HOME", root.path().join("launcher"))
+            .env(
+                "SUNRISE_LAUNCHER_LOCATION_FILE",
+                root.path().join("location"),
+            )
+            .env("SUNRISE_NO_KEYCHAIN", "1")
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("SUNRISE_MOD_INDEX_V2", root.path().join("no-index.signed"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success()
+                && stdout
+                    .lines()
+                    .any(|line| line.starts_with("test result: ok. 1 passed;")),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    };
+    let home = backend::game_home();
+    match role.as_str() {
+        "mutate-inputs" => {
+            fs::write(home.join(mod_list::FILE), b"mod.lantern:false\n").unwrap();
+            fs::write(home.join("hook-mutated-inputs"), b"ok").unwrap();
+            return;
+        }
+        "mutate-binary" => {
+            fs::write(
+                backend::version_dir(BUILD).join(backend::CLIENT),
+                b"tampered client",
+            )
+            .unwrap();
+            fs::write(home.join("hook-mutated-binary"), b"ok").unwrap();
+            return;
+        }
+        "scenario" => {}
+        other => panic!("unknown mutating-hook actor: {other}"),
+    }
+    let build = backend::version_dir(BUILD);
+    let prepared = backend::resources(BUILD);
+    fs::create_dir_all(&prepared).unwrap();
+    fs::write(prepared.join("sunrise-resources.json"), b"{}").unwrap();
+    fs::write(prepared.join("fixture-blob.bin"), b"hook bytes").unwrap();
+    fs::write(build.join(".installed"), []).unwrap();
+    #[cfg(not(target_os = "linux"))]
+    let client_bytes = b"unchanged client";
+    #[cfg(target_os = "linux")]
+    let client_bytes = br#"#!/bin/sh
+touch "$SUNRISE_HOME/game-spawned"
+"#;
+    fs::write(build.join(backend::CLIENT), client_bytes).unwrap();
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            build.join(backend::CLIENT),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    fs::create_dir_all(home.join(mod_list::DIR)).unwrap();
+    let body = format!(
+        "id='lantern'\nname='Lantern'\nversion='1.0.0'\napi='{}'\ncapabilities=['registries']\n",
+        manifest::API
+    );
+    fs::write(
+        home.join(mod_list::DIR).join("lantern.smod"),
+        manifest::Package::write_files(&body, &[]).unwrap(),
+    )
+    .unwrap();
+    fs::write(home.join(mod_list::FILE), b"mod.lantern:true\n").unwrap();
+
+    let instance = instances::selection().unwrap();
+    let client = Client {
+        instance: &instance,
+        accepted_account: None,
+        explicit_account: false,
+        piped: false,
+    };
+    let cancellation = native_mods::Cancellation::default();
+    let mut profile = Profile::open(&home, None).unwrap();
+    let (active, _, _) = client
+        .ready(
+            &mut profile,
+            || FirstBuild::installed(BUILD),
+            |_, _| Ok(()),
+            &cancellation,
+            |_| {},
+            || None,
+        )
+        .unwrap();
+    let exe = std::env::current_exe()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let hook_for = |actor: &str| {
+        let mut launch = crate::launch::Launch {
+            pre_launch: if cfg!(windows) {
+                format!("\"%HOOK_EXE%\" --exact {TEST} --nocapture")
+            } else {
+                format!("\"$HOOK_EXE\" --exact {TEST} --nocapture")
+            },
+            ..Default::default()
+        };
+        launch.env.insert("HOOK_EXE".into(), exe.clone());
+        launch.env.insert(ACTOR.into(), actor.into());
+        launch
+    };
+    let command = || {
+        let mut command = Command::new(build.join(backend::CLIENT));
+        command
+            .current_dir(&home)
+            .env("SUNRISE_HOME", &home)
+            .arg("--game-dir")
+            .arg(&home)
+            .arg("--resources")
+            .arg(active.resource_path());
+        command
+    };
+
+    // Case 1: a hook that exits 0 after mutating profile inputs must be refused before spawn
+    // with exactly one full resource verification.
+    FULL_VERIFICATIONS.take();
+    let error = profile
+        .spawn_checked_account(
+            &active,
+            &cancellation,
+            command(),
+            (&hook_for("mutate-inputs"), true, &|_| {}, None),
+            |_| Ok(()),
+            |_| panic!("mutated profile reached spawn"),
+        )
+        .err()
+        .expect("mutating hook launched the game");
+    assert!(
+        matches!(&error, StartError::Other(detail) if detail.contains("managed_play/first.rs:")),
+        "{error:?}"
+    );
+    assert!(home.join("hook-mutated-inputs").is_file());
+    assert!(!home.join("game-spawned").exists());
+    assert_eq!(FULL_VERIFICATIONS.take(), 1);
+
+    // Case 2: a hook that exits 0 after mutating the game binary must also be refused before
+    // spawn with exactly one full resource verification.
+    fs::write(home.join(mod_list::FILE), b"mod.lantern:true\n").unwrap();
+    FULL_VERIFICATIONS.take();
+    let error = profile
+        .spawn_checked_account(
+            &active,
+            &cancellation,
+            command(),
+            (&hook_for("mutate-binary"), true, &|_| {}, None),
+            |_| Ok(()),
+            |_| panic!("mutated binary reached spawn"),
+        )
+        .err()
+        .expect("binary-mutating hook launched the game");
+    assert!(
+        matches!(&error, StartError::Other(detail) if detail.contains("managed_play.rs:")),
+        "{error:?}"
+    );
+    assert!(home.join("hook-mutated-binary").is_file());
+    assert!(!home.join("game-spawned").exists());
+    assert_eq!(FULL_VERIFICATIONS.take(), 1);
+}
