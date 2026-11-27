@@ -679,6 +679,7 @@ impl Storage {
                         && present(child.file_type())?.is_some_and(|kind| kind.is_dir())
                         && !child.path().join(".installed").is_file()
                         && !name.to_string_lossy().starts_with(".trash-")
+                        && !crate::backend::installation::private_stage(&name)
                     {
                         entries.push(Entry::fixed(
                             &data,

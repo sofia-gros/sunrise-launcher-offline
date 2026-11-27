@@ -3339,9 +3339,14 @@ mod tests {
                     .iter()
                     .find(|row| row.category == crate::storage::Category::SpareGameBuilds)
                     .unwrap();
-                assert!(staged.kept.iter().any(
-                    |keep| keep.bytes > 0 && keep.reason.contains("unpublished game download")
-                ));
+                assert!(!staged
+                    .kept
+                    .iter()
+                    .any(|keep| keep.reason.contains("unpublished game download")));
+                if backend::installed().is_empty() {
+                    assert_eq!(staged.remaining_bytes, 0);
+                    assert!(staged.kept.is_empty());
+                }
                 assert!(!stage.join(".last-used").exists());
                 assert!(stage.join("unpacked").is_dir());
                 assert!(

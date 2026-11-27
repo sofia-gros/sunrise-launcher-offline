@@ -550,3 +550,38 @@ fn detached_trash_does_not_sweep_a_profile_that_shares_the_launcher_root() {
         assert!(!cache.exists());
     }
 }
+
+#[test]
+fn private_stage_directories_under_versions_are_excluded_from_spare_game_builds() {
+    let home = Home::new();
+    home.installed_version();
+    let build_stage = home.file("launcher/versions/.build-stage-active/payload", &[5; 16384]);
+    let repair_stage = home.file("launcher/versions/.repair-active/payload", &[6; 16384]);
+    let incomplete = home.file("launcher/versions/v0.0.0-incomplete/payload", &[7; 16384]);
+
+    let output = home.run(&["--json", "storage"]);
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let row = report["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["category"] == "spare-game-builds")
+        .unwrap();
+    let expected = row["remaining_bytes"].as_u64().unwrap();
+    assert!(expected > 0, "incomplete build must still be reported");
+
+    let cleared = home.clear("spare-game-builds");
+    let cleared_row = cleared["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["category"] == "spare-game-builds")
+        .unwrap();
+    assert_eq!(cleared_row["freed_bytes"].as_u64().unwrap(), expected);
+    assert_eq!(cleared_row["remaining_bytes"].as_u64().unwrap(), 0);
+    assert!(cleared_row["kept"].as_array().unwrap().is_empty());
+    assert!(!incomplete.exists());
+    assert_eq!(fs::read(build_stage).unwrap(), vec![5; 16384]);
+    assert_eq!(fs::read(repair_stage).unwrap(), vec![6; 16384]);
+}
