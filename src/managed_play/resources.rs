@@ -178,7 +178,10 @@ impl Resources {
                 }
                 Err(error) => {
                     step.failed(&error);
-                    crate::elog!("{error}");
+                    eprintln!(
+                        "Packing game data cache: {}",
+                        launcher_log::safe_error(&error)
+                    );
                     Ok(None)
                 }
             }

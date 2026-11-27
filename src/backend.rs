@@ -2884,7 +2884,7 @@ fn complete_assets_with(
                 Ok(None) => return checking.done("this version's preparer cannot check"),
                 Err(e) => {
                     checking.failed(&e);
-                    return log(format!("{tag}: {e}"));
+                    return log(format!("{tag}: {}", crate::launcher_log::safe_error(&e)));
                 }
             }
         }
@@ -2897,17 +2897,28 @@ fn complete_assets_with(
         return;
     }
     if let Err(error) = Resources::invalidate(&root) {
-        return log(format!("{tag}: {error}"));
+        return log(format!(
+            "{tag}: {}",
+            crate::launcher_log::safe_error(&error.to_string())
+        ));
     }
     let kinds: Vec<String> = lacking.iter().map(|(kind, _)| kind.clone()).collect();
     let fetching = crate::launcher_log::step(format!(
         "Fetching missing game files ({})",
         kinds.join(", ")
     ));
-    let result =
-        crate::preparer::add_extras(&binary, &root, &resources, &kinds, &folders(), log, handoff);
+    let result = crate::preparer::add_extras(
+        &binary,
+        &root,
+        &resources,
+        &kinds,
+        &folders(),
+        &|_| {},
+        handoff,
+    );
     match &result {
-        Ok(_) => fetching.done(""),
+        Ok(Some(added)) => fetching.done(format!("{} added", added.added.len())),
+        Ok(None) => fetching.done("this version's preparer cannot add extras"),
         Err(e) => fetching.failed(e),
     }
     if !stopped() {
@@ -2922,12 +2933,16 @@ fn complete_assets_with(
                     .map_or(kind.as_str(), |(_, what)| what.as_str());
                 log(crate::i18n::trf(
                     "{version}: {what} not added: {error}",
-                    &[("version", tag), ("what", what), ("error", &error)],
+                    &[
+                        ("version", tag),
+                        ("what", what),
+                        ("error", &crate::launcher_log::safe_error(&error)),
+                    ],
                 ));
             }
         }
         Ok(None) => {}
-        Err(e) => log(format!("{tag}: {e}")),
+        Err(e) => log(format!("{tag}: {}", crate::launcher_log::safe_error(&e))),
     }
 }
 
@@ -8855,10 +8870,10 @@ esac"#
         complete_assets_in(&versions, "v1", folders, &log, None);
         assert_eq!(
             *lines.borrow(),
-            [
-                "Built-in packs ready",
-                "v1: The sounds not added: no sound index"
-            ]
+            [format!(
+                "v1: The sounds not added: {}",
+                crate::launcher_log::safe_error("no sound index")
+            )]
         );
         assert_eq!(asked.get(), 1, "one try per run");
         let calls = fs::read_to_string(root.join("extras-calls")).unwrap();
@@ -9781,6 +9796,205 @@ esac"#
             ["missing-extras", "extras", "data-file"],
             "finish_preparation must feed the unlocked missing-extras probe without probing again under lock"
         );
+    }
+
+    /// A preparer reply whose error message, progress message, or stderr names a local path keeps
+    /// that path out of the on-disk `launcher.log`, stderr, and an active switch operation's log
+    /// while still reporting the categorized failure (review of #615).
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_preparer_reply_logs_no_path_in_the_switch_log() {
+        use std::os::unix::fs::PermissionsExt;
+        const SECRET_WORDS: &[&str] = &[
+            "Private",
+            "Client",
+            "Backup",
+            "drafts",
+            "secret.jar",
+            "data.bin",
+            "msg.txt",
+            "stderr.log",
+            "sounds.json",
+            "extras.err",
+            "extras.out",
+        ];
+        let Some(root) = std::env::var_os("PREPARER_ERROR_LOG_ROOT") else {
+            let root = tempfile::tempdir().unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "backend::tests::a_failed_preparer_reply_logs_no_path_in_the_switch_log",
+                    "--nocapture",
+                ])
+                .env("PREPARER_ERROR_LOG_ROOT", root.path())
+                .env("SUNRISE_LAUNCHER_HOME", root.path())
+                .env("SUNRISE_HOME", root.path().join("home"))
+                .env("XDG_DATA_HOME", root.path().join("xdg-data"))
+                .env("XDG_CONFIG_HOME", root.path().join("xdg-config"))
+                .env("SUNRISE_LAUNCHER_NO_SELF_UPDATE", "1")
+                .env("SUNRISE_NO_AUDIO", "1")
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "child failed:\nstdout:\n{}\nstderr:\n{stderr}",
+                String::from_utf8_lossy(&output.stdout),
+            );
+            for expected in [
+                "(os error 2)",
+                "(os error 13)",
+                "(os error 5)",
+                "(os error 28)",
+                "v-invalidate:",
+            ] {
+                assert!(
+                    stderr.contains(expected),
+                    "stderr missing categorized failure {expected}: {stderr}"
+                );
+            }
+            for word in SECRET_WORDS {
+                assert!(!stderr.contains(word), "{word} leaked to stderr: {stderr}");
+            }
+            let disk_log = fs::read_to_string(root.path().join("logs/launcher.log")).unwrap();
+            for expected in [
+                "Checking game files: failed after",
+                "(os error 2)",
+                "Packing game data cache: failed after",
+                "(os error 13)",
+                "v-extras-partial: The sounds not added:",
+                "(os error 5)",
+                "Fetching missing game files (sounds): failed after",
+                "(os error 28)",
+                "v-invalidate:",
+            ] {
+                assert!(
+                    disk_log.contains(expected),
+                    "launcher.log missing {expected}: {disk_log}"
+                );
+            }
+            for word in SECRET_WORDS {
+                assert!(
+                    !disk_log.contains(word),
+                    "{word} leaked to launcher.log: {disk_log}"
+                );
+            }
+            return;
+        };
+        let root = PathBuf::from(root);
+        crate::launcher_log::init(&root.join("logs"));
+        let make_version = |tag: &str, script: &str| {
+            let version = root.join("versions").join(tag);
+            let resources = version.join(".local/sunrise-client/26.3");
+            fs::create_dir_all(&resources).unwrap();
+            fs::write(
+                version.join("research-lock.json"),
+                r#"{"minecraft":{"version":"26.3"}}"#,
+            )
+            .unwrap();
+            fs::write(version.join(COMPLETE), "").unwrap();
+            fs::write(resources.join(RESOURCES_MANIFEST), "{}").unwrap();
+            let preparer = version.join("sunrise-prepare");
+            fs::write(&preparer, format!("#!/bin/sh\n{script}\n")).unwrap();
+            fs::set_permissions(&preparer, fs::Permissions::from_mode(0o700)).unwrap();
+            version
+        };
+        let lacking =
+            r#"{"format":1,"prepared":true,"missing":[{"kind":"sounds","what":"The sounds"}]}"#;
+        make_version(
+            "v-missing",
+            concat!(
+                "case \"$1\" in\n",
+                "  missing-extras) printf '%s\\n' '{\"format\":1,\"error\":{\"message\":\"could not open /home/ada/Private Client Backup/drafts/secret.jar (os error 2)\"}}'; exit 1;;\n",
+                "  data-file) printf '%s\\n' '{\"format\":1,\"error\":{\"message\":\"could not write /home/ada/Private Client Backup/drafts/data.bin (os error 13)\"}}'; exit 1;;\n",
+                "  *) exit 2;;\n",
+                "esac",
+            ),
+        );
+        make_version(
+            "v-extras-partial",
+            &format!(
+                concat!(
+                    "case \"$1\" in\n",
+                    "  missing-extras) printf '%s\\n' '{lacking}';;\n",
+                    "  extras)\n",
+                    "    printf '%s\\n' '{{\"message\":\"could not inspect /home/ada/Private Client Backup/drafts/msg.txt (os error 1)\"}}'\n",
+                    "    printf '%s\\n' 'failed reading /home/ada/Private Client Backup/drafts/stderr.log (os error 22)' >&2\n",
+                    "    printf '%s\\n' '{{\"format\":1,\"added\":[],\"failed\":[{{\"kind\":\"sounds\",\"error\":\"could not read /home/ada/Private Client Backup/drafts/sounds.json (os error 5)\"}}],\"missing\":[{{\"kind\":\"sounds\",\"what\":\"The sounds\"}}]}}'\n",
+                    "    exit 1;;\n",
+                    "  data-file) printf '%s\\n' '{{\"format\":1,\"written\":false}}';;\n",
+                    "  *) exit 2;;\n",
+                    "esac",
+                ),
+                lacking = lacking,
+            ),
+        );
+        make_version(
+            "v-extras-err",
+            &format!(
+                concat!(
+                    "case \"$1\" in\n",
+                    "  missing-extras) printf '%s\\n' '{lacking}';;\n",
+                    "  extras)\n",
+                    "    printf '%s\\n' 'failed in /home/ada/Private Client Backup/drafts/extras.err (os error 17)' >&2\n",
+                    "    printf '%s\\n' '{{\"format\":1,\"error\":{{\"message\":\"could not write /home/ada/Private Client Backup/drafts/extras.out (os error 28)\"}}}}'\n",
+                    "    exit 1;;\n",
+                    "  data-file) printf '%s\\n' '{{\"format\":1,\"written\":false}}';;\n",
+                    "  *) exit 2;;\n",
+                    "esac",
+                ),
+                lacking = lacking,
+            ),
+        );
+        let invalidate = make_version(
+            "v-invalidate",
+            &format!(
+                concat!(
+                    "case \"$1\" in\n",
+                    "  missing-extras) printf '%s\\n' '{lacking}';;\n",
+                    "  *) exit 2;;\n",
+                    "esac",
+                ),
+                lacking = lacking,
+            ),
+        );
+        fs::create_dir_all(invalidate.join(".local/launcher-prepared/current.json")).unwrap();
+
+        let op = crate::launcher_log::Operation::new(|_| {});
+        let _guard = op.enter();
+        let before = crate::launcher_log::since(0).0;
+        for tag in ["v-missing", "v-extras-partial", "v-extras-err"] {
+            let preparation = prepare_lock(tag).unwrap();
+            Resources::prepare(tag, &preparation, None).unwrap();
+        }
+        let inv_lock = prepare_lock("v-invalidate").unwrap();
+        complete_assets_staged("v-invalidate", &inv_lock.handoff(None));
+
+        let (_, mine) = crate::launcher_log::since_in(before, op.id());
+        for expected in [
+            ("Checking game files: failed after", "(os error 2)"),
+            ("v-missing:", "(os error 2)"),
+            ("Packing game data cache: failed after", "(os error 13)"),
+            ("v-extras-partial: The sounds not added:", "(os error 5)"),
+            (
+                "Fetching missing game files (sounds): failed after",
+                "(os error 28)",
+            ),
+            ("v-extras-err:", "(os error 28)"),
+            ("v-invalidate:", "(os error "),
+        ] {
+            assert!(
+                mine.iter()
+                    .any(|line| line.contains(expected.0) && line.contains(expected.1)),
+                "switch log missing {expected:?}: {mine:?}"
+            );
+        }
+        for word in SECRET_WORDS {
+            assert!(
+                mine.iter().all(|line| !line.contains(word)),
+                "{word} leaked to switch log: {mine:?}"
+            );
+        }
     }
 }
 
