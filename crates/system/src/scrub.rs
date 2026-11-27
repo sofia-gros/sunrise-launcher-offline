@@ -50,16 +50,16 @@ impl Scrubber {
     }
 
     pub fn scrub(&self, text: &str) -> String {
-        let mut out = text.to_owned();
-        for term in &self.terms {
-            out = out.replace(term.as_str(), PRIVATE);
-        }
-        out = user_folders(&out);
-        out = replace_tokens(&out, email_at);
+        let mut out = replace_tokens(text, email_at);
         out = replace_tokens(&out, ipv4_at);
         out = replace_tokens(&out, ipv6_at);
         out = replace_tokens(&out, uuid_at);
         out = connecting_host(&out);
+        // Private terms can be part of the text that identifies an address or credential.
+        for term in &self.terms {
+            out = out.replace(term.as_str(), PRIVATE);
+        }
+        out = user_folders(&out);
         if let Some(user) = &self.user {
             out = replace_word(&out, user, USER);
         }
@@ -67,10 +67,8 @@ impl Scrubber {
     }
 }
 
-/// The game's `Connecting to <host>, <port>` log line (vanilla's, which other launchers read to offer
-/// the server again): the host becomes [`PRIVATE`], unless another rule already replaced it, and the
-/// port stays. Only that exact shape matches: one word, a comma and a port (digits, or what a known
-/// term already replaced) to the end of the line.
+/// Hides the host in a connection record, keeping the port: vanilla writes `host, port`,
+/// and launcher connection lines may use `host:port`. Ordinary prose is left alone.
 fn connecting_host(text: &str) -> String {
     const HEAD: &str = "Connecting to ";
     let mut out = String::with_capacity(text.len());
@@ -80,21 +78,25 @@ fn connecting_host(text: &str) -> String {
         out.push_str(&rest[..from]);
         let after = &rest[from..];
         let line = after.find(['\r', '\n']).unwrap_or(after.len());
-        let comma = after[..line].rfind(", ").filter(|&comma| {
-            let port = after[comma + 2..line].trim_end();
-            !after[..comma].contains(char::is_whitespace)
-                && (port == PRIVATE
-                    || (!port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())))
-        });
-        match comma {
-            Some(comma) => {
-                let host = &after[..comma];
+        let address = after[..line].trim_end();
+        let host = address
+            .rsplit_once(", ")
+            .or_else(|| address.rsplit_once(':'))
+            .and_then(|(host, port)| {
+                (!host.is_empty()
+                    && !host.contains(char::is_whitespace)
+                    && (port == PRIVATE
+                        || (!port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))))
+                .then_some(host)
+            });
+        match host {
+            Some(host) => {
                 out.push_str(if host == IP || host == PRIVATE {
                     host
                 } else {
                     PRIVATE
                 });
-                rest = &after[comma..];
+                rest = &after[host.len()..];
             }
             None => rest = after,
         }
@@ -149,16 +151,16 @@ fn replace_tokens(
     let mut i = 0;
     let mut copied = 0;
     while i < bytes.len() {
-        if text.is_char_boundary(i)
-            && let Some((len, label)) = matcher(bytes, i)
-        {
-            out.push_str(&text[copied..i]);
-            out.push_str(label);
-            i += len;
-            copied = i;
-        } else {
-            i += 1;
+        if text.is_char_boundary(i) {
+            if let Some((len, label)) = matcher(bytes, i) {
+                out.push_str(&text[copied..i]);
+                out.push_str(label);
+                i += len;
+                copied = i;
+                continue;
+            }
         }
+        i += 1;
     }
     out.push_str(&text[copied..]);
     out
@@ -325,7 +327,7 @@ mod tests {
     use super::*;
 
     /// The game logs `Connecting to <host>, <port>` for every connection, as vanilla does: the
-    /// host is private, the port is not. Only that exact shape matches.
+    /// host is private, the port is not.
     #[test]
     fn the_host_of_a_connecting_line_is_private() {
         let s = Scrubber::bare();
@@ -471,7 +473,7 @@ mod tests {
     }
 
     #[test]
-    fn known_private_terms_go_first() {
+    fn known_private_terms_are_hidden() {
         let s = Scrubber::bare()
             .term("My World")
             .term("play.example.net")
