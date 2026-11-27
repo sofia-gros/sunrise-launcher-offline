@@ -33,14 +33,17 @@ pub(super) enum Confirm {
 }
 
 impl View {
-    fn stop_count(&mut self) {
+    pub(crate) fn stop_count(&mut self) {
         self.generation += 1;
         if let Some(cancel) = self.cancel.take() {
             cancel.cancel();
         }
     }
 
-    fn start_count(&mut self, location_unavailable: bool) -> Option<(u64, storage::Cancel)> {
+    pub(crate) fn start_count(
+        &mut self,
+        location_unavailable: bool,
+    ) -> Option<(u64, storage::Cancel)> {
         self.stop_count();
         self.rows = None;
         if location_unavailable {
@@ -51,11 +54,16 @@ impl View {
         Some((self.generation, cancel))
     }
 
-    fn accept_rows(&mut self, generation: u64, mut rows: Vec<Build>) {
+    pub(crate) fn accept_rows(&mut self, generation: u64, mut rows: Vec<Build>) {
         if self.generation == generation {
             rows.retain(|row| row.size_unavailable != Some(SizeUnavailable::Vanished));
             self.rows = Some(rows);
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_rows(&self) -> bool {
+        self.rows.is_some()
     }
 }
 
@@ -91,11 +99,6 @@ impl Launcher {
         });
     }
 
-    pub(super) fn stop_storage_builds_count(&mut self) {
-        self.storage_builds.stop_count();
-    }
-
-    /// Shown on Storage: count the builds' sizes and the rows. Anywhere else: stop counting.
     pub(super) fn refresh_open_storage_builds(&mut self) {
         if self.ui.page == frame::Page::Settings
             && self.ui.settings.section == settings::Section::Storage

@@ -14,6 +14,42 @@ pub(crate) struct Work {
     clearing: bool,
 }
 
+#[cfg(test)]
+impl Work {
+    pub(crate) fn count_for_test() -> Self {
+        Self {
+            cancel: storage::Cancel::default(),
+            clearing: false,
+        }
+    }
+
+    pub(crate) fn clear_for_test() -> Self {
+        Self {
+            cancel: storage::Cancel::default(),
+            clearing: true,
+        }
+    }
+
+    pub(crate) fn cancel_token(&self) -> storage::Cancel {
+        self.cancel.clone()
+    }
+}
+
+/// Cancels any active Storage inventory and build-size counts and drops pending confirmations.
+/// A Clear in flight keeps running.
+pub(crate) fn stop_storage_counts(
+    settings: &mut settings::SettingsView,
+    builds: &mut storage_builds::View,
+    storage_confirm: &mut Option<Option<Category>>,
+) {
+    if let Some(count) = settings.storage_work.take_if(|work| !work.clearing) {
+        count.cancel.cancel();
+    }
+    builds.stop_count();
+    builds.confirm = None;
+    *storage_confirm = None;
+}
+
 /// Whether Clear can start independently of any count in flight.
 pub(crate) fn clear_offered(work: Option<&Work>) -> bool {
     !work.is_some_and(|work| work.clearing)
@@ -190,10 +226,11 @@ impl Launcher {
     /// Leaving Storage cancels what is still being counted, the installed builds' sizes too. A
     /// Clear in flight runs to its end.
     pub(super) fn stop_storage_work(&mut self) {
-        if let Some(count) = self.ui.settings.storage_work.take_if(|work| !work.clearing) {
-            count.cancel.cancel();
-        }
-        self.stop_storage_builds_count();
+        stop_storage_counts(
+            &mut self.ui.settings,
+            &mut self.storage_builds,
+            &mut self.storage_confirm,
+        );
     }
 }
 
