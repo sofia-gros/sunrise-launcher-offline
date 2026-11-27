@@ -459,7 +459,10 @@ mod tests {
                     cancel.cancel();
                 });
                 assert_eq!(handed_over, 1);
-                assert_eq!(builds.iter().filter(|build| build.bytes.is_some()).count(), 1);
+                assert_eq!(
+                    builds.iter().filter(|build| build.bytes.is_some()).count(),
+                    1
+                );
                 let mut builds = inventory(&[]);
                 measure(&mut builds, &Cancel::default(), |_| {});
                 assert!(builds
