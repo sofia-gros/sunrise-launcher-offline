@@ -217,7 +217,7 @@ impl Resources {
             &parent(&root),
             path.parent().expect("snapshot parent"),
         ] {
-            require_dir(dir)?;
+            require_dir(dir).map_err(|_| setup_error())?;
         }
         launcher_log::play_detail(crate::i18n::tr("Checking the game files"));
         let meter = launcher_log::PlayMeter::new(|done, total| {
@@ -235,14 +235,16 @@ impl Resources {
                     pool::workers(),
                     None,
                     Some(&on_done),
-                )? {
+                )
+                .map_err(|_| setup_error())?
+                {
                     Some((digest, files)) => (Some(digest), files),
                     None => (None, 0),
                 },
             )
         })?;
         if actual != Some(self.primary) {
-            return Err(setup_error(&path));
+            return Err(setup_error());
         }
         Ok(())
     }
@@ -275,13 +277,13 @@ impl Resources {
         stop: Option<&Cancellation>,
         accelerator: impl FnOnce(&Path) -> Result<Option<[u8; 32]>, String>,
     ) -> Result<Self, String> {
-        let relative = source.strip_prefix(root).map_err(|_| setup_error(source))?;
+        let relative = source.strip_prefix(root).map_err(|_| setup_error())?;
         if relative.as_os_str().is_empty()
             || relative
                 .components()
                 .any(|part| !matches!(part, std::path::Component::Normal(_)))
         {
-            return Err(setup_error(source));
+            return Err(setup_error());
         }
         for ancestor in source.ancestors().take_while(|path| *path != root) {
             require_dir(ancestor)?;
@@ -305,10 +307,10 @@ impl Resources {
             )
         })?;
         let Some(primary) = primary else {
-            return Err(setup_error(source));
+            return Err(setup_error());
         };
         let parent = parent(root);
-        fs::create_dir_all(&parent).map_err(|e| at(&parent, e))?;
+        fs::create_dir_all(&parent).map_err(io_failure)?;
         require_dir(&parent)?;
         let snapshot = parent.join(key(primary));
         let resources = snapshot.join("resources");
@@ -332,7 +334,7 @@ impl Resources {
             let stage = tempfile::Builder::new()
                 .prefix(".prepared-")
                 .tempdir_in(root.join(".local"))
-                .map_err(|error| at(root, error))?;
+                .map_err(io_failure)?;
             let candidate = stage.path().join("resources");
             let on_copy = |done, total: usize| {
                 seal_meter.tick(
@@ -370,15 +372,14 @@ impl Resources {
                 let retired = tempfile::Builder::new()
                     .prefix(".prepared-damaged-")
                     .tempdir_in(root.join(".local"))
-                    .map_err(|error| at(root, error))?;
+                    .map_err(io_failure)?;
                 durable::move_new_directory(&snapshot, &retired.path().join("snapshot"))
-                    .map_err(|error| at(&snapshot, error))?;
+                    .map_err(io_failure)?;
                 Some(retired)
             } else {
                 None
             };
-            durable::move_new_directory(stage.path(), &snapshot)
-                .map_err(|error| at(&snapshot, error))?;
+            durable::move_new_directory(stage.path(), &snapshot).map_err(io_failure)?;
             let digest = accelerator(&resources)?;
             if let Some(digest) = digest {
                 write_receipt(&evidence, &digest)?;
@@ -419,12 +420,12 @@ fn receipt(root: &Path) -> Result<PathBuf, String> {
 // primary tree is already durable and a profile's independent digest is checked at cutoff.
 fn write_receipt(path: &Path, value: &impl Serialize) -> Result<(), String> {
     let mut staged = tempfile::NamedTempFile::new_in(path.parent().expect("snapshot directory"))
-        .map_err(|e| at(path, e))?;
+        .map_err(io_failure)?;
     serde_json::to_writer(&mut staged, value).map_err(|e| e.to_string())?;
     staged
         .persist(path)
         .map(|_| ())
-        .map_err(|e| at(path, e.error))
+        .map_err(|e| io_failure(e.error))
 }
 fn key(digest: [u8; 32]) -> String {
     format!("{:x}", sha2::digest::Output::<Sha256>::from(digest))
@@ -492,11 +493,11 @@ fn copy_tree_with(
         on_done,
         || (),
         |_, (src, dst)| {
-            let meta = fs::symlink_metadata(src).map_err(|e| at(src, e))?;
+            let meta = fs::symlink_metadata(src).map_err(io_failure)?;
             if !plain_file(&meta) || !meta.is_file() {
-                return Err(setup_error(src));
+                return Err(setup_error());
             }
-            preparer::clone_or_copy(src, dst).map_err(|e| at(dst, e))
+            preparer::clone_or_copy(src, dst).map_err(io_failure)
         },
     )?;
     Ok(copied)
@@ -511,32 +512,32 @@ fn lay_out(
     copied: &mut Copied,
 ) -> Result<(), String> {
     if depth > 64 {
-        return Err(setup_error(source));
+        return Err(setup_error());
     }
     if let Some(stop) = stop {
         stop.check()?;
     }
     require_dir(source)?;
-    fs::create_dir(dest).map_err(|e| at(dest, e))?;
+    fs::create_dir(dest).map_err(io_failure)?;
     copied.dirs.push(dest.to_owned());
-    for entry in fs::read_dir(source).map_err(|e| at(source, e))? {
-        let entry = entry.map_err(|e| at(source, e))?;
+    for entry in fs::read_dir(source).map_err(io_failure)? {
+        let entry = entry.map_err(io_failure)?;
         let name = entry.file_name();
         if skip_accelerator && generated_cache(&name) {
             continue;
         }
         let src = entry.path();
         let dst = dest.join(name);
-        let meta = fs::symlink_metadata(&src).map_err(|e| at(&src, e))?;
+        let meta = fs::symlink_metadata(&src).map_err(io_failure)?;
         if !plain_file(&meta) {
-            return Err(setup_error(&src));
+            return Err(setup_error());
         }
         if meta.is_dir() {
             lay_out(&src, &dst, false, depth + 1, stop, copied)?;
         } else if meta.is_file() {
             copied.files.push((src, dst));
         } else {
-            return Err(setup_error(&src));
+            return Err(setup_error());
         }
     }
     Ok(())
@@ -556,23 +557,23 @@ fn flush_copied(
         stop,
         on_done,
         || (),
-        |_, (_, dst)| durable::flush_tree(dst).map_err(|e| at(dst, e)),
+        |_, (_, dst)| durable::flush_tree(dst).map_err(io_failure),
     )?;
     pool::run(
         &copied.dirs,
         workers,
         stop,
         || (),
-        |_, dir| durable::flush_directory(dir).map_err(|e| at(dir, e)),
+        |_, dir| durable::flush_directory(dir).map_err(io_failure),
     )
     .map(drop)
 }
 
-fn setup_error(path: &Path) -> String {
-    format!("{}: {}", path.display(), unsettled!())
+fn setup_error() -> String {
+    unsettled!()
 }
-fn at(path: &Path, error: io::Error) -> String {
-    format!("{}: {error}", path.display())
+fn io_failure(error: io::Error) -> String {
+    unsettled!(error.kind())
 }
 
 /// The optional data cache a seal packs, as a `launcher.log` step: its digest when written.
@@ -872,11 +873,11 @@ mod tests {
             let error = copy_tree_with(&source, &root.join("copy"), true, 0, workers, None, None)
                 .err()
                 .unwrap();
-            assert_eq!(error, setup_error(&link));
+            assert_eq!(error, setup_error());
             fs::remove_dir_all(root.join("copy")).unwrap();
             let error =
                 Resources::seal_with(root, &source, workers, None, |_| Ok(None)).unwrap_err();
-            assert_eq!(error, at(&link, io::ErrorKind::InvalidData.into()));
+            assert!(error.contains("invalid data"), "{error}");
             assert!(!parent(root).exists());
         }
     }

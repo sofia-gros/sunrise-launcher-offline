@@ -940,6 +940,7 @@ fn play_hashes_the_prepared_files_once_and_still_refuses_damage() {
             "{stdout}\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(&*root.path().to_string_lossy()));
         return;
     };
     let fixture = std::path::PathBuf::from(fixture);
@@ -1033,11 +1034,16 @@ fn play_hashes_the_prepared_files_once_and_still_refuses_damage() {
         active
     };
     let snapshot_error = |active: &Active, error: String| {
+        let prefix =
+            "Sunrise couldn't verify the profile's saved game build (managed_play/resources.rs:";
+        let line = error
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(")."));
         assert!(
-            error.starts_with(&format!("{}: ", active.resource_path().display())),
+            line.is_some_and(|line| line.parse::<u32>().is_ok()),
             "{error}"
         );
-        assert!(error.contains("managed_play/resources.rs:"), "{error}");
+        assert!(!error.contains(&active.resource_path().to_string_lossy().into_owned()));
     };
 
     // First Play, an unchanged Play, and a Play that refreshes for a changed mod.
