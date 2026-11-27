@@ -198,6 +198,7 @@ impl Cache {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn bytes(&self) -> Result<u64, Error> {
         self.process(None, false)
     }

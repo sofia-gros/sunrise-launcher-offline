@@ -740,7 +740,7 @@ impl Storage {
             if cancel.is_cancelled() {
                 break;
             }
-            if profile_home(&parent) || parent.parent().is_some_and(&profile_home) {
+            if profile_home(&parent) || parent.parent().is_some_and(profile_home) {
                 continue;
             }
             let root = match Root::open(&parent) {
