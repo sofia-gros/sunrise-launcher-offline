@@ -575,22 +575,36 @@ impl Storage {
             let versions =
                 Entry::fixed(&data, Path::new("versions"), Category::SpareGameBuilds)?.path;
             if let Some(profiles) = &profiles {
-                spare_builds(&mut entries, &data, profiles, cancel)?;
-            }
-            // Interrupted removal loses completion; keep those units visible for retry.
-            for child in children_until(&versions, cancel)? {
-                if cancel.is_cancelled() {
-                    break;
-                }
-                if present(child.file_type())?.is_some_and(|kind| kind.is_dir())
-                    && !child.path().join(".installed").is_file()
-                    && !child.file_name().to_string_lossy().starts_with(".trash-")
-                {
-                    entries.push(Entry::fixed(
-                        &data,
-                        &Path::new("versions").join(child.file_name()),
-                        Category::SpareGameBuilds,
-                    )?);
+                let settings = backend::Settings::load();
+                let selected = settings.selected.as_deref();
+                spare_builds(&mut entries, &data, profiles, selected, cancel)?;
+                // Interrupted removal loses completion; keep unpinned incomplete units visible for
+                // retry, never overriding ordinary profile pins or an unreadable profile snapshot.
+                for child in children_until(&versions, cancel)? {
+                    if cancel.is_cancelled() {
+                        break;
+                    }
+                    let name = child.file_name();
+                    let pinned = name.to_str().is_some_and(|tag| {
+                        selected.is_some_and(|v| v.eq_ignore_ascii_case(tag))
+                            || profiles.iter().any(|profile| {
+                                profile
+                                    .version
+                                    .as_deref()
+                                    .is_some_and(|v| v.eq_ignore_ascii_case(tag))
+                            })
+                    });
+                    if !pinned
+                        && present(child.file_type())?.is_some_and(|kind| kind.is_dir())
+                        && !child.path().join(".installed").is_file()
+                        && !name.to_string_lossy().starts_with(".trash-")
+                    {
+                        entries.push(Entry::fixed(
+                            &data,
+                            &Path::new("versions").join(name),
+                            Category::SpareGameBuilds,
+                        )?);
+                    }
                 }
             }
         }
@@ -1032,12 +1046,14 @@ fn spare_builds(
     entries: &mut Vec<Entry>,
     data: &Root,
     profiles: &[instances::Instance],
+    selected: Option<&str>,
     cancel: &Cancel,
 ) -> Result<(), Error> {
     let played: HashSet<_> = profiles
         .iter()
         .take_while(|_| !cancel.is_cancelled())
         .filter_map(|instance| instance.resolve_version(None).ok())
+        .map(|tag| tag.to_ascii_lowercase())
         .collect();
     if cancel.is_cancelled() {
         return Ok(());
@@ -1045,12 +1061,22 @@ fn spare_builds(
     let Some(installed) = backend::installed_until(cancel) else {
         return Ok(());
     };
+    let pinned = |version: &str| {
+        selected.is_some_and(|v| v.eq_ignore_ascii_case(version))
+            || played.contains(&version.to_ascii_lowercase())
+            || profiles.iter().any(|instance| {
+                instance
+                    .version
+                    .as_deref()
+                    .is_some_and(|v| v.eq_ignore_ascii_case(version))
+            })
+    };
     for version in installed {
         if cancel.is_cancelled() {
             break;
         }
         if native_mods::is_native(&version)
-            && !played.contains(&version)
+            && !pinned(&version)
             && native_mods::resource_dependent(&version).is_none()
             && !backend::in_use(&version)
         {

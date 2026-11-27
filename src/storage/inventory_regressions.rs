@@ -372,3 +372,121 @@ fn shared_runtime_lease_on_profile_context_root_blocks_clearing_profile_caches()
         );
     }
 }
+
+#[test]
+fn incomplete_build_retry_and_clear_recheck_enforce_ordinary_profile_pins() {
+    const TEST: &str = "storage::inventory::regressions::incomplete_build_retry_and_clear_recheck_enforce_ordinary_profile_pins";
+    const ACTOR: &str = "STORAGE_ORDINARY_PIN_RECHECK_ACTOR";
+    if std::env::var_os(ACTOR).is_none() {
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(ACTOR, "1")
+            .env("SUNRISE_LAUNCHER_HOME", root.path().join("launcher"))
+            .env("SUNRISE_HOME", root.path().join("game"))
+            .env(
+                "SUNRISE_LAUNCHER_LOCATION_FILE",
+                root.path().join("location"),
+            )
+            .env("XDG_DATA_HOME", root.path().join("xdg-data"))
+            .env("XDG_CONFIG_HOME", root.path().join("xdg-config"))
+            .env("SUNRISE_NO_KEYCHAIN", "1")
+            .env("SUNRISE_LAUNCHER_NO_SELF_UPDATE", "1")
+            .env("SUNRISE_NO_AUDIO", "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let data = backend::data_dir();
+    let base = backend::version_dir("v0.0.1");
+    fs::create_dir_all(&base).unwrap();
+    fs::write(base.join(".installed"), b"").unwrap();
+    fs::write(data.join("settings.json"), br#"{"selected":"v0.0.1"}"#).unwrap();
+
+    // 1. An incomplete build (no `.installed`) pinned by an ordinary profile must neither be
+    // selected for retry nor removed under the publication fence.
+    let incomplete = backend::version_dir("native-incomplete");
+    fs::create_dir_all(&incomplete).unwrap();
+    fs::write(incomplete.join("game"), b"pinned incomplete").unwrap();
+    let pin = instances::create("Pinned", None).unwrap();
+    instances::edit(&pin.id, |meta| {
+        meta.version = Some("native-incomplete".into())
+    })
+    .unwrap();
+
+    // 2. A spare native build pinned after Clear selects it must be refused under the fence.
+    let raced = backend::version_dir("native-raced");
+    fs::create_dir_all(&raced).unwrap();
+    fs::write(raced.join(".installed"), b"").unwrap();
+    fs::write(raced.join("game"), b"newly pinned").unwrap();
+    let late = instances::create("Late Pin", None).unwrap();
+
+    let storage = Storage::at(&data).unwrap();
+    let entries = storage.entries().unwrap();
+    assert!(
+        !entries.iter().any(|entry| entry.path == incomplete),
+        "incomplete build pinned by an ordinary profile was selected for retry"
+    );
+    assert!(
+        entries.iter().any(|entry| entry.path == raced),
+        "unpinned spare native build should be a candidate before the late pin"
+    );
+
+    let late_id = late.id.clone();
+    let report = storage
+        .clear_observed(Some(Category::SpareGameBuilds), false, |path| {
+            if backend::plain(path.to_path_buf()) == backend::plain(raced.clone()) {
+                instances::edit(&late_id, |meta| meta.version = Some("native-raced".into()))
+                    .unwrap();
+            }
+        })
+        .unwrap();
+    let row = report
+        .rows
+        .iter()
+        .find(|row| row.category == Category::SpareGameBuilds)
+        .unwrap();
+    assert!(row
+        .kept
+        .iter()
+        .any(|unit| unit.kind == KeptKind::ReferencedProfile));
+    assert_eq!(
+        fs::read(raced.join("game")).unwrap(),
+        b"newly pinned",
+        "spare build pinned after selection was deleted"
+    );
+    assert_eq!(
+        fs::read(incomplete.join("game")).unwrap(),
+        b"pinned incomplete",
+        "pinned incomplete build was deleted"
+    );
+    assert!(matches!(
+        crate::cache_cleanup::clear_claimed_unit_with_contexts(&incomplete, &[]),
+        Err(Error::ReferencedProfile)
+    ));
+
+    // 3. With an unreadable instances.json, incomplete builds are neither selected nor removed.
+    let orphan = backend::version_dir("native-unproven");
+    fs::create_dir_all(&orphan).unwrap();
+    fs::write(orphan.join("game"), b"unproven").unwrap();
+    fs::write(data.join("instances.json"), b"{not valid json").unwrap();
+    assert!(
+        !storage
+            .entries()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.path == orphan),
+        "unreadable instances.json must suppress incomplete-build retry selection"
+    );
+    assert!(matches!(
+        crate::cache_cleanup::clear_claimed_unit_with_contexts(&orphan, &[]),
+        Err(Error::UnprovenReferences)
+    ));
+    assert_eq!(fs::read(orphan.join("game")).unwrap(), b"unproven");
+}

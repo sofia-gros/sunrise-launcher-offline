@@ -123,6 +123,21 @@ fn profile_user<'a>(
     })
 }
 
+/// Under the exclusive publication fence, verify no ordinary profile or launcher default
+/// selection pins or resolves to `tag`. Fails closed if `instances.json` cannot be read.
+pub(crate) fn require_unpinned_by_profiles(tag: &str) -> Result<(), Error> {
+    let settings = Settings::load();
+    let selected = settings.selected.as_ref();
+    let (installed, nightly) = play_installations(selected.map(String::as_str));
+    let profiles = instances::list_for_storage().map_err(|_| Error::UnprovenReferences)?;
+    if selected.is_some_and(|v| v.eq_ignore_ascii_case(tag))
+        || profile_user(&profiles, &installed, selected, nightly.as_ref(), &[], tag).is_some()
+    {
+        return Err(Error::ReferencedProfile);
+    }
+    Ok(())
+}
+
 pub fn inventory(releases: &[Release]) -> Vec<Build> {
     inventory_until(releases, &Cancel::default()).expect("an uncancellable inventory finishes")
 }
