@@ -466,6 +466,25 @@ pub fn since_in(since: u64, id: u64) -> (u64, Vec<String>) {
     lock(&RING).since_in(since, Some(id))
 }
 
+/// What `launcher.log` and the ring keep of a line the game's preparer wrote, or a line about
+/// its preparation: the line itself, or a fixed note when it names a file or an address. The
+/// preparer writes paths in its progress lines ("Imported client 26.3 from <file>") and its
+/// errors, and no rule can tell where such a path ends (review of #615), so a line with a path
+/// separator or an address is left out whole. The window's Logs panel still shows it.
+pub fn preparer_line(line: &str) -> String {
+    format!("Preparing: {}", without_paths(line))
+}
+
+/// `line` as the log keeps a line about preparing or downloading a build's files: as it is, or a
+/// fixed note when it has a path separator or an address in it (see [`preparer_line`]).
+pub fn without_paths(line: &str) -> &str {
+    if line.contains(['/', '\\']) || line.contains("://") {
+        "(a line that names a file or an address, left out of the log)"
+    } else {
+        line
+    }
+}
+
 /// An error's text as the log keeps it: a fixed category and, when the text has one, its OS
 /// error code or HTTP status (`entity not found (os error 2)`, `HTTP 404`). Nothing else of the
 /// text reaches `launcher.log` or the ring: an error's words can hold a local path with any

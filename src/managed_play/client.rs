@@ -480,7 +480,10 @@ fn turn_off_mods(
         .collect();
     let mut worlds = crate::worlds::review_risk(home, &suspects)
         .map_err(|error| {
-            crate::elog!("checking saved worlds before turning off mods: {error}");
+            crate::elog!(
+                "checking saved worlds before turning off mods: {}",
+                crate::launcher_log::safe_error(&error.to_string())
+            );
             crate::i18n::tr("Sunrise couldn't check the saved worlds. No mods were turned off.")
                 .to_owned()
         })?
@@ -542,7 +545,7 @@ pub fn headless_first(instance: &instances::Instance) -> Result<FirstBuild, Stri
 /// window and the CLI `play` path pass through here, so neither logs twice and both record
 /// preparation progress in `launcher.log`).
 fn emit_prepare_line(progress: &impl Fn(Progress), line: String) {
-    crate::launcher_log::line(format!("Preparing: {line}"));
+    crate::launcher_log::line(crate::launcher_log::preparer_line(&line));
     progress(Progress::Line(line));
 }
 
@@ -582,6 +585,45 @@ mod cli_log_tests {
                 .iter()
                 .any(|l| l.contains("Checking cli files: 1 of 50")),
             "{lines:?}"
+        );
+    }
+
+    /// The preparer names files in its progress lines and errors: such a line reaches the
+    /// caller whole and `launcher.log` only as a fixed note (review of #615).
+    #[test]
+    fn a_preparer_line_naming_a_file_or_address_stays_out_of_the_log() {
+        let named = [
+            "Imported client 26.3 from /home/ada/Private Client Backup/.minecraft/versions/26.3/26.3.jar",
+            r"C:\Users\Ada Lovelace\Private Client Backup\java\bin\javac.exe: The system cannot find the file specified. (os error 2)",
+            r"\\nas\Private Client Backup\sounds\indexes\26.json: denied",
+            "Downloading https://piston-data.mojang.com/v1/objects/0123/client.jar for Private Client Backup",
+            "Missing versions/26.3/26.3.json in Private Client Backup",
+        ];
+        let before = crate::launcher_log::since(0).0;
+        let seen = std::cell::RefCell::new(Vec::new());
+        for line in named {
+            emit_prepare_line(
+                &|p| {
+                    if let Progress::Line(line) = p {
+                        seen.borrow_mut().push(line);
+                    }
+                },
+                line.into(),
+            );
+        }
+        assert_eq!(seen.into_inner(), named, "the window gets each line whole");
+        let (_, lines) = crate::launcher_log::since(before);
+        let left_out = lines
+            .iter()
+            .filter(|l| l.contains("Preparing: (a line that names a file or an address"))
+            .count();
+        assert_eq!(left_out, named.len(), "{lines:?}");
+        for word in ["Private Client Backup", "/home/ada", "piston-data", "javac"] {
+            assert!(lines.iter().all(|l| !l.contains(word)), "{word}: {lines:?}");
+        }
+        assert_eq!(
+            crate::launcher_log::preparer_line("Preparing fixture resources (3 of 40)"),
+            "Preparing: Preparing fixture resources (3 of 40)"
         );
     }
 }

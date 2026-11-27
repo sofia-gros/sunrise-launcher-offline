@@ -144,7 +144,10 @@ impl Launcher {
             match backend::switch_from_auto(&home, api) {
                 Ok(changed) => switched |= changed,
                 Err(e) => {
-                    sunrise_launcher::elog!("Sunrise launcher: could not switch to {label}: {e}")
+                    sunrise_launcher::elog!(
+                        "Sunrise launcher: could not switch to {label}: {}",
+                        sunrise_launcher::launcher_log::safe_error(&e.to_string())
+                    )
                 }
             }
         }
@@ -260,7 +263,9 @@ impl Launcher {
         std::thread::spawn(move || {
             let _in = sunrise_launcher::launcher_log::enter(&op);
             let log = |line: String| {
-                sunrise_launcher::launcher_log::line(format!("Preparing: {line}"));
+                sunrise_launcher::launcher_log::line(
+                    sunrise_launcher::launcher_log::preparer_line(&line),
+                );
                 let _ = tx.send(Msg::Line(Job::Prepare, line));
             };
             let result = (|| {

@@ -158,33 +158,7 @@ impl Resources {
                 return Ok(None);
             };
             launcher_log::play_detail(crate::i18n::tr("Preparing the game"));
-            let step = launcher_log::step("Packing game data cache");
-            match preparer::data_file(&binary, &root, resources, Some(handoff)) {
-                Ok(Some(true)) => {
-                    check()?;
-                    let digest = digest_file(&resources.join(preparer::DATA_FILE))
-                        .ok()
-                        .flatten();
-                    step.done("");
-                    Ok(digest)
-                }
-                Ok(_) => {
-                    step.done("already present");
-                    Ok(None)
-                }
-                Err(error) if stop.is_some_and(crate::native_mods::Cancellation::is_stopped) => {
-                    step.failed(&error);
-                    Err(error)
-                }
-                Err(error) => {
-                    step.failed(&error);
-                    eprintln!(
-                        "Packing game data cache: {}",
-                        launcher_log::safe_error(&error)
-                    );
-                    Ok(None)
-                }
-            }
+            pack_data_cache(&binary, &root, resources, Some(handoff), stop)
         })
     }
 
@@ -552,9 +526,87 @@ fn at(path: &Path, error: io::Error) -> String {
     format!("{}: {error}", path.display())
 }
 
+/// The optional data cache a seal packs, as a `launcher.log` step: its digest when written.
+/// A failure is logged only as the step's kind of failure, as the preparer's own message can name
+/// a local path (review of #615), and the seal goes on without the cache unless it was cancelled.
+fn pack_data_cache(
+    binary: &Path,
+    root: &Path,
+    resources: &Path,
+    handoff: Option<&preparer::Handoff<'_>>,
+    stop: Option<&crate::native_mods::Cancellation>,
+) -> Result<Option<[u8; 32]>, String> {
+    let check = || stop.map_or(Ok(()), crate::native_mods::Cancellation::check);
+    let step = launcher_log::step("Packing game data cache");
+    match preparer::data_file(binary, root, resources, handoff) {
+        Ok(Some(true)) => {
+            check()?;
+            let digest = digest_file(&resources.join(preparer::DATA_FILE))
+                .ok()
+                .flatten();
+            step.done("");
+            Ok(digest)
+        }
+        Ok(_) => {
+            step.done("already present");
+            Ok(None)
+        }
+        Err(error) if stop.is_some_and(crate::native_mods::Cancellation::is_stopped) => {
+            step.failed(&error);
+            Err(error)
+        }
+        Err(error) => {
+            step.failed(&error);
+            eprintln!(
+                "Packing game data cache: {}",
+                launcher_log::safe_error(&error)
+            );
+            Ok(None)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A data-file reply whose error message names a local path: the seal's step logs only the
+    /// kind of failure, and nothing of the message reaches the log (review of #615).
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_data_cache_logs_none_of_the_preparers_message() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("version");
+        let resources = root.join(".local/sunrise-client/26.3");
+        fs::create_dir_all(&resources).unwrap();
+        let binary = root.join("sunrise-prepare");
+        fs::write(
+            &binary,
+            "#!/bin/sh\ncase \"$1\" in\n  data-file) echo '{\"format\":1,\"error\":{\"message\":\"/home/ada/Private Client Backup/sunrise/data.bin: Permission denied (os error 13)\"}}';;\n  *) exit 2;;\nesac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let before = launcher_log::since(0).0;
+        assert_eq!(
+            pack_data_cache(&binary, &root, &resources, None, None),
+            Ok(None),
+            "the seal goes on without the cache"
+        );
+        let (_, lines) = launcher_log::since(before);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Packing game data cache: failed after")),
+            "{lines:?}"
+        );
+        for word in ["Private Client Backup", "/home/ada"] {
+            assert!(
+                lines.iter().all(|line| !line.contains(word)),
+                "{word}: {lines:?}"
+            );
+        }
+    }
 
     #[test]
     fn cannot_seal_a_prepared_tree_outside_the_install() {
