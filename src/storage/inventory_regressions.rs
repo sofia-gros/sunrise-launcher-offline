@@ -283,3 +283,92 @@ fn capable_units_delete_only_after_the_last_game_lease_and_mixed_builds_stay_res
         "incomplete installs must stay visible for residual reporting and retry"
     );
 }
+
+#[test]
+fn shared_runtime_lease_on_profile_context_root_blocks_clearing_profile_caches() {
+    const TEST: &str =
+        "storage::inventory::regressions::shared_runtime_lease_on_profile_context_root_blocks_clearing_profile_caches";
+    const ACTOR: &str = "STORAGE_CONTEXT_ROOT_LEASE_ACTOR";
+    if std::env::var_os(ACTOR).is_none() {
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(ACTOR, "1")
+            .env("SUNRISE_LAUNCHER_HOME", root.path().join("launcher"))
+            .env("SUNRISE_HOME", root.path().join("game"))
+            .env(
+                "SUNRISE_LAUNCHER_LOCATION_FILE",
+                root.path().join("location"),
+            )
+            .env("XDG_DATA_HOME", root.path().join("xdg-data"))
+            .env("XDG_CONFIG_HOME", root.path().join("xdg-config"))
+            .env("SUNRISE_NO_KEYCHAIN", "1")
+            .env("SUNRISE_LAUNCHER_NO_SELF_UPDATE", "1")
+            .env("SUNRISE_NO_AUDIO", "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let data = backend::data_dir();
+    let home = backend::game_home();
+    let version = backend::version_dir("v0.0.1");
+    fs::create_dir_all(&version).unwrap();
+    fs::write(version.join(".installed"), b"").unwrap();
+    fs::write(data.join("settings.json"), br#"{"selected":"v0.0.1"}"#).unwrap();
+    let caches = [
+        home.join(".sunrise-cache/behaviours-v8.bin"),
+        home.join(".sunrise-cache/mod-content/overlay"),
+        home.join("cache/dx12-shaders.bin"),
+        home.join("jars/unused.jar"),
+    ];
+    for path in &caches {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"live cache").unwrap();
+    }
+    // Hold the exact shared runtime lease a running game holds on its profile context root,
+    // without any matching version process name.
+    let registry = crate::run_leases::Registry::open().unwrap();
+    let home_dir = Dir::open_ambient_dir(&home, cap_std::ambient_authority()).unwrap();
+    let lease = registry
+        .lock(&home_dir, crate::native_cache::LockMode::Shared)
+        .unwrap();
+    let storage = Storage::at(&data).unwrap();
+    let blocked = storage.report(Some(Category::OtherCaches), false).unwrap();
+    let row = blocked
+        .rows
+        .iter()
+        .find(|row| row.category == Category::OtherCaches)
+        .unwrap();
+    assert!(row.kept.iter().any(|unit| unit.kind == KeptKind::Busy));
+    for path in &caches {
+        assert_eq!(
+            fs::read(path).unwrap(),
+            b"live cache",
+            "cache was removed while its profile context root held a shared runtime lease"
+        );
+    }
+    drop(lease);
+    drop(home_dir);
+    let cleared = storage.report(Some(Category::OtherCaches), false).unwrap();
+    let row = cleared
+        .rows
+        .iter()
+        .find(|row| row.category == Category::OtherCaches)
+        .unwrap();
+    assert!(
+        row.kept.is_empty(),
+        "expected caches to clear once context lease dropped"
+    );
+    for path in &caches {
+        assert!(
+            !path.exists(),
+            "cache still existed after context lease dropped"
+        );
+    }
+}

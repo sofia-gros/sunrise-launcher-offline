@@ -264,12 +264,18 @@ fn is_compiler_attempt(relative: &Path) -> bool {
         && relative.file_name().is_some_and(compiler_attempt)
 }
 
+struct ProfileContext {
+    home: PathBuf,
+    work: PathBuf,
+    version: String,
+}
+
 struct Entry {
     category: Category,
     directory: Option<Arc<Dir>>,
     relative: PathBuf,
     path: PathBuf,
-    profile: Option<Arc<(PathBuf, String)>>,
+    profile: Option<Arc<ProfileContext>>,
 }
 
 impl Entry {
@@ -365,22 +371,31 @@ impl Entry {
             return Ok(());
         };
         let _profile = if let Some(profile) = &self.profile {
-            let (home, version) = profile.as_ref();
-            let owner = instances::lifecycle::owner_file(&backend::game_home(), home)
+            let owner = instances::lifecycle::owner_file(&backend::game_home(), &profile.home)
                 .map_err(|_| Error::Busy)?;
-            let claim = crate::profile_txn::Admission::claim(home, owner.as_deref())
+            let claim = crate::profile_txn::Admission::claim(&profile.home, owner.as_deref())
                 .map_err(|_| Error::Busy)?;
-            if backend::in_use(version) {
+            if backend::in_use(&profile.version) {
                 return Err(Error::Busy);
             }
             Some(claim)
         } else {
             None
         };
+        let context_roots: Vec<&Path> = match &self.profile {
+            Some(profile) if profile.work != profile.home => {
+                vec![profile.home.as_path(), profile.work.as_path()]
+            }
+            Some(profile) => vec![profile.home.as_path()],
+            None => Vec::new(),
+        };
         if !explicit {
             let access = self.access()?;
             if matches!(access, Access::LeasedGame) {
-                return crate::cache_cleanup::delete_game_unit(&self.path);
+                return crate::cache_cleanup::delete_game_unit_with_contexts(
+                    &self.path,
+                    &context_roots,
+                );
             }
             access.check()?;
         } else if self.incomplete_target() {
@@ -393,7 +408,10 @@ impl Entry {
                         || self.path.starts_with(backend::plain(data.clone()))
                 })
             {
-                return crate::cache_cleanup::clear_claimed_unit(&self.path);
+                return crate::cache_cleanup::clear_claimed_unit_with_contexts(
+                    &self.path,
+                    &context_roots,
+                );
             }
         }
         let mut parent = root.try_clone()?;
@@ -1069,7 +1087,11 @@ fn profile_caches(
         old_logs(entries, &root, cancel)?;
         unused_jars_until(entries, &root, cancel)?;
         profile_game_caches(entries, &root)?;
-        let profile = Arc::new((instance.home.clone(), version));
+        let profile = Arc::new(ProfileContext {
+            home: instance.home.clone(),
+            work: instance.work.clone(),
+            version,
+        });
         for entry in &mut entries[start..] {
             entry.profile = Some(profile.clone());
         }

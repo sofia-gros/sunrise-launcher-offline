@@ -182,6 +182,18 @@ impl Registry {
         path: &Path,
         authorize: impl FnOnce(&Dir, bool) -> Result<(), E>,
     ) -> Result<(), E> {
+        self.remove_unit_with_contexts(path, &[], authorize)
+    }
+
+    /// Like [`Self::remove_unit`], also claiming exclusive runtime leases on `contexts` (such as
+    /// a profile's game/home roots leased by a running game) under the publication fence across
+    /// authorization and removal. Context roots remain on disk and are never retired.
+    pub fn remove_unit_with_contexts<E: From<Error> + From<io::Error>>(
+        self: &Arc<Self>,
+        path: &Path,
+        contexts: &[&Path],
+        authorize: impl FnOnce(&Dir, bool) -> Result<(), E>,
+    ) -> Result<(), E> {
         let parent_path = path
             .parent()
             .ok_or_else(|| Error::Unsafe(path.to_owned()))?;
@@ -207,6 +219,27 @@ impl Registry {
             return Err(Error::Unsafe(path.to_owned()).into());
         }
         drop(current);
+        let mut claimed = vec![(before.dev(), before.ino())];
+        let mut context_claims = Vec::new();
+        for context in contexts {
+            checked(context, true)?;
+            let context = context.canonicalize()?;
+            let context_dir = open_directory(&context)?;
+            let context_meta = context_dir.dir_metadata()?;
+            let identity = (context_meta.dev(), context_meta.ino());
+            if claimed.contains(&identity) {
+                continue;
+            }
+            let context_claim = self.lock(&context_dir, LockMode::Exclusive)?;
+            let recheck = open_directory(&context)?.dir_metadata()?;
+            if (recheck.dev(), recheck.ino()) != identity {
+                return Err(Error::Unsafe(context).into());
+            }
+            // Release the directory handle before rename on Windows while keeping the lease held.
+            drop(context_dir);
+            claimed.push(identity);
+            context_claims.push(context_claim);
+        }
         authorize(&directory, is_directory)?;
         let name = path
             .file_name()
@@ -237,6 +270,7 @@ impl Registry {
         if result.is_ok() && is_directory {
             claim.retire()?;
         }
+        drop(context_claims);
         result.map_err(|error| removal_error(error).into())
     }
 

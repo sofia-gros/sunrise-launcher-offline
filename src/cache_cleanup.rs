@@ -369,16 +369,23 @@ pub(crate) fn delete_game_unit(path: &Path) -> Result<(), Error> {
     delete_game_unit_observed(path, || {})
 }
 
+pub(crate) fn delete_game_unit_with_contexts(path: &Path, contexts: &[&Path]) -> Result<(), Error> {
+    delete_unit(path, contexts, false, false, || {}, || Ok(()))
+}
+
 pub(crate) fn delete_game_unit_observed(
     path: &Path,
     after_classification: impl FnOnce(),
 ) -> Result<(), Error> {
-    delete_unit(path, false, false, after_classification, || Ok(()))
+    delete_unit(path, &[], false, false, after_classification, || Ok(()))
 }
 
 /// Explicit Storage Clear relies on the exclusive claim, not an executable marker.
-pub(crate) fn clear_claimed_unit(path: &Path) -> Result<(), Error> {
-    delete_unit(path, true, true, || {}, || Ok(()))
+pub(crate) fn clear_claimed_unit_with_contexts(
+    path: &Path,
+    contexts: &[&Path],
+) -> Result<(), Error> {
+    delete_unit(path, contexts, true, true, || {}, || Ok(()))
 }
 
 /// Remove an installed version after the caller's selection checks under the publication fence.
@@ -387,16 +394,17 @@ pub(crate) fn delete_version_checked(
     path: &Path,
     check: impl FnOnce() -> Result<(), Error>,
 ) -> Result<(), Error> {
-    delete_unit(path, true, false, || {}, check)
+    delete_unit(path, &[], true, false, || {}, check)
 }
 
 /// Remove an installed version whose running processes have already been checked.
 pub(crate) fn delete_version(path: &Path, idle: bool) -> Result<(), Error> {
-    delete_unit(path, idle, false, || {}, || Ok(()))
+    delete_unit(path, &[], idle, false, || {}, || Ok(()))
 }
 
 fn delete_unit(
     path: &Path,
+    contexts: &[&Path],
     idle: bool,
     explicit_storage_clear: bool,
     after_classification: impl FnOnce(),
@@ -404,7 +412,7 @@ fn delete_unit(
 ) -> Result<(), Error> {
     use sunrise_launcher_smod::{locks::Release, runtime_leases::Registry};
     let registry = Registry::with_release(&crate::backend::data_dir(), Release::Close)?;
-    registry.remove_unit(path, |directory, is_directory| {
+    registry.remove_unit_with_contexts(path, contexts, |directory, is_directory| {
         if !explicit_storage_clear {
             match Access::for_unit(path)? {
                 Access::UninstrumentedGame if idle => (),
