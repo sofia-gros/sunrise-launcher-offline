@@ -1909,6 +1909,11 @@ fn resources_owner_in(versions: &Path, tag: &str) -> String {
         .map_or_else(|| tag.to_owned(), |about| about.base)
 }
 
+/// Native builds never own prepared resources, even when their build record is unreadable.
+fn owns_prepared_resources_in(versions: &Path, tag: &str) -> bool {
+    !crate::native_mods::is_native(tag) && resources_owner_in(versions, tag) == tag
+}
+
 pub fn resources(tag: &str) -> PathBuf {
     resources_at(&version_dir(&resources_owner(tag)))
 }
@@ -2424,7 +2429,7 @@ fn reuse_prepared_cancellable(
     stop: Option<&crate::native_mods::Cancellation>,
 ) -> Option<String> {
     let stopped = || stop.is_some_and(crate::native_mods::Cancellation::is_stopped);
-    if resources_owner_in(versions, tag) != tag {
+    if !owns_prepared_resources_in(versions, tag) {
         return None;
     }
     let target = versions.join(tag);
@@ -2435,7 +2440,7 @@ fn reuse_prepared_cancellable(
     let version = game_version_at(&target);
     for other in installed_in(versions)
         .into_iter()
-        .filter(|t| t != tag && resources_owner_in(versions, t) == *t)
+        .filter(|t| t != tag && owns_prepared_resources_in(versions, t))
     {
         if stopped() {
             return None;
@@ -2618,7 +2623,7 @@ pub fn reuse_prepared_everywhere() -> Vec<(String, String)> {
     forget_prepared();
     for tag in installed_in(&versions)
         .into_iter()
-        .filter(|tag| resources_owner(tag) == *tag)
+        .filter(|tag| owns_prepared_resources_in(&versions, tag))
     {
         let was_reused = reused.iter().any(|(prepared, _)| prepared == &tag);
         // Probe unlocked once; lock only when this base was reused or actually lacks extras.
@@ -2648,7 +2653,7 @@ fn reuse_prepared_in(versions: &Path) -> Vec<(String, String)> {
     let mut tags = installed_in(versions);
     tags.reverse();
     tags.into_iter()
-        .filter(|tag| resources_owner_in(versions, tag) == *tag)
+        .filter(|tag| owns_prepared_resources_in(versions, tag))
         .filter_map(|tag| {
             let target = versions.join(&tag);
             let to = resources_at(&target);
@@ -2686,7 +2691,7 @@ fn complete_reports(versions: &Path, tag: &str) -> bool {
 
 /// Complete the reports in the already resolved hosting resource folder.
 pub(crate) fn complete_reports_at(versions: &Path, tag: &str, target: &Path, to: &Path) -> bool {
-    if !to.join(RESOURCES_MANIFEST).exists() {
+    if !owns_prepared_resources_in(versions, tag) || !to.join(RESOURCES_MANIFEST).exists() {
         return false;
     }
     let missing: Vec<_> = RUNTIME_REPORTS
@@ -2710,7 +2715,7 @@ pub(crate) fn complete_reports_at(versions: &Path, tag: &str, target: &Path, to:
     let mut source_claims = Vec::new();
     for other in installed_in(versions)
         .into_iter()
-        .filter(|t| t != tag && resources_owner_in(versions, t) == *t)
+        .filter(|t| t != tag && owns_prepared_resources_in(versions, t))
     {
         let dir = versions.join(&other);
         if server(&dir).as_ref() == Some(&pins) {
@@ -9410,6 +9415,9 @@ esac"#
         let versions = versions_dir();
         let base = "dev-2026-11-26-ba1f24e";
         let native = "native-aaaaaaaaaaaa-fixture";
+        let missing = "native-bbbbbbbbbbbb-missing-record";
+        let invalid = "native-cccccccccccc-invalid-record";
+        let native_tags = [native, missing, invalid];
         let write = |tag: &str, path: &str, text: &str| {
             let path = versions.join(tag).join(path);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -9459,7 +9467,10 @@ esac"#
 
         // Native client build shares the base's resources (`copy_base` copies research-lock.json and
         // sunrise-prepare sources but omits `.local`).
-        seed_common(native);
+        for tag in native_tags {
+            seed_common(tag);
+        }
+        write(invalid, crate::native_mods::RECORD, "{");
         write(
             native,
             crate::native_mods::RECORD,
@@ -9472,13 +9483,20 @@ esac"#
             .to_string(),
         );
 
+        for tag in native_tags {
+            let _preparation = prepare_lock(tag).unwrap();
+            assert_eq!(reuse_prepared(&versions, tag), None, "{tag}");
+        }
+
         let before = (crate::storage::walks(), crate::storage::entries_calls());
         let reused = reuse_prepared_everywhere();
         assert!(reused.is_empty(), "{reused:?}");
-        assert!(
-            !version_dir(native).join(".local").exists(),
-            "reuse_prepared_everywhere must not copy .local into a native build"
-        );
+        for tag in native_tags {
+            assert!(
+                !version_dir(tag).join(".local").exists(),
+                "reuse_prepared_everywhere must not copy .local into {tag}"
+            );
+        }
         assert_eq!(fs::read(&receipt).unwrap(), receipt_bytes);
         assert_eq!(
             fs::metadata(&receipt).unwrap().modified().unwrap(),
@@ -9500,7 +9518,7 @@ esac"#
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, text).unwrap();
         };
-        for tag in [native, "dev-2026-11-27-target"] {
+        for tag in native_tags.into_iter().chain(["dev-2026-11-27-target"]) {
             write_at(tag, COMPLETE, "");
             write_at(tag, "research-lock.json", lock);
             write_at(tag, "crates/sunrise-prepare/Cargo.toml", "[package]");
@@ -9522,16 +9540,19 @@ esac"#
             })
             .to_string(),
         );
-        write_at(
-            native,
-            &format!(".local/sunrise-client/26.3/{RESOURCES_MANIFEST}"),
-            "{}",
-        );
-        write_at(
-            native,
-            &format!(".local/sunrise-client/26.3/{PREPARATION_STAMP}"),
-            r#"{"output_version":1}"#,
-        );
+        write_at(invalid, crate::native_mods::RECORD, "{");
+        for tag in native_tags {
+            write_at(
+                tag,
+                &format!(".local/sunrise-client/26.3/{RESOURCES_MANIFEST}"),
+                "{}",
+            );
+            write_at(
+                tag,
+                &format!(".local/sunrise-client/26.3/{PREPARATION_STAMP}"),
+                r#"{"output_version":1}"#,
+            );
+        }
         assert_eq!(
             reuse_prepared(donor_versions, "dev-2026-11-27-target"),
             None
@@ -9553,24 +9574,33 @@ esac"#
             ".local/sunrise-client/26.3/registries.json",
             "{}",
         );
-        write_at(
-            native,
-            ".local/sunrise-client/26.3/commands.json",
-            r#"{"from":"native"}"#,
-        );
-        write_at(
-            native,
-            ".local/datagen/out/reports/commands.json",
-            r#"{"from":"native-datagen"}"#,
-        );
+        for tag in native_tags {
+            write_at(
+                tag,
+                ".local/sunrise-client/26.3/commands.json",
+                r#"{"from":"native"}"#,
+            );
+            write_at(
+                tag,
+                ".local/datagen/out/reports/commands.json",
+                r#"{"from":"native-datagen"}"#,
+            );
+        }
         assert!(!complete_reports(donor_versions, report_target));
         assert!(
             !donor_versions
                 .join(report_target)
                 .join(".local/sunrise-client/26.3/commands.json")
                 .exists(),
-            "complete_reports must not read reports from a resource-borrowing native build"
+            "complete_reports must not read reports from a native build, even without a valid record"
         );
+        for tag in native_tags {
+            write_at(tag, ".local/datagen/out/reports/registries.json", "{}");
+            assert!(!complete_reports(donor_versions, tag), "{tag}");
+            assert!(!resources_at(&donor_versions.join(tag))
+                .join("registries.json")
+                .exists());
+        }
     }
 
     #[test]
