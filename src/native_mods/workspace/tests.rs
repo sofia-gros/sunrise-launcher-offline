@@ -774,7 +774,21 @@ fn a_failed_kept_slot_is_emptied_and_built_cold_once_after_a_proved_stop() {
     assert!(!stage.retry_cold(&lease).unwrap());
     assert!(stale.is_file());
     stage.worker_finished();
+    let tmp_for = |stage: &Workspace| {
+        let mut command = std::process::Command::new("unused");
+        stage.isolate(&mut command).unwrap();
+        command
+            .get_envs()
+            .find_map(|(key, val)| (key == "TMPDIR").then(|| val.unwrap()))
+            .map(PathBuf::from)
+            .unwrap()
+    };
+    let first_tmp = tmp_for(&stage);
+    fs::write(first_tmp.join("stale"), b"old scratch").unwrap();
     assert!(stage.retry_cold(&lease).unwrap());
+    let retry_tmp = tmp_for(&stage);
+    assert_ne!(first_tmp, retry_tmp);
+    assert!(fs::read_dir(retry_tmp).unwrap().next().is_none());
     assert!(!stale.exists());
     assert!(stage.work().is_dir());
     assert!(listing(&stage.work()).is_empty());
@@ -808,10 +822,33 @@ fn cold_retry_refuses_a_redirected_slot_parent() {
 
 #[test]
 fn an_unproved_exit_skips_the_slot_in_memory_only_until_the_next_start() {
+    const CHILD: &str = "SUNRISE_NATIVE_UNPROVED_SLOT_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "native_mods::workspace::tests::an_unproved_exit_skips_the_slot_in_memory_only_until_the_next_start",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("1 passed; 0 failed"),
+            "child test did not run: {stdout}"
+        );
+        return;
+    }
     let (_dir, lease, build) = leased();
     let native = build.join("native");
     let client = crate::native_mods::Target::Client;
-    // Keys of their own: the skipped set is the process's, and other tests share it.
+    // The unproved state belongs to this scratch child only.
     let unproved = SlotKey::keyed(COMMIT, "unproved-triple", client, "9.9.9").unwrap();
     let proved = SlotKey::keyed(COMMIT, "proved-triple", client, "9.9.9").unwrap();
     let mut stage = Workspace::new(&native).unwrap();
@@ -826,11 +863,13 @@ fn an_unproved_exit_skips_the_slot_in_memory_only_until_the_next_start() {
     // The builds that follow take the attempt's own folders.
     let attempt = Workspace::new(&native).unwrap();
     assert!(attempt.work().starts_with(attempt.path()));
-    // Another game build is not affected.
-    assert!(proved.clone().usable(false).is_some());
-    // A compiler tree proved gone leaves its slot in use.
+    // Another game build can still use its own work slot, but not the shared Cargo home.
+    let another = proved.clone().usable(false).unwrap();
     let mut stopped = Workspace::new(&native).unwrap();
-    assert!(stopped.attach(&lease, proved.clone()).unwrap());
+    assert!(stopped.attach(&lease, another).unwrap());
+    assert_ne!(stopped.work(), stage.work());
+    assert_eq!(stopped.cargo_home(), stopped.path().join("cargo"));
+    // A compiler tree proved gone leaves its slot in use.
     stopped.allow_worker();
     stopped.worker_finished();
     stopped.note_unproved();
@@ -843,6 +882,7 @@ fn an_unproved_exit_skips_the_slot_in_memory_only_until_the_next_start() {
     // The next launcher start reuses the slot as usual, with its files.
     fs::write(stage.work().join("kept"), b"compiled").unwrap();
     unproved.forget_unproved();
+    CARGO_HOME_UNPROVED.store(false, Ordering::Relaxed);
     let reused = unproved.clone().usable(false).unwrap();
     let mut next = Workspace::new(&native).unwrap();
     assert!(next.attach(&lease, reused).unwrap());
