@@ -5,6 +5,7 @@ use super::resume::{partial_path, sweep_partials, valid};
 use super::runtime::{build_client, Clients};
 use super::CANCELLED;
 use crate::backend::lock::recover;
+use crate::i18n::{tr, trf};
 
 /// Why acquiring a permit can't fail: nothing closes these semaphores (they are private to this
 /// file, which never calls `close()`).
@@ -159,6 +160,14 @@ pub(super) struct Connection<'a> {
     _host: OwnedSemaphorePermit,
     _count: Count<'a>,
 }
+/// A refusal from `url`, as said to the player.
+fn answered(url: &Url, status: StatusCode) -> String {
+    trf(
+        "{url} answered {status}",
+        &[("url", url.as_str()), ("status", &status.to_string())],
+    )
+}
+
 impl Downloader {
     pub fn new(mut config: Config) -> Result<Self, String> {
         config.files = config.files.clamp(1, 1024);
@@ -244,7 +253,7 @@ impl Downloader {
         for _ in 0..=10 {
             let host = url
                 .host_str()
-                .ok_or_else(|| Failure::permanent("URL has no host"))?
+                .ok_or_else(|| Failure::permanent(tr("URL has no host")))?
                 .to_owned();
             let budget = {
                 let mut hosts = recover(&self.hosts);
@@ -280,7 +289,7 @@ impl Downloader {
                     .headers()
                     .get(header::LOCATION)
                     .and_then(|s| s.to_str().ok())
-                    .ok_or_else(|| Failure::permanent("Redirect has no Location"))?;
+                    .ok_or_else(|| Failure::permanent(tr("Redirect has no Location")))?;
                 url = redirect_target(&url, location)?;
                 continue;
             }
@@ -293,7 +302,7 @@ impl Downloader {
                     .map(|s| retry_after(s, SystemTime::now()))
                     .unwrap_or_default();
                 return Err(Failure {
-                    message: format!("{url} answered {status}"),
+                    message: answered(&url, status),
                     retry: status == StatusCode::TOO_MANY_REQUESTS
                         || status == StatusCode::REQUEST_TIMEOUT
                         || status.is_server_error(),
@@ -310,7 +319,7 @@ impl Downloader {
                 _count: count,
             });
         }
-        Err(Failure::permanent("Too many redirects"))
+        Err(Failure::permanent(tr("Too many redirects")))
     }
     pub(super) async fn pause(&self, attempt: u32, after: Duration) {
         self.metrics.counters.retried.fetch_add(1, Relaxed);
@@ -340,7 +349,9 @@ impl Downloader {
         let start = Instant::now();
         let operation = async {
             if artifact.sha1.len() != 40 || !artifact.sha1.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err(Failure::permanent("Artifact requires a 40-character SHA-1"));
+                return Err(Failure::permanent(tr(
+                    "Artifact requires a 40-character SHA-1",
+                )));
             }
             let lock = {
                 let mut paths = recover(&self.paths);
@@ -382,9 +393,9 @@ impl Downloader {
                 if !matches {
                     let _ = fs::remove_file(&partial).await;
                     let _ = fs::remove_dir_all(partial.with_extension("segments")).await;
-                    return Err(Failure::permanent(
+                    return Err(Failure::permanent(tr(
                         "Downloaded size or SHA-1 does not match the manifest",
-                    ));
+                    )));
                 }
                 if cancel.load(Relaxed) {
                     return Err(Failure::permanent(CANCELLED));
@@ -424,11 +435,13 @@ impl Downloader {
                 Err(if e.message == CANCELLED {
                     e.message
                 } else {
-                    format!(
-                        "{}: {} (after {:.2}s)",
-                        artifact.url,
-                        e.message,
-                        start.elapsed().as_secs_f64()
+                    trf(
+                        "{url}: {message} (after {seconds}s)",
+                        &[
+                            ("url", artifact.url.as_str()),
+                            ("message", e.message.as_str()),
+                            ("seconds", &format!("{:.2}", start.elapsed().as_secs_f64())),
+                        ],
                     )
                 })
             }
@@ -467,7 +480,7 @@ impl Downloader {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.tick().await;
         loop {
-            tokio::select! {result=&mut future=>return result,_=tick.tick()=>{let p=self.progress();log(format!("{} files complete, {} active, {} pending; {:.2} MiB/s; {}/{} bytes",p.completed,p.active,p.pending,p.mib_per_second,p.verified_bytes,p.total_bytes));}}
+            tokio::select! {result=&mut future=>return result,_=tick.tick()=>{let p=self.progress();log(trf("{completed} files complete, {active} active, {pending} pending; {speed} MiB/s; {verified}/{total} bytes",&[("completed",&p.completed.to_string()),("active",&p.active.to_string()),("pending",&p.pending.to_string()),("speed",&format!("{:.2}",p.mib_per_second)),("verified",&p.verified_bytes.to_string()),("total",&p.total_bytes.to_string())]));}}
         }
     }
     async fn batch_policy(
@@ -514,12 +527,14 @@ impl Downloader {
                 let result = async {
                     let mut connection = self.request(url, None, None).await?;
                     if connection.response.status() != StatusCode::OK {
-                        return Err(Failure::permanent("Unexpected partial metadata response"));
+                        return Err(Failure::permanent(tr(
+                            "Unexpected partial metadata response",
+                        )));
                     }
                     let mut body = Vec::new();
                     while let Some(chunk) = connection.response.chunk().await? {
                         if body.len() + chunk.len() > 16 << 20 {
-                            return Err(Failure::permanent("Metadata exceeds 16 MiB"));
+                            return Err(Failure::permanent(tr("Metadata exceeds 16 MiB")));
                         }
                         self.metrics
                             .counters
@@ -546,7 +561,7 @@ impl Downloader {
 pub(super) fn redirect_target(url: &Url, location: &str) -> Result<Url, Failure> {
     let target = url.join(location).map_err(Failure::permanent)?;
     if target.scheme() != "https" {
-        return Err(Failure::permanent("Redirect target must use HTTPS"));
+        return Err(Failure::permanent(tr("Redirect target must use HTTPS")));
     }
     Ok(target)
 }

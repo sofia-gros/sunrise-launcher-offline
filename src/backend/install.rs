@@ -180,7 +180,7 @@ pub(crate) fn download_cancellable(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 stop.check()?;
-                return Err("Download worker stopped unexpectedly".into());
+                return Err(crate::i18n::tr("Download worker stopped unexpectedly").into());
             }
         }
     };
@@ -272,9 +272,12 @@ fn write_checked(
     let mut hash = sunrise_launcher_release_verify::Sha256::default();
     let (mut done, mut buf) = (0u64, vec![0u8; 1 << 16]);
     loop {
-        let n = reader
-            .read(&mut buf)
-            .map_err(|e| SaveCheckedError::Download(format!("Download interrupted: {e}")))?;
+        let n = reader.read(&mut buf).map_err(|e| {
+            SaveCheckedError::Download(crate::i18n::trf(
+                "Download interrupted: {error}",
+                &[("error", &e.to_string())],
+            ))
+        })?;
         if n == 0 {
             break;
         }
@@ -380,7 +383,10 @@ pub(super) const RELEASE_FILE: &str = "sunrise-release.json";
 /// Keeps `bytes` as the installed build's [`RELEASE_FILE`] in `dir` when they are the signed `sha256`'s.
 pub(super) fn keep_release_file(dir: &Path, bytes: &[u8], sha256: &str) -> Result<(), String> {
     if sunrise_launcher_release_verify::sha256_hex(bytes) != sha256 {
-        return Err(format!("{RELEASE_FILE}: not the signed file"));
+        return Err(crate::i18n::trf(
+            "{file}: not the signed file",
+            &[("file", RELEASE_FILE)],
+        ));
     }
     let file = dir.join(RELEASE_FILE);
     match fs::File::create_new(&file) {

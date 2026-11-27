@@ -6,11 +6,11 @@ impl Launcher {
         use backend::WhilePlaying;
         let current = self.settings.while_playing.here();
         let mut ways = vec![
-            (WhilePlaying::Stay, "Stay open"),
-            (WhilePlaying::Minimize, "Minimise"),
+            (WhilePlaying::Stay, crate::i18n::tr_key("Stay open")),
+            (WhilePlaying::Minimize, crate::i18n::tr_key("Minimise")),
         ];
         if cfg!(target_os = "macos") {
-            ways.push((WhilePlaying::Hide, "Hide"));
+            ways.push((WhilePlaying::Hide, crate::i18n::tr_key("Hide")));
         }
         let ways = ways
             .into_iter()

@@ -87,9 +87,9 @@ fn host_resources(tag: &str) -> Result<HostResources, SetUpError> {
     let game_version = backend::hosting_game_version(&base)?;
     let folder = backend::resources_for_game(&base, &game_version);
     if !backend::prepared_at(&folder) {
-        return Err(SetUpError::NotPrepared(format!(
-            "Sunrise {tag} isn't prepared yet: press Prepare on the Play page (it uses your own Minecraft {})",
-            game_version
+        return Err(SetUpError::NotPrepared(trf(
+            "Sunrise {tag} isn't prepared yet: press Prepare on the Play page (it uses your own Minecraft {version})",
+            &[("tag", tag), ("version", game_version.as_str())],
         )));
     }
     Ok(HostResources {
@@ -150,7 +150,12 @@ pub(super) fn set_up_in(
         if !release.join(PROGRAM).is_file() {
             let scratch = releases.join(format!(".{tag}.copying"));
             let _ = fs::remove_dir_all(&scratch);
-            copy_release(version, &scratch).map_err(|e| format!("copying {tag}: {e}"))?;
+            copy_release(version, &scratch).map_err(|e| {
+                trf(
+                    "copying {tag}: {error}",
+                    &[("tag", tag), ("error", &e.to_string())],
+                )
+            })?;
             let _ = fs::remove_dir_all(&release);
             fs::rename(&scratch, &release).map_err(|e| e.to_string())?;
         }

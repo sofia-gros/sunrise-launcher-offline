@@ -1,4 +1,5 @@
 //! Servers page text helpers: byte sizes, uptime and a backup's date and kind for people.
+use crate::i18n::{tr, trf};
 use sunrise_launcher::servers::Backup;
 
 pub(super) fn bytes(n: u64) -> String {
@@ -19,16 +20,21 @@ pub(super) fn backup_label(b: &Backup) -> (String, String) {
     let (date, time) = when.split_once('_').unwrap_or((when, ""));
     let label = format!("{date} {} UTC", time.replace('-', ":"));
     let kind = match kind {
-        "auto" => "Automatic".to_string(),
-        "manual" => "Made by hand".to_string(),
-        "before-update" => "Before an update".to_string(),
+        "auto" => tr("Automatic").to_string(),
+        "manual" => tr("Made by hand").to_string(),
+        "before-update" => tr("Before an update").to_string(),
         // sunrise-server writes the tag with dashes (before-v2026-10-19-10).
         k if k.starts_with("before-v")
             && k[8..].chars().all(|c| c.is_ascii_digit() || c == '-') =>
         {
-            format!("Before updating to {}", k[7..].replace('-', "."))
+            trf(
+                "Before updating to {version}",
+                &[("version", &k[7..].replace('-', "."))],
+            )
         }
-        k if k.starts_with("before-") => format!("Before updating to {}", &k[7..]),
+        k if k.starts_with("before-") => {
+            trf("Before updating to {version}", &[("version", &k[7..])])
+        }
         k => k.to_string(),
     };
     (label, kind)

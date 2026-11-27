@@ -1,0 +1,14 @@
+[package]
+name = "sunrise-launcher-paths"
+version = "0.1.0"
+edition = "2021"
+license = "PolyForm-Shield-1.0.0"
+description = "The launcher's own file names and the hashes it checks downloads with, without the rest of the launcher."
+publish = false
+
+[dependencies]
+sha1 = "0.10"
+sunrise-launcher-release-verify = { path = "../release-verify" }
+
+[dev-dependencies]
+tempfile = "3"

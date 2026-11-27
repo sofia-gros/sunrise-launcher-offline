@@ -78,17 +78,17 @@ pub(crate) fn featured() -> Vec<Featured> {
 fn featured_with(horizon: &'static str) -> Vec<Featured> {
     vec![
         Featured {
-            name: "Horizon Minecraft",
+            name: crate::i18n::tr_key("Horizon Minecraft"),
             address: Some(horizon).filter(|a| !a.is_empty()),
-            note: "A Horizon community server",
-            inert: "Address coming soon",
+            note: crate::i18n::tr_key("A Horizon community server"),
+            inert: crate::i18n::tr_key("Address coming soon"),
             badge: Badge::Horizon,
         },
         Featured {
-            name: "Sunrise server",
+            name: crate::i18n::tr_key("Sunrise server"),
             address: None,
-            note: "Sunrise's own server",
-            inert: "Coming soon",
+            note: crate::i18n::tr_key("Sunrise's own server"),
+            inert: crate::i18n::tr_key("Coming soon"),
             badge: Badge::Sunrise,
         },
     ]

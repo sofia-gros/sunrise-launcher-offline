@@ -7,7 +7,8 @@ use std::process::Command;
 
 pub const ENV: &str = "SUNRISE_LAUNCHER_DEVELOPER_OFFLINE";
 pub const FLAG: &str = "--developer-single-player";
-pub const NOTICE: &str = "Offline developer session: single-player only; no account features.";
+pub const NOTICE: &str =
+    crate::i18n::tr_key("Offline developer session: single-player only; no account features.");
 
 pub fn requested() -> bool {
     std::env::var_os(ENV).as_deref() == Some(std::ffi::OsStr::new("1"))
@@ -81,8 +82,8 @@ fn eligible(base: &str, directory: &std::path::Path, native_revision: Option<&st
             .is_ok_and(|revision| native_revision.is_none_or(|expected| expected == revision))
 }
 
-pub const REBUILD: &str = "This game cannot enforce offline developer single-player. Rebuild and reinstall the developer game and its native mods.";
-const START_FAILED: &str = "The game failed to start while checking support for offline developer play. Repeat your sunrise-launcher developer-install command, rebuild this build’s native mods with native-build, then try Play again. If it still fails, report this message on the Sunrise Discord (linked in the launcher).\nDetails: {reason}";
+pub const REBUILD: &str = crate::i18n::tr_key("This game cannot enforce offline developer single-player. Rebuild and reinstall the developer game and its native mods.");
+const START_FAILED: &str = crate::i18n::tr_key("The game failed to start while checking support for offline developer play. Repeat your sunrise-launcher developer-install command, rebuild this build’s native mods with native-build, then try Play again. If it still fails, report this message on the Sunrise Discord (linked in the launcher).\nDetails: {reason}");
 pub fn require_capability(tag: &str) -> Result<(), String> {
     let program = crate::backend::client_program(tag);
     let output = Command::new(&program)

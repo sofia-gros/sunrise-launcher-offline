@@ -210,7 +210,10 @@ pub(in crate::backend) fn download_for_owner(
         &mut accounts,
     );
     if let Err(e) = accounts.save_renewed() {
-        log(format!("Sunrise: the accounts are not saved: {e}"));
+        log(crate::i18n::trf(
+            "Sunrise: the accounts are not saved: {error}",
+            &[("error", &e.to_string())],
+        ));
     }
     download_for(
         pins,
@@ -273,8 +276,9 @@ pub(in crate::backend) fn download_for(
             ..
         }) => {
             let name = owner.name;
-            log(format!(
-                "{name} owns Minecraft: downloading {v} from Mojang"
+            log(crate::i18n::trf(
+                "{name} owns Minecraft: downloading {version} from Mojang",
+                &[("name", &name), ("version", &v.to_string())],
             ));
             let os = match sources::Os::current() {
                 sources::Os::Linux => "linux",

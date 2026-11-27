@@ -96,11 +96,11 @@ pub(crate) fn plays_after_sign_in(asked: Option<String>, selected: Option<&str>)
 /// The sign-in screen's title. With accounts already here, a sign-in that no Play asked for and
 /// that renews none of them adds one.
 pub(crate) fn sign_in_title(for_play: bool, again: bool, signed_in: usize) -> &'static str {
-    if signed_in > 0 && !for_play && !again {
+    crate::i18n::tr_key(if signed_in > 0 && !for_play && !again {
         "Add a Microsoft account"
     } else {
         "Sign in to play"
-    }
+    })
 }
 
 /// Where the menu goes: its top, and how far its right edge is from the window's. Under the

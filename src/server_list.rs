@@ -4,7 +4,7 @@
 //! an optional `icon` (a PNG in base64), `acceptTextures`, `acceptedCodeOfConduct` and `hidden`.
 //! The launcher only adds and removes entries: every other field of every entry is written back
 //! as it was read.
-use crate::i18n::tr;
+use crate::i18n::{tr, trf};
 use base64::alphabet::STANDARD as ALPHABET;
 use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
 use base64::engine::DecodePaddingMode;
@@ -114,7 +114,7 @@ impl List {
     pub fn add(&mut self, name: &str, ip: &str) -> Result<(), String> {
         let (name, ip) = (name.trim(), ip.trim());
         if ip.is_empty() {
-            return Err("A server needs an address.".into());
+            return Err(tr("A server needs an address.").into());
         }
         if !valid_address(ip) {
             return Err(tr("That is not a server address: use a name or IP address, then an optional port from 0 to 65535.").into());
@@ -135,11 +135,12 @@ impl List {
 
     /// Removes the `index`th shown server.
     pub fn remove(&mut self, index: usize) -> Result<Server, String> {
-        let server = self
-            .servers()
-            .into_iter()
-            .nth(index)
-            .ok_or_else(|| format!("There is no server {}.", index + 1))?;
+        let server = self.servers().into_iter().nth(index).ok_or_else(|| {
+            trf(
+                "There is no server {number}.",
+                &[("number", &(index + 1).to_string())],
+            )
+        })?;
         let at = (0..self.entries.len())
             .filter(|&i| !hidden(&self.entries[i]))
             .nth(index)
@@ -176,7 +177,12 @@ impl List {
                 false => Ok(()),
             })
             .and_then(|()| fs::rename(&new, &current));
-        written.map_err(|e| format!("Could not save the server list: {e}"))
+        written.map_err(|e| {
+            trf(
+                "Could not save the server list: {error}",
+                &[("error", &e.to_string())],
+            )
+        })
     }
 }
 
@@ -218,7 +224,7 @@ pub fn find(list: &List, query: &str) -> Result<(usize, Server), String> {
         .or_else(|| servers.iter().position(|s| s.name.eq_ignore_ascii_case(q)))
         .or_else(|| servers.iter().position(|s| s.ip.eq_ignore_ascii_case(q)))
         .map(|i| (i, servers[i].clone()))
-        .ok_or_else(|| format!("No server {q} in the list"))
+        .ok_or_else(|| trf("No server {query} in the list", &[("query", q)]))
 }
 
 #[cfg(test)]

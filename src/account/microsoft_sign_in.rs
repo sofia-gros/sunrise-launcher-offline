@@ -1,6 +1,7 @@
 //! Microsoft sign-in: the device-code flow, Xbox Live, XSTS and the Minecraft services, the
 //! ownership check and the profile, and renewing a saved sign-in.
 use super::*;
+use crate::i18n::{tr, trf};
 
 /// The configured Azure app, if any: the run-time variable wins over the build-time one, and an
 /// empty value means none.
@@ -116,12 +117,12 @@ pub enum SignInError {
 impl std::fmt::Display for SignInError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::SignInAgain => SIGN_IN_AGAIN,
-            Self::DamagedSignIn => session::DAMAGED_SIGN_IN,
-            Self::NotConfigured => NOT_CONFIGURED,
-            Self::DoesNotOwn => DOES_NOT_OWN,
-            Self::NoProfile => NO_PROFILE,
-            Self::OtherProfile => OTHER_PROFILE,
+            Self::SignInAgain => tr(SIGN_IN_AGAIN),
+            Self::DamagedSignIn => tr(session::DAMAGED_SIGN_IN),
+            Self::NotConfigured => tr(NOT_CONFIGURED),
+            Self::DoesNotOwn => tr(DOES_NOT_OWN),
+            Self::NoProfile => tr(NO_PROFILE),
+            Self::OtherProfile => tr(OTHER_PROFILE),
             Self::Other(message) => message,
         })
     }
@@ -181,8 +182,9 @@ pub(super) fn send(
         Ok(r) => r,
         Err(ureq::Error::Status(_, r)) => r,
         Err(ureq::Error::Transport(_)) => {
-            return Err(format!(
-                "Could not reach {service}. Check your internet connection."
+            return Err(trf(
+                "Could not reach {service}. Check your internet connection.",
+                &[("service", tr(service))],
             ));
         }
     };
@@ -273,15 +275,17 @@ pub fn device_code(ep: &Endpoints, client_id: &str) -> Result<DeviceCode, SignIn
 /// The OAuth error codes as messages for the player.
 pub(super) fn oauth_error(v: &Value) -> SignInError {
     match v.get("error").and_then(Value::as_str) {
-        Some("authorization_declined") => "Sign-in was declined in the browser.".into(),
-        Some("expired_token") => "The sign-in code expired. Start again.".into(),
-        Some("bad_verification_code") => "The sign-in code was not recognised. Start again.".into(),
+        Some("authorization_declined") => tr("Sign-in was declined in the browser.").into(),
+        Some("expired_token") => tr("The sign-in code expired. Start again.").into(),
+        Some("bad_verification_code") => {
+            tr("The sign-in code was not recognised. Start again.").into()
+        }
         Some("invalid_grant") => SignInError::SignInAgain,
         Some("invalid_client" | "unauthorized_client") => {
-            "Microsoft refused this launcher's app registration (client ID).".into()
+            tr("Microsoft refused this launcher's app registration (client ID).").into()
         }
-        Some(other) => format!("Microsoft sign-in failed ({other}).").into(),
-        None => "Microsoft sign-in failed.".into(),
+        Some(other) => trf("Microsoft sign-in failed ({error}).", &[("error", other)]).into(),
+        None => tr("Microsoft sign-in failed.").into(),
     }
 }
 
@@ -328,12 +332,12 @@ pub fn wait_for_sign_in(
         let until = std::time::Instant::now() + Duration::from_secs(interval);
         while std::time::Instant::now() < until {
             if cancelled() {
-                return Err("Sign-in cancelled.".into());
+                return Err(tr("Sign-in cancelled.").into());
             }
             std::thread::sleep(Duration::from_millis(100));
         }
         if now() > code.expires_at {
-            return Err("The sign-in code expired. Start again.".into());
+            return Err(tr("The sign-in code expired. Start again.").into());
         }
         match poll(ep, client_id, code)? {
             Poll::Pending => {}
@@ -365,19 +369,22 @@ fn refresh_ms(ep: &Endpoints, client_id: &str, refresh: &str) -> Result<MsTokens
 // ----- Xbox Live, XSTS, Minecraft ----------------------------------------------------------------
 
 const FAMILY_URL: &str = sunrise_launcher_addresses::MICROSOFT_FAMILY;
-const CHILD_ACCOUNT: &str = "Microsoft says this is a child account (error {code}). An adult has to add it to a Microsoft family at {url}. If it is an adult account, check its family settings there.";
+const CHILD_ACCOUNT: &str = crate::i18n::tr_key("Microsoft says this is a child account (error {code}). An adult has to add it to a Microsoft family at {url}. If it is an adult account, check its family settings there.");
 
 /// The XSTS `XErr` codes, as the official launcher explains them.
 fn xsts_error(code: u64) -> String {
     match code {
-        2148916233 => "This Microsoft account has no Xbox profile yet. Sign in once at xbox.com to create one, then try again.".into(),
-        2148916235 => "Xbox Live is not available in your country or region.".into(),
-        2148916236 | 2148916237 => "This account needs adult verification on xbox.com before it can play.".into(),
-        2148916238 => crate::i18n::trf(
+        2148916233 => tr("This Microsoft account has no Xbox profile yet. Sign in once at xbox.com to create one, then try again.").into(),
+        2148916235 => tr("Xbox Live is not available in your country or region.").into(),
+        2148916236 | 2148916237 => tr("This account needs adult verification on xbox.com before it can play.").into(),
+        2148916238 => trf(
             CHILD_ACCOUNT,
             &[("code", &code.to_string()), ("url", FAMILY_URL)],
         ),
-        other => format!("Xbox Live refused the sign-in (error {other})."),
+        other => trf(
+            "Xbox Live refused the sign-in (error {code}).",
+            &[("code", &other.to_string())],
+        ),
     }
 }
 
@@ -409,7 +416,7 @@ fn minecraft_login(
     )?;
     let xbl_token = str_field(&xbl, "Token")
         .filter(|_| status == 200)
-        .ok_or("Xbox Live refused the sign-in.")?;
+        .ok_or_else(|| tr("Xbox Live refused the sign-in.").to_string())?;
     let (status, xsts) = send(
         request_to("POST", &ep.xsts)?,
         Some(Body::Json(json!({
@@ -427,7 +434,7 @@ fn minecraft_login(
         str_field(&xsts, "Token").filter(|_| status == 200),
         claims.and_then(|c| str_field(c, "uhs")),
     ) else {
-        return Err("Xbox Live refused the sign-in.".into());
+        return Err(tr("Xbox Live refused the sign-in.").into());
     };
     let xuid = claims.and_then(|c| str_field(c, "xid"));
     progress(session::Phase::Minecraft);
@@ -469,12 +476,14 @@ fn minecraft_token(ep: &Endpoints, xtoken: &str) -> Result<(String, u64), SignIn
     match (status, str_field(&mc, "access_token")) {
         (200, Some(token)) => Ok((token, lifetime(&mc))),
         // New Azure apps are refused until Mojang approves them (Minecraft API access).
-        (403, _) => Err(
-            "The Minecraft services refused this launcher: its app is not approved by Mojang yet."
-                .into(),
-        ),
-        (429, _) => Err("Too many sign-ins in a short time. Wait a minute and try again.".into()),
-        _ => Err("The Minecraft services refused the sign-in.".into()),
+        (403, _) => Err(tr(
+            "The Minecraft services refused this launcher: its app is not approved by Mojang yet.",
+        )
+        .into()),
+        (429, _) => {
+            Err(tr("Too many sign-ins in a short time. Wait a minute and try again.").into())
+        }
+        _ => Err(tr("The Minecraft services refused the sign-in.").into()),
     }
 }
 
@@ -493,7 +502,7 @@ fn owns_game(ep: &Endpoints, token: &str) -> Result<bool, SignInError> {
         "the Minecraft services",
     )?;
     if status != 200 {
-        return Err("Could not check which games this account owns.".into());
+        return Err(tr("Could not check which games this account owns.").into());
     }
     Ok(v.get("items")
         .and_then(Value::as_array)
@@ -534,7 +543,7 @@ fn profile(ep: &Endpoints, token: &str) -> Result<Option<Account>, SignInError> 
         return Ok(None);
     }
     let (Some(uuid), Some(name)) = (str_field(&v, "id"), str_field(&v, "name")) else {
-        return Err("Could not read the Minecraft profile.".into());
+        return Err(tr("Could not read the Minecraft profile.").into());
     };
     let active = |key: &str| {
         v.get(key)

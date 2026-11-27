@@ -409,7 +409,7 @@ fn registry_library(
 
 // Refuse reparse points and links at every component, including the root. The compiler never
 // receives the installation destination; the launcher copies these bytes out of the work tree.
-fn regular_under(root: &Path, file: &Path) -> io::Result<()> {
+pub(super) fn regular_under(root: &Path, file: &Path) -> io::Result<()> {
     checked_under(root, file, false)
 }
 

@@ -1,8 +1,8 @@
 //! The launcher's identity: its names, folders, keychain service and Windows registry keys.
 pub const VERSION_PREFIX: &str = "sunrise-launcher ";
 pub const DESKTOP_ENTRY: &str = "net.playsunrise.launcher.desktop";
-pub const WINDOW_TITLE: &str = "Sunrise Launcher";
-pub const QUIT_LABEL: &str = "Quit Sunrise Launcher";
+pub const WINDOW_TITLE: &str = crate::i18n::tr_key("Sunrise Launcher");
+pub const QUIT_LABEL: &str = crate::i18n::tr_key("Quit Sunrise Launcher");
 pub const DISPLAY_NAME: &str = "Sunrise Launcher";
 // The installed copy's folder, shortcuts and Add/Remove entry carry Sunrise's own name, never a Horizon install's.
 pub const INSTALL_NAME: &str = "Sunrise Launcher";

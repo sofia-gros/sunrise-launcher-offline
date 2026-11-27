@@ -213,7 +213,14 @@ impl Launcher {
             tx,
             rx,
             _appearance: appearance,
-            _activation: cx.observe_window_activation(window, |_, _, cx| cx.notify()),
+            // Coming back to the window, the profiles are read again: `sunrise-launcher
+            // instance rename` and the other commands change `instances.json` behind it.
+            _activation: cx.observe_window_activation(window, |this, window, cx| {
+                if window.is_window_active() {
+                    this.refresh_instances_list();
+                }
+                cx.notify()
+            }),
             perf: perf::Perf::new("session"),
             install_started: None,
             prepare_started: None,

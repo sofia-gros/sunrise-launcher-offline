@@ -67,7 +67,7 @@ impl Draft {
 
 impl Launcher {
     /// Whether the sheet holds edits its Save has not kept.
-    pub(super) fn sheet_changed(&self) -> bool {
+    pub(crate) fn sheet_changed(&self) -> bool {
         !self.sheet_changes().is_empty()
     }
 

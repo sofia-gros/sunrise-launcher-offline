@@ -125,14 +125,24 @@ pub struct Shared {
 /// Uploads `text` (already [`private`]) to the paste API at `api` ([`api`]) and returns its link.
 pub fn share(api: &str, text: &str) -> Result<Shared, String> {
     if api.is_empty() {
-        return Err("Log sharing is not configured for this build.".into());
+        return Err(crate::i18n::tr("Log sharing is not configured for this build.").into());
     }
     let body = serde_json::json!({ "content": fit(text), "source": "Sunrise launcher" });
     let answer: serde_json::Value = ureq::post(&format!("{api}/log"))
         .send_json(body)
-        .map_err(|e| format!("mclo.gs didn't take the log: {e}"))?
+        .map_err(|e| {
+            crate::i18n::trf(
+                "mclo.gs didn't take the log: {error}",
+                &[("error", &e.to_string())],
+            )
+        })?
         .into_json()
-        .map_err(|e| format!("mclo.gs answered something unexpected: {e}"))?;
+        .map_err(|e| {
+            crate::i18n::trf(
+                "mclo.gs answered something unexpected: {error}",
+                &[("error", &e.to_string())],
+            )
+        })?;
     let field = |k: &str| answer[k].as_str().map(str::to_string);
     match (
         answer["success"].as_bool(),
@@ -141,9 +151,12 @@ pub fn share(api: &str, text: &str) -> Result<Shared, String> {
         field("token"),
     ) {
         (Some(true), Some(url), Some(id), Some(token)) => Ok(Shared { url, id, token }),
-        _ => Err(format!(
-            "mclo.gs didn't take the log: {}",
-            field("error").unwrap_or_else(|| "no reason given".into())
+        _ => Err(crate::i18n::trf(
+            "mclo.gs didn't take the log: {reason}",
+            &[(
+                "reason",
+                &field("error").unwrap_or_else(|| crate::i18n::tr("no reason given").to_string()),
+            )],
         )),
     }
 }
@@ -153,7 +166,12 @@ pub fn unshare(api: &str, shared: &Shared) -> Result<(), String> {
     ureq::delete(&format!("{api}/log/{}", shared.id))
         .set("Authorization", &format!("Bearer {}", shared.token))
         .call()
-        .map_err(|e| format!("mclo.gs didn't delete it: {e}"))?;
+        .map_err(|e| {
+            crate::i18n::trf(
+                "mclo.gs didn't delete it: {error}",
+                &[("error", &e.to_string())],
+            )
+        })?;
     Ok(())
 }
 

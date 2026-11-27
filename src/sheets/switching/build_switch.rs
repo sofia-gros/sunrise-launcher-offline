@@ -168,7 +168,7 @@ impl Launcher {
             running.progress = stage;
             running.eta.update(
                 crate::eta::install_stage_key(stage),
-                crate::mods_page::install::stage_fraction(stage),
+                crate::eta::stage_fraction(stage),
                 Instant::now(),
             );
         }
@@ -284,7 +284,7 @@ impl Launcher {
             running.progress = stage;
             running.eta.update(
                 crate::eta::install_stage_key(stage),
-                crate::mods_page::install::stage_fraction(stage),
+                crate::eta::stage_fraction(stage),
                 Instant::now(),
             );
         }
@@ -380,7 +380,7 @@ impl Launcher {
     }
 
     pub(in crate::sheets) fn switch_sheet(&self, cx: &mut Context<Self>) -> Stateful<Div> {
-        use crate::mods_page::install::{stage_fraction, stage_label};
+        use crate::eta::{stage_fraction, stage_label};
         let running = self
             .ui
             .sheets

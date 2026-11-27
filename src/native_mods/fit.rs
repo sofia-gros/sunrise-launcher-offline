@@ -100,18 +100,18 @@ pub fn item(id: &str) -> String {
         return id.to_owned();
     };
     let en = match kind {
-        ItemKind::Hook => "the hook {name}",
-        ItemKind::Argument => "the argument {name}",
-        ItemKind::Trait => "the trait {name}",
-        ItemKind::Method => "the method {name}",
-        ItemKind::AssociatedItem => "the associated item {name}",
-        ItemKind::Function => "the function {name}",
-        ItemKind::Macro => "the macro {name}",
-        ItemKind::PartKind => "the Part kind {name}",
-        ItemKind::Capability => "the capability {name}",
-        ItemKind::Type => "the type {name}",
-        ItemKind::Variant => "the variant {name}",
-        ItemKind::Field => "the field {name}",
+        ItemKind::Hook => crate::i18n::tr_key("the hook {name}"),
+        ItemKind::Argument => crate::i18n::tr_key("the argument {name}"),
+        ItemKind::Trait => crate::i18n::tr_key("the trait {name}"),
+        ItemKind::Method => crate::i18n::tr_key("the method {name}"),
+        ItemKind::AssociatedItem => crate::i18n::tr_key("the associated item {name}"),
+        ItemKind::Function => crate::i18n::tr_key("the function {name}"),
+        ItemKind::Macro => crate::i18n::tr_key("the macro {name}"),
+        ItemKind::PartKind => crate::i18n::tr_key("the Part kind {name}"),
+        ItemKind::Capability => crate::i18n::tr_key("the capability {name}"),
+        ItemKind::Type => crate::i18n::tr_key("the type {name}"),
+        ItemKind::Variant => crate::i18n::tr_key("the variant {name}"),
+        ItemKind::Field => crate::i18n::tr_key("the field {name}"),
     };
     trf(en, &[("name", &name)])
 }

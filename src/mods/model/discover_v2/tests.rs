@@ -575,6 +575,19 @@ fn a_collection_picks_its_default_members_that_fit_and_installs_only_the_rest() 
         collection.to_install(&cards, &all, &|id| id == "Ab3dE9xQ"),
         ["Bc4eF0yR"]
     );
+    // Install names how many it takes, and why the rest wait: Roofs doesn't fit, and Doors is
+    // optional until it is installed.
+    let (label, why) = collection.install_label(&cards, 1, &|_| false);
+    assert_eq!(label, "Install 1");
+    assert_eq!(
+        why.as_deref(),
+        Some("Installs 1 of its 3 mods: some don't fit this build yet and some are optional. Open it to choose.")
+    );
+    let (_, why) = collection.install_label(&cards, 1, &|id| id == "Bc4eF0yR");
+    assert_eq!(
+        why.as_deref(),
+        Some("Installs 1 of its 3 mods: the rest don't fit this build yet.")
+    );
 
     let filters = |text: &str, category: Option<&str>, show_all| V2Filters {
         text: text.to_owned(),
@@ -831,6 +844,13 @@ fn a_collection_whose_base_has_no_release_for_the_build_installs_the_others_and_
     assert_eq!(
         collection.to_install(&cards, &all, &|_| false),
         ["De6gH2aT"]
+    );
+    assert_eq!(
+        collection.install_label(&cards, 1, &|_| false),
+        (
+            "Install 1".to_owned(),
+            Some("Installs 1 of its 4 mods: the rest don't fit this build yet.".to_owned())
+        )
     );
 
     // The dependants are greyed with the reason; the one with nothing missing shows none.

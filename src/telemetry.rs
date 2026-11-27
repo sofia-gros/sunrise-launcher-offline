@@ -19,40 +19,40 @@ pub use gather::gather;
 pub const SWITCHES: [(Kind, &str, &str, &str); 4] = [
     (
         Kind::Perf,
-        "Performance statistics",
-        "How smoothly Sunrise runs on your computer, so slowdowns can be found and fixed.",
-        "After each session: frame-time percentiles and a 14-bucket histogram, tick times, peak memory and startup times, which of Sunrise's own steps held up frames of a quarter second or longer (their names in the code, how often and for how long), with your machine (OS, CPU and its cores and clocks, memory size, GPU, its memory and driver, drive type, screen size and refresh rate, laptop or desktop, on battery or not) and the settings that change performance.",
+        crate::i18n::tr_key("Performance statistics"),
+        crate::i18n::tr_key("How smoothly Sunrise runs on your computer, so slowdowns can be found and fixed."),
+        crate::i18n::tr_key("After each session: frame-time percentiles and a 14-bucket histogram, tick times, peak memory and startup times, which of Sunrise's own steps held up frames of a quarter second or longer (their names in the code, how often and for how long), with your machine (OS, CPU and its cores and clocks, memory size, GPU, its memory and driver, drive type, screen size and refresh rate, laptop or desktop, on battery or not) and the settings that change performance."),
     ),
     (
         Kind::Crash,
-        "Crash reports",
-        "A short report when the game crashes, so the crash can be fixed.",
-        "When the game crashes: the error, where in Sunrise's code it happened and on which of its threads, the native mod whose code crashed if one did, the Sunrise version, your graphics adapter and settings, and your machine (OS, CPU and its cores and clocks, memory size, GPU, its memory and driver, drive type, screen size and refresh rate, laptop or desktop, on battery or not). No log, no world or server, no user name in paths.",
+        crate::i18n::tr_key("Crash reports"),
+        crate::i18n::tr_key("A short report when the game crashes, so the crash can be fixed."),
+        crate::i18n::tr_key("When the game crashes: the error, where in Sunrise's code it happened and on which of its threads, the native mod whose code crashed if one did, the Sunrise version, your graphics adapter and settings, and your machine (OS, CPU and its cores and clocks, memory size, GPU, its memory and driver, drive type, screen size and refresh rate, laptop or desktop, on battery or not). No log, no world or server, no user name in paths."),
     ),
     (
         Kind::Bug,
-        "Bug reports",
-        "Only the bug reports you write and send yourself.",
-        "Only the reports you write and send yourself, with the game's log if you add it after reading it.",
+        crate::i18n::tr_key("Bug reports"),
+        crate::i18n::tr_key("Only the bug reports you write and send yourself."),
+        crate::i18n::tr_key("Only the reports you write and send yourself, with the game's log if you add it after reading it."),
     ),
     (
         Kind::Benchmark,
-        "Benchmark uploads",
-        "Your benchmark results, for the community results page.",
-        "The results of benchmarks you run, for the community results on playsunrise.net.",
+        crate::i18n::tr_key("Benchmark uploads"),
+        crate::i18n::tr_key("Your benchmark results, for the community results page."),
+        crate::i18n::tr_key("The results of benchmarks you run, for the community results on playsunrise.net."),
     ),
 ];
 
 /// Never sent, whatever the switches say.
-pub const NEVER: &str = "Never sent: your account name or UUID, world names, server addresses, chat, or your IP address. Each report is dated to the day, under a random install ID you can delete.";
+pub const NEVER: &str = crate::i18n::tr_key("Never sent: your account name or UUID, world names, server addresses, chat, or your IP address. Each report is dated to the day, under a random install ID you can delete.");
 
 /// The anonymous "I'm playing" ping the game sends (Ludovic's decision, 2026-10-22: count
 /// everyone, and tell them). On by default as upstream; this launcher also lets the player turn
 /// it off (`Settings::ping_off`), then starts the game with `SUNRISE_NO_HEARTBEAT`. Shown in
 /// Settings, beside the four switches.
-pub const PING_NAME: &str = "\"I'm playing\" ping";
-pub const PING_SUMMARY: &str = "Tells Sunrise, anonymously, that you're playing, so the launcher can show how many people play right now.";
-pub const PING: &str = "While you play, the game sends an anonymous \"I'm playing\" ping once a minute, so the launcher can show how many people play Sunrise right now. It holds: a random number made when the game starts and forgotten when it closes, the Sunrise version, your OS (Linux, macOS or Windows), and whether you have a world open to LAN or friends. It doesn't hold: your account, your install ID, world or server names, or anything you do in the game, and the server doesn't keep your IP address. It is on unless you turn it off.";
+pub const PING_NAME: &str = crate::i18n::tr_key("\"I'm playing\" ping");
+pub const PING_SUMMARY: &str = crate::i18n::tr_key("Tells Sunrise, anonymously, that you're playing, so the launcher can show how many people play right now.");
+pub const PING: &str = crate::i18n::tr_key("While you play, the game sends an anonymous \"I'm playing\" ping once a minute, so the launcher can show how many people play Sunrise right now. It holds: a random number made when the game starts and forgotten when it closes, the Sunrise version, your OS (Linux, macOS or Windows), and whether you have a world open to LAN or friends. It doesn't hold: your account, your install ID, world or server names, or anything you do in the game, and the server doesn't keep your IP address. It is on unless you turn it off.");
 
 /// The game sends the [`PING`] unless the player turned it off (`Settings::ping_off`).
 pub fn ping_only_if_allowed(cmd: &mut std::process::Command, allowed: bool) {
@@ -145,10 +145,15 @@ pub fn preview() -> (String, String) {
     let home = home();
     let waiting = outbox::retain_allowed(&home).len();
     if waiting > 0 {
-        let what = format!(
-            "{waiting} item{} waiting to be sent, exactly as they will leave (compressed):",
-            if waiting == 1 { "" } else { "s" }
-        );
+        let what = if waiting == 1 {
+            crate::i18n::tr("1 item waiting to be sent, exactly as they will leave (compressed):")
+                .to_string()
+        } else {
+            crate::i18n::trf(
+                "{count} items waiting to be sent, exactly as they will leave (compressed):",
+                &[("count", &waiting.to_string())],
+            )
+        };
         return (what, upload::preview(&home));
     }
     let system = with_example_gpu(System::detect_in(Some(&home)));
@@ -192,7 +197,7 @@ pub fn preview() -> (String, String) {
     }))
     .unwrap_or_default();
     (
-        "Nothing is waiting. One example of each kind, from this machine; the game fills in the GPU and screen it uses where these say example (a benchmark upload is the report itself, see docs/benchmark-report.md):".into(),
+        crate::i18n::tr("Nothing is waiting. One example of each kind, from this machine; the game fills in the GPU and screen it uses where these say example (a benchmark upload is the report itself, see docs/benchmark-report.md):").into(),
         json,
     )
 }
@@ -224,20 +229,25 @@ pub fn delete_my_data() -> Result<String, String> {
     outbox::clear(&home).map_err(|e| e.to_string())?;
     gather::clear_profiles(&home).map_err(|e| e.to_string())?;
     let remote = match sunrise_launcher_telemetry::endpoint() {
-        _ if consent.install_id.is_empty() => "Nothing was ever sent from here.",
-        None => {
-            "Sending is turned off here (SUNRISE_TELEMETRY_URL=off), so the server was not asked."
-        }
+        _ if consent.install_id.is_empty() => crate::i18n::tr("Nothing was ever sent from here."),
+        None => crate::i18n::tr(
+            "Sending is turned off here (SUNRISE_TELEMETRY_URL=off), so the server was not asked.",
+        ),
         Some(url) => {
-            upload::delete_remote(&url, &consent.install_id)
-                .map_err(|e| format!("The server could not be reached ({e}). Try again later."))?;
-            "The server deleted everything sent from here."
+            upload::delete_remote(&url, &consent.install_id).map_err(|e| {
+                crate::i18n::trf(
+                    "The server could not be reached ({error}). Try again later.",
+                    &[("error", &e.to_string())],
+                )
+            })?;
+            crate::i18n::tr("The server deleted everything sent from here.")
         }
     };
     consent.reset_install_id();
     consent.save(&home).map_err(|e| e.to_string())?;
-    Ok(format!(
-        "{remote} Nothing is waiting, and this install has a new ID."
+    Ok(crate::i18n::trf(
+        "{remote} Nothing is waiting, and this install has a new ID.",
+        &[("remote", remote)],
     ))
 }
 
@@ -291,9 +301,9 @@ pub fn ensure_allowed(kind: Kind) -> Result<(), String> {
     if consent().allows(kind) {
         return Ok(());
     }
-    Err(format!(
-        "{} are off: turn them on in Settings → Data collection first.",
-        label(kind)
+    Err(crate::i18n::trf(
+        "{name} are off: turn them on in Settings → Data collection first.",
+        &[("name", crate::i18n::tr(label(kind)))],
     ))
 }
 
@@ -301,22 +311,32 @@ pub fn ensure_allowed(kind: Kind) -> Result<(), String> {
 pub fn submit(item: &Item) -> Result<String, String> {
     ensure_allowed(item.kind())?;
     if !outbox::push(&home(), item).map_err(|e| e.to_string())? {
-        return Err("Today's limit for these is reached; try again tomorrow.".into());
+        return Err(
+            crate::i18n::tr("Today's limit for these is reached; try again tomorrow.").into(),
+        );
     }
     Ok(match send() {
-        Flush::Sent { .. } => "Sent. Thank you.".into(),
+        Flush::Sent { .. } => crate::i18n::tr("Sent. Thank you.").into(),
         Flush::Nothing if sunrise_launcher_telemetry::endpoint().is_none() => {
-            "Kept; sending is turned off here (SUNRISE_TELEMETRY_URL=off).".into()
+            crate::i18n::tr("Kept; sending is turned off here (SUNRISE_TELEMETRY_URL=off).").into()
         }
-        _ => "Kept; it will be sent the next time the launcher starts.".into(),
+        _ => crate::i18n::tr("Kept; it will be sent the next time the launcher starts.").into(),
     })
 }
 
 /// A benchmark report file (`docs/benchmark-report.md`), scrubbed, as an upload.
 pub fn benchmark_report(path: &Path) -> Result<Item, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let report: serde_json::Value = serde_json::from_str(&scrubber().scrub(&text))
-        .map_err(|e| format!("{}: not a JSON report ({e})", path.display()))?;
+    let report: serde_json::Value =
+        serde_json::from_str(&scrubber().scrub(&text)).map_err(|e| {
+            crate::i18n::trf(
+                "{path}: not a JSON report ({error})",
+                &[
+                    ("path", &path.display().to_string()),
+                    ("error", &e.to_string()),
+                ],
+            )
+        })?;
     let item = Item::new(
         Source::Launcher,
         backend::VERSION,
@@ -382,7 +402,10 @@ pub fn parse_kinds(names: &[String]) -> Result<Vec<Kind>, String> {
             "bugs" => kinds.push(Kind::Bug),
             "benchmarks" => kinds.push(Kind::Benchmark),
             other => kinds.push(Kind::from_name(other).ok_or_else(|| {
-                format!("{other}: one of performance, crashes, bugs, benchmarks, all")
+                crate::i18n::trf(
+                    "{name}: one of performance, crashes, bugs, benchmarks, all",
+                    &[("name", other)],
+                )
             })?),
         }
     }

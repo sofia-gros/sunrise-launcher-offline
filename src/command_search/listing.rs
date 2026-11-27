@@ -20,7 +20,7 @@ pub(crate) enum Group {
 
 impl Group {
     pub(super) fn heading(self) -> &'static str {
-        match self {
+        crate::i18n::tr_key(match self {
             Group::Navigate => "Go to",
             Group::Profiles => "Profiles",
             Group::Worlds => "Worlds",
@@ -28,7 +28,7 @@ impl Group {
             Group::Packs => "Installed resource and shader packs",
             Group::Settings => "Settings",
             Group::Shortcuts => "Keyboard shortcuts",
-        }
+        })
     }
 }
 
@@ -93,23 +93,38 @@ impl Entry {
 
 /// The rows of Settings found by name, as their sections title them.
 pub(super) const SETTINGS_ROWS: [(&str, Section); 17] = [
-    ("While you play", Section::Game),
-    ("Minecraft folder", Section::Game),
-    ("Profiles", Section::Game),
-    ("Theme", Section::Appearance),
-    ("Accent", Section::Appearance),
-    ("Custom background", Section::Appearance),
-    ("Worlds on Home", Section::Appearance),
-    ("Your themes", Section::Appearance),
-    ("Show the cat", Section::Appearance),
-    ("Installed game builds", Section::Storage),
-    ("Import a game build", Section::Storage),
-    ("Remove old game builds automatically", Section::Storage),
-    ("Game files and worlds", Section::Storage),
-    ("Downloads kept for reuse", Section::Storage),
-    ("Keep at most", Section::Storage),
-    ("Your data", Section::Privacy),
-    ("Language", Section::Launcher),
+    (crate::i18n::tr_key("While you play"), Section::Game),
+    (crate::i18n::tr_key("Minecraft folder"), Section::Game),
+    (crate::i18n::tr_key("Profiles"), Section::Game),
+    (crate::i18n::tr_key("Theme"), Section::Appearance),
+    (crate::i18n::tr_key("Accent"), Section::Appearance),
+    (
+        crate::i18n::tr_key("Custom background"),
+        Section::Appearance,
+    ),
+    (crate::i18n::tr_key("Worlds on Home"), Section::Appearance),
+    (crate::i18n::tr_key("Your themes"), Section::Appearance),
+    (crate::i18n::tr_key("Show the cat"), Section::Appearance),
+    (
+        crate::i18n::tr_key("Installed game builds"),
+        Section::Storage,
+    ),
+    (crate::i18n::tr_key("Import a game build"), Section::Storage),
+    (
+        crate::i18n::tr_key("Remove old game builds automatically"),
+        Section::Storage,
+    ),
+    (
+        crate::i18n::tr_key("Game files and worlds"),
+        Section::Storage,
+    ),
+    (
+        crate::i18n::tr_key("Downloads kept for reuse"),
+        Section::Storage,
+    ),
+    (crate::i18n::tr_key("Keep at most"), Section::Storage),
+    (crate::i18n::tr_key("Your data"), Section::Privacy),
+    (crate::i18n::tr_key("Language"), Section::Launcher),
 ];
 
 /// The launcher's own places: its pages, then the sections and rows of Settings.
@@ -119,8 +134,16 @@ pub(crate) fn destinations() -> Vec<Entry> {
         Entry::page(tr("Home").to_string(), "home", Page::Home),
         Entry::page(tr("Mods").to_string(), "puzzle", Page::Discover),
         Entry::page(tr("Packs").to_string(), "package", Page::Packs),
-        Entry::page(under("Servers", "Join"), "globe", Page::Join),
-        Entry::page(under("Servers", "Host"), "server", Page::Hosting),
+        Entry::page(
+            under(crate::i18n::tr_key("Servers"), crate::i18n::tr_key("Join")),
+            "globe",
+            Page::Join,
+        ),
+        Entry::page(
+            under(crate::i18n::tr_key("Servers"), crate::i18n::tr_key("Host")),
+            "server",
+            Page::Hosting,
+        ),
         Entry::page(tr("Skins").to_string(), "shirt", Page::Skins),
         Entry::page(tr("Settings").to_string(), "sliders", Page::Settings),
     ];
@@ -128,7 +151,7 @@ pub(crate) fn destinations() -> Vec<Entry> {
         target: Target::Section(section),
         quiet: true,
         ..Entry::page(
-            under("Settings", section.label()),
+            under(crate::i18n::tr_key("Settings"), section.label()),
             "sliders",
             Page::Settings,
         )
@@ -136,7 +159,7 @@ pub(crate) fn destinations() -> Vec<Entry> {
     all.extend(SETTINGS_ROWS.map(|(title, section)| Entry {
         group: Group::Settings,
         label: tr(title).to_string(),
-        hint: under("Settings", section.label()),
+        hint: under(crate::i18n::tr_key("Settings"), section.label()),
         target: match title {
             "Worlds on Home" => Target::WorldsOnHome,
             _ => Target::Section(section),
@@ -159,8 +182,13 @@ pub(super) fn keys(letter: &str) -> String {
 /// The launcher's keyboard shortcuts, each a row that does what its key does.
 pub(crate) fn shortcuts() -> Vec<Entry> {
     [
-        ("Search", "K", Target::Search, "search"),
-        ("Show or hide the sidebar", "B", Target::Sidebar, "home"),
+        (crate::i18n::tr_key("Search"), "K", Target::Search, "search"),
+        (
+            crate::i18n::tr_key("Show or hide the sidebar"),
+            "B",
+            Target::Sidebar,
+            "home",
+        ),
     ]
     .map(|(label, letter, target, icon)| Entry {
         group: Group::Shortcuts,

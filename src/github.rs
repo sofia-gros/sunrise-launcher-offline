@@ -42,7 +42,7 @@ enum Answer {
 
 /// GitHub's JSON for a required resource. Missing resources are reported as errors.
 pub fn json(url: &str) -> Result<serde_json::Value, String> {
-    json_optional(url)?.ok_or_else(|| format!("{url} answered 404"))
+    json_optional(url)?.ok_or_else(|| crate::i18n::trf("{url} answered 404", &[("url", url)]))
 }
 
 /// Whether the saved answer can stand in for a new request.
@@ -108,17 +108,21 @@ fn release_list_with(
             policy,
             paginated: true,
         })?
-        .ok_or_else(|| format!("{url} answered 404"))?;
+        .ok_or_else(|| crate::i18n::trf("{url} answered 404", &[("url", url)]))?;
         let serde_json::Value::Array(items) = page.body else {
-            return Err(format!("{url} didn't answer with a release list."));
+            return Err(crate::i18n::trf(
+                "{url} didn't answer with a release list.",
+                &[("url", url)],
+            ));
         };
         releases.extend(items);
         if page.next != Some(true) {
             return Ok(releases);
         }
     }
-    Err(format!(
-        "{repo}'s release list exceeds {MAX_RELEASE_PAGES} pages."
+    Err(crate::i18n::trf(
+        "{repo}'s release list exceeds {pages} pages.",
+        &[("repo", repo), ("pages", &MAX_RELEASE_PAGES.to_string())],
     ))
 }
 
@@ -178,7 +182,7 @@ fn page_with(
                 return Ok(Some(k.page));
             }
             // A 304 to a request that had no ETag: can't happen, but don't trust it.
-            None => "GitHub answered 304 without a saved copy".to_owned(),
+            None => crate::i18n::tr("GitHub answered 304 without a saved copy").to_owned(),
         },
         Answer::NotFound => return Ok(None),
         Answer::RateLimited => RATE_LIMITED.to_owned(),
@@ -203,9 +207,11 @@ fn page_with(
                 return Ok(Some(page));
             }
             Answer::NotFound => return Ok(None),
-            Answer::RateLimited => Some("too many requests from this network".to_owned()),
+            Answer::RateLimited => {
+                Some(crate::i18n::tr("too many requests from this network").to_owned())
+            }
             Answer::Failed(e) => Some(e),
-            Answer::NotModified(_) => Some("an unexpected 304".to_owned()),
+            Answer::NotModified(_) => Some(crate::i18n::tr("an unexpected 304").to_owned()),
         },
         None => None,
     };
@@ -215,8 +221,9 @@ fn page_with(
         }
     }
     Err(match from_mirror {
-        Some(m) => format!(
-            "{why}, and Sunrise's mirror of GitHub couldn't help either ({m}). Try again in a few minutes."
+        Some(m) => crate::i18n::trf(
+            "{why}, and Sunrise's mirror of GitHub couldn't help either ({mirror}). Try again in a few minutes.",
+            &[("why", why.as_str()), ("mirror", m.as_str())],
         ),
         None => why,
     })
@@ -315,7 +322,10 @@ fn failure(url: &str, e: ureq::Error) -> Answer {
         ureq::Error::Status(code, r) if rate_limited(code, |h| r.header(h).map(str::to_owned)) => {
             Answer::RateLimited
         }
-        ureq::Error::Status(code, _) => Answer::Failed(format!("{url} answered {code}")),
+        ureq::Error::Status(code, _) => Answer::Failed(crate::i18n::trf(
+            "{url} answered {code}",
+            &[("url", url), ("code", &code.to_string())],
+        )),
         ureq::Error::Transport(t) => Answer::Failed(format!("No connection: {t}")),
     }
 }

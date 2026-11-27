@@ -428,7 +428,7 @@ impl Launcher {
             Some(Sheet::Search) => Some(self.command_search(cx)),
             Some(Sheet::RegistryPlay) => match self.registry_stage() {
                 Some(stage) => {
-                    use crate::mods_page::install::{stage_fraction, stage_label};
+                    use crate::eta::{stage_fraction, stage_label};
                     let body = div()
                         .flex()
                         .flex_col()

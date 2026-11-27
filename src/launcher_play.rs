@@ -341,7 +341,7 @@ impl Launcher {
         self.prepare_log.clear();
         self.prepare_error = None;
         self.prepare_log
-            .push_back("Checking Java and your Minecraft install".into());
+            .push_back(crate::i18n::tr("Checking Java and your Minecraft install").into());
         let tx = self.tx.clone();
         // The checks may download the server jar, so they run on the thread too.
         std::thread::spawn(move || {

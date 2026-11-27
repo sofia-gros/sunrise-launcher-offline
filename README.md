@@ -474,8 +474,10 @@ and don't set `%ERRORLEVEL%` / `$LASTEXITCODE`. Scripts that need the exit code 
     sunrise-launcher modpack play <pack>   temporarily unavailable
     sunrise-launcher modpack remove <pack>                   temporarily unavailable
     sunrise-launcher mods [list]                    what the mod browser installed (docs/mod-browser.md)
-    sunrise-launcher mods search <text> [--kind resource|shader|datapack|mod|modpack] [--everything] [--source modrinth]
-    sunrise-launcher mods install <id or slug>      checksum checked, with what it needs; Sunrise modpacks are paused
+    sunrise-launcher mods search <text> [--kind resource|shader|datapack|mod|modpack] [--everything] [--source modrinth|sunrise]
+                     mods come from Sunrise's registry, the rest from Modrinth, unless --source says
+    sunrise-launcher mods install <id or slug>      checksum checked, with what it needs; a mod the registry lists
+                     comes from it (`shulker-tooltip` finds `shulker_tooltip`); Sunrise modpacks are paused
     sunrise-launcher mods update [<pack>] [--check]
     sunrise-launcher mods remove <pack>
     sunrise-launcher servers [list]                 the servers hosted from the launcher, and whether they run

@@ -112,14 +112,14 @@ fn a_stopped_managed_build_opens_its_result_from_home_and_the_strip() {
 }
 
 #[test]
-fn signed_out_play_is_disabled_and_only_its_tooltip_says_why() {
+fn signed_out_play_signs_in_first_and_only_its_tooltip_says_so() {
     let out = Facts {
         signed_in: false,
         ..idle()
     }
     .view();
     assert_eq!(out.main, Main::SignIn);
-    assert!(!out.enabled, "nothing happens when it is pressed");
+    assert!(out.enabled, "pressing it signs in, then plays");
     assert_eq!(out.main.tooltip().as_deref(), Some("Sign in to play"));
     // Signed in: the normal Play, no tooltip.
     let signed_in = idle().view();

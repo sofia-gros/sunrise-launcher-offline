@@ -170,18 +170,20 @@ impl Launcher {
     pub(super) fn save_token(&mut self) {
         let token = self.servers.value(Field::Token).trim().to_string();
         if !token.starts_with("tskey-") {
-            self.internet.message = Some(Err(
-                "Paste the access token Tailscale showed (it begins with tskey-).".into(),
-            ));
+            self.internet.message = Some(Err(crate::i18n::tr(
+                "Paste the access token Tailscale showed (it begins with tskey-).",
+            )
+            .into()));
             return;
         }
         self.servers.text(Field::Token).set(String::new());
         self.internet.asking_token = false;
         self.internet.message = match account::keychain().set(tailscale::TOKEN_KEY, &token) {
             Ok(()) if account::keychain().persistent() => None,
-            Ok(()) => Some(Ok(
-                "No keychain here: the token is kept until the launcher closes.".into(),
-            )),
+            Ok(()) => Some(Ok(crate::i18n::tr(
+                "No keychain here: the token is kept until the launcher closes.",
+            )
+            .into())),
             Err(e) => Some(Err(e.into())),
         };
         self.internet.token = Some(Some(token));

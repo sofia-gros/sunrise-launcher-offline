@@ -12,6 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::i18n::{tr, trf};
 #[cfg(windows)]
 use crate::windows_runtime::wide;
 
@@ -49,7 +50,8 @@ pub fn bootstrap_path() -> Result<PathBuf> {
                 .join(crate::paths::LOCATION)
         })
         .ok_or_else(|| {
-            "Cannot locate the platform configuration folder for the launcher location file".into()
+            tr("Cannot locate the platform configuration folder for the launcher location file")
+                .into()
         })
 }
 
@@ -93,7 +95,7 @@ fn location() -> std::sync::MutexGuard<'static, Option<Result<Option<Roots>>>> {
 }
 
 fn open_error(error: &str) -> String {
-    format!("Cannot open the data folder: {error}")
+    trf("Cannot open the data folder: {error}", &[("error", error)])
 }
 
 fn remember_startup_error(error: Option<String>) {
@@ -207,16 +209,21 @@ pub fn resolve_at(bootstrap: &Path) -> Result<Option<Roots>> {
         Err(e) => return Err(problem(bootstrap, e)),
     };
     let location: Location = serde_json::from_slice(&bytes).map_err(|e| {
-        format!(
-            "Invalid {}: {e}; restore this file or the previous data folder",
-            bootstrap.display()
+        trf(
+            "Invalid {path}: {error}; restore this file or the previous data folder",
+            &[
+                ("path", &bootstrap.display().to_string()),
+                ("error", &e.to_string()),
+            ],
         )
     })?;
     if location.version != 1 {
-        return Err(format!(
-            "Unsupported data location version {} in {}",
-            location.version,
-            bootstrap.display()
+        return Err(trf(
+            "Unsupported data location version {version} in {path}",
+            &[
+                ("version", &location.version.to_string()),
+                ("path", &bootstrap.display().to_string()),
+            ],
         ));
     }
     let canonical = validate_roots(&location.roots)?;
@@ -227,9 +234,9 @@ pub fn resolve_at(bootstrap: &Path) -> Result<Option<Roots>> {
         &location.roots.build,
     ] {
         if !root.is_dir() {
-            return Err(format!(
-                "Data folder {} is missing; reconnect its drive or restore location.json",
-                root.display()
+            return Err(trf(
+                "Data folder {path} is missing; reconnect its drive or restore location.json",
+                &[("path", &root.display().to_string())],
             ));
         }
     }
@@ -255,7 +262,7 @@ fn lock_at(bootstrap: &Path, exclusive: bool) -> Result<MigrationLease> {
     let bootstrap = &pointer_path(bootstrap)?;
     let parent = bootstrap
         .parent()
-        .ok_or("Bootstrap needs a parent folder")?;
+        .ok_or_else(|| tr("Bootstrap needs a parent folder").to_string())?;
     fs::create_dir_all(parent).map_err(|e| problem(parent, e))?;
     lock_file(&parent.join("migration.lock"), exclusive)
 }
@@ -311,7 +318,7 @@ pub fn migrate_current_with_prepare(
     prepare: impl FnOnce(&Roots, &Roots) -> Result<()>,
 ) -> Result<Roots> {
     if has_override() {
-        return Err("Unset SUNRISE_LAUNCHER_HOME and SUNRISE_HOME before moving data".into());
+        return Err(tr("Unset SUNRISE_LAUNCHER_HOME and SUNRISE_HOME before moving data").into());
     }
     let bootstrap = bootstrap_path()?;
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -359,10 +366,10 @@ fn migrate_locked(
     let source = validate_roots(source)?;
     if let Some(current) = resolve_at(bootstrap)? {
         if current != source {
-            return Err(
-                "Data location changed while waiting; restart the launcher and retry the move"
-                    .into(),
-            );
+            return Err(tr(
+                "Data location changed while waiting; restart the launcher and retry the move",
+            )
+            .into());
         }
     }
     let target = checked_path(target)?;
@@ -373,10 +380,12 @@ fn migrate_locked(
         &pointer_path(bootstrap)?,
     ] {
         if overlaps(root, &target) {
-            return Err(format!(
-                "Destination {} overlaps existing data or its bootstrap {}",
-                target.display(),
-                root.display()
+            return Err(trf(
+                "Destination {target} overlaps existing data or its bootstrap {bootstrap}",
+                &[
+                    ("target", &target.display().to_string()),
+                    ("bootstrap", &root.display().to_string()),
+                ],
             ));
         }
     }
@@ -396,9 +405,9 @@ fn migrate_locked(
                 .next()
                 .is_some())
     {
-        return Err(format!(
-            "Destination {} must be an empty folder",
-            target.display()
+        return Err(trf(
+            "Destination {path} must be an empty folder",
+            &[("path", &target.display().to_string())],
         ));
     }
     // Canonical spellings are only for excluding controls from the copied tree. Commit
@@ -414,17 +423,17 @@ fn migrate_locked(
     controls.push(registry.path().to_owned());
     // Both pointer and source leases cover recovery and the entire snapshot/commit.
     crate::relocation::admit_idle_profiles(&source)?;
-    progress("Copying and verifying launcher data");
+    progress(tr("Copying and verifying launcher data"));
     fs::create_dir_all(&target).map_err(|e| problem(&target, e))?;
     let stage = target.join(".relocation-staging");
     let staged = layout(&source, &stage);
     let result = (|| {
         private_dir(&stage)?;
         copy_tree(&source.launcher, &staged.launcher, &controls, &mut progress)?;
-        progress("Copying and verifying game data");
+        progress(tr("Copying and verifying game data"));
         copy_tree(&source.game, &staged.game, &controls, &mut progress)?;
         if !within(&source.build, &source.launcher) {
-            progress("Copying and verifying build data");
+            progress(tr("Copying and verifying build data"));
             copy_tree(&source.build, &staged.build, &controls, &mut progress)?;
         } else if !staged.build.exists() {
             fs::create_dir_all(&staged.build).map_err(|e| problem(&staged.build, e))?;
@@ -444,11 +453,16 @@ fn migrate_locked(
         }
         fs::remove_dir(&stage).map_err(|e| problem(&stage, e))?;
         sync_dir(&target)?;
-        progress("Committing data location");
+        progress(tr("Committing data location"));
         commit(bootstrap, &destination)?;
         Ok(destination)
     })();
-    result.map_err(|e: String| format!("{e}. Original data was kept. Partial copies may remain in {}; choose an empty folder to retry", target.display()))
+    result.map_err(|e: String| {
+        trf(
+            "{error}. Original data was kept. Partial copies may remain in {path}; choose an empty folder to retry",
+            &[("error", &e), ("path", &target.display().to_string())],
+        )
+    })
 }
 
 fn layout(source: &Roots, target: &Path) -> Roots {
@@ -481,7 +495,10 @@ fn validate_roots(roots: &Roots) -> Result<Roots> {
     for root in [&roots.launcher, &roots.game, &roots.build] {
         match fs::metadata(root) {
             Ok(meta) if !meta.is_dir() => {
-                return Err(format!("Data root must be a folder: {}", root.display()))
+                return Err(trf(
+                    "Data root must be a folder: {path}",
+                    &[("path", &root.display().to_string())],
+                ))
             }
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(problem(root, e)),
             _ => {}
@@ -491,10 +508,10 @@ fn validate_roots(roots: &Roots) -> Result<Roots> {
         || overlaps(&roots.build, &roots.game)
         || (overlaps(&roots.launcher, &roots.build) && !within(&roots.build, &roots.launcher))
     {
-        return Err(
-            "Source data roots overlap; only a build folder inside/equal to launcher is supported"
-                .into(),
-        );
+        return Err(tr(
+            "Source data roots overlap; only a build folder inside/equal to launcher is supported",
+        )
+        .into());
     }
     Ok(roots)
 }
@@ -521,9 +538,9 @@ fn same_path(a: &Path, b: &Path) -> bool {
 /// Canonicalize existing ancestors, reject links/junctions and ambiguous relative components.
 fn checked_path(path: &Path) -> Result<PathBuf> {
     if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
-        return Err(format!(
-            "Use an absolute path without '..': {}",
-            path.display()
+        return Err(trf(
+            "Use an absolute path without '..': {path}",
+            &[("path", &path.display().to_string())],
         ));
     }
     let mut current = PathBuf::new();
@@ -583,9 +600,9 @@ fn pointer_path(path: &Path) -> Result<PathBuf> {
 
 fn resolved_prefix(path: &Path) -> Result<(PathBuf, Vec<std::ffi::OsString>)> {
     if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
-        return Err(format!(
-            "Use an absolute path without '..': {}",
-            path.display()
+        return Err(trf(
+            "Use an absolute path without '..': {path}",
+            &[("path", &path.display().to_string())],
         ));
     }
     let mut existing = path;
@@ -627,9 +644,9 @@ fn reject_link(path: &Path, meta: &fs::Metadata) -> Result<()> {
     #[cfg(not(windows))]
     let reparse = false;
     if meta.file_type().is_symlink() || reparse {
-        return Err(format!(
-            "Symbolic links and reparse points cannot be relocated: {}",
-            path.display()
+        return Err(trf(
+            "Symbolic links and reparse points cannot be relocated: {path}",
+            &[("path", &path.display().to_string())],
         ));
     }
     Ok(())
@@ -726,20 +743,26 @@ pub(crate) fn copy_tree_except(
         std::io::copy(&mut input, &mut output).map_err(|e| problem(dest, e))?;
         output.sync_all().map_err(|e| problem(dest, e))?;
         if hash(source)? != hash(dest)? {
-            return Err(format!("Copy verification failed for {}", source.display()));
+            return Err(trf(
+                "Copy verification failed for {path}",
+                &[("path", &source.display().to_string())],
+            ));
         }
         let after = fs::symlink_metadata(source).map_err(|e| problem(source, e))?;
         reject_link(source, &after)?;
         if meta.len() != after.len() || meta.modified().ok() != after.modified().ok() {
-            return Err(format!(
-                "Source changed during copying: {}; stop all writers and retry",
-                source.display()
+            return Err(trf(
+                "Source changed during copying: {path}; stop all writers and retry",
+                &[("path", &source.display().to_string())],
             ));
         }
         fs::set_permissions(dest, meta.permissions()).map_err(|e| problem(dest, e))?;
         progress("Verified file");
     } else {
-        return Err(format!("Unsupported special file: {}", source.display()));
+        return Err(trf(
+            "Unsupported special file: {path}",
+            &[("path", &source.display().to_string())],
+        ));
     }
     Ok(())
 }
@@ -784,7 +807,7 @@ fn commit(bootstrap: &Path, roots: &Roots) -> Result<()> {
     let _ = sync_dir(
         bootstrap
             .parent()
-            .ok_or("Bootstrap needs a parent folder")?,
+            .ok_or_else(|| tr("Bootstrap needs a parent folder").to_string())?,
     );
     Ok(())
 }
@@ -867,10 +890,12 @@ fn copy_acl(source: &Path, dest: &Path) -> Result<()> {
         )
     } == 0
     {
-        return Err(format!(
-            "Cannot preserve access permissions on {}: {}",
-            dest.display(),
-            std::io::Error::last_os_error()
+        return Err(trf(
+            "Cannot preserve access permissions on {path}: {error}",
+            &[
+                ("path", &dest.display().to_string()),
+                ("error", &std::io::Error::last_os_error().to_string()),
+            ],
         ));
     }
     Ok(())

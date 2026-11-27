@@ -3,6 +3,7 @@
 //! that the world's level.dat (`Data.DataPacks.Disabled`) doesn't list as disabled, when the world
 //! opens or on `/reload`, so adding one is copying it in. While a `<world>/datapacks.json` still
 //! exists it is read instead of level.dat; the launcher never creates one.
+use crate::i18n::{tr, trf};
 use crate::packs::{entry, pack_description, pack_meta};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -96,7 +97,10 @@ fn check(file: &Path) -> Result<(), String> {
     let archive = fs::File::open(file).map_err(|e| format!("{}: {e}", file.display()))?;
     let zip = crate::zip_intake::open(archive).map_err(|e| format!("{}: {e}", file.display()))?;
     if zip.index_for_name("pack.mcmeta").is_none() {
-        return Err(format!("{name} is not a pack: it has no pack.mcmeta."));
+        return Err(trf(
+            "{name} is not a pack: it has no pack.mcmeta.",
+            &[("name", &name)],
+        ));
     }
     // What `list` needs to show it, checked before the pack is copied.
     if entry(file, "pack.mcmeta")
@@ -104,15 +108,21 @@ fn check(file: &Path) -> Result<(), String> {
         .and_then(|meta| pack_description(&meta))
         .is_none()
     {
-        return Err(format!("{name} is not a data pack the game reads."));
+        return Err(trf(
+            "{name} is not a data pack the game reads.",
+            &[("name", &name)],
+        ));
     }
-    let names: Vec<_> = zip
-        .file_names()
-        .collect::<Result<_, _>>()
-        .map_err(|e| format!("{name} has an entry whose name can't be read: {e}"))?;
+    let names: Vec<_> = zip.file_names().collect::<Result<_, _>>().map_err(|e| {
+        trf(
+            "{name} has an entry whose name can't be read: {error}",
+            &[("name", &name), ("error", &e.to_string())],
+        )
+    })?;
     if !names.iter().any(|n| n.starts_with("data/")) {
-        return Err(format!(
-            "{name} has no data folder: it is a resource pack, not a data pack."
+        return Err(trf(
+            "{name} has no data folder: it is a resource pack, not a data pack.",
+            &[("name", &name)],
         ));
     }
     Ok(())
@@ -137,7 +147,15 @@ pub fn add(world: &Path, file: &Path) -> Result<DataPack, String> {
         })
         .find(|p| !p.exists())
         .expect("a folder can't hold a pack under every numbered name");
-    fs::copy(file, &target).map_err(|e| format!("Could not copy {}: {e}", file.display()))?;
+    fs::copy(file, &target).map_err(|e| {
+        trf(
+            "Could not copy {file}: {error}",
+            &[
+                ("file", &file.display().to_string()),
+                ("error", &e.to_string()),
+            ],
+        )
+    })?;
     let file_name = target
         .file_name()
         .expect("the target is a name joined onto datapacks/")
@@ -148,7 +166,12 @@ pub fn add(world: &Path, file: &Path) -> Result<DataPack, String> {
     list(world)
         .into_iter()
         .find(|p| p.file == file_name)
-        .ok_or_else(|| format!("{} is not a data pack the game reads", target.display()))
+        .ok_or_else(|| {
+            trf(
+                "{file} is not a data pack the game reads",
+                &[("file", &target.display().to_string())],
+            )
+        })
 }
 
 /// Drops `file/<name>` from `Data.DataPacks.Enabled` and `Disabled` in level.dat, and changes no
@@ -200,9 +223,12 @@ pub fn find(world: &Path, query: &str) -> Result<DataPack, String> {
         .into_iter()
         .find(|p| p.file == query || p.file.strip_suffix(".zip") == Some(query))
         .ok_or_else(|| {
-            format!(
-                "No data pack {query} in {}",
-                world.join("datapacks").display()
+            trf(
+                "No data pack {query} in {folder}",
+                &[
+                    ("query", query),
+                    ("folder", &world.join("datapacks").display().to_string()),
+                ],
             )
         })
 }
@@ -215,7 +241,12 @@ pub fn remove(world: &Path, pack: &DataPack, trash: Option<&Path>) -> Result<(),
         Some(folder) => crate::desktop_seams::to_folder(&pack.path, folder),
         None => crate::desktop_seams::to_trash(&pack.path),
     }
-    .map_err(|e| format!("Could not move {} to the trash: {e}", pack.file))?;
+    .map_err(|e| {
+        trf(
+            "Could not move {file} to the trash: {error}",
+            &[("file", &pack.file), ("error", &e.to_string())],
+        )
+    })?;
     forget(world, &pack.file)
 }
 
@@ -281,12 +312,15 @@ impl Coverage {
     /// "Runs its 12 functions, 1 predicate. Not read yet: 40 worldgen, 3 recipes."
     pub fn summary(&self) -> String {
         let runs = match self.read.is_empty() {
-            true => "Nothing in it runs in Sunrise yet.".to_string(),
-            false => format!("Runs its {}.", counts(&self.read)),
+            true => tr("Nothing in it runs in Sunrise yet.").to_string(),
+            false => trf("Runs its {counts}.", &[("counts", &counts(&self.read))]),
         };
         match self.unread.is_empty() {
             true => runs,
-            false => format!("{runs} Not read yet: {}.", self.not_read()),
+            false => trf(
+                "{runs} Not read yet: {unread}.",
+                &[("runs", &runs), ("unread", &self.not_read())],
+            ),
         }
     }
 
@@ -299,8 +333,11 @@ impl Coverage {
         biggest.truncate(6);
         match others {
             0 => counts(&biggest),
-            1 => format!("{} and 1 other kind", counts(&biggest)),
-            n => format!("{} and {n} other kinds", counts(&biggest)),
+            1 => trf("{kinds} and 1 other kind", &[("kinds", &counts(&biggest))]),
+            n => trf(
+                "{kinds} and {n} other kinds",
+                &[("kinds", &counts(&biggest)), ("n", &n.to_string())],
+            ),
         }
     }
 }

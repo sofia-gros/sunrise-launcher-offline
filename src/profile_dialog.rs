@@ -8,7 +8,7 @@ use crate::{
     servers_page::Field,
 };
 use gpui::rgb;
-use instances::{Channel, Icon};
+use instances::{Channel, Icon, Instance};
 
 impl Launcher {
     pub(super) fn new_profile(&mut self, cx: &mut Context<Self>) {
@@ -35,6 +35,32 @@ impl Launcher {
         cx.notify();
     }
 
+    /// The same dialog for a profile that exists: its name, group and icon. Its build stays
+    /// with Home's picker beside Play, so the dialog keeps the saved one untouched.
+    pub(super) fn edit_profile(&mut self, target: &Instance, cx: &mut Context<Self>) {
+        self.servers
+            .text(Field::InstanceName)
+            .set(target.name.clone());
+        self.servers
+            .text(Field::InstanceGroup)
+            .set(target.group.clone().unwrap_or_default());
+        self.focus_handle(Field::InstanceName, cx);
+        self.servers.focus_soon = Some(Field::InstanceName);
+        self.instances.dialog = Some(InstanceDialog {
+            editing: Some(target.id.clone()),
+            copy: None,
+            icon: target.icon.clone(),
+            picture: None,
+            picture_focus: cx.focus_handle().tab_index(0).tab_stop(true),
+            error: None,
+            busy: false,
+            pin: target.version.clone(),
+            channel: target.channel,
+            discarding: false,
+        });
+        cx.notify();
+    }
+
     pub(super) fn profile_dialog(
         &mut self,
         window: &Window,
@@ -54,6 +80,8 @@ impl Launcher {
             d.pin.clone(),
             d.error.clone(),
         );
+        let editing = d.editing.is_some();
+        let discarding = d.discarding;
         let picture_focus = d.picture_focus.clone();
         let picture_focused = picture_focus.is_focused(window);
         let picture = d
@@ -64,7 +92,8 @@ impl Launcher {
         let p = palette();
         let name = self.servers.value(Field::InstanceName).trim().to_owned();
         let tags = self.profile_build_choices(channel);
-        let ready = !name.is_empty() && !busy;
+        // An edit saves only once something in it changed, as its Save says.
+        let ready = !name.is_empty() && !busy && (!editing || self.sheet_changed());
         let current = bound
             .clone()
             .or_else(|| {
@@ -194,7 +223,9 @@ impl Launcher {
                             .min_w_0(),
                     ),
             );
-        if let Some(build) = bound.as_deref() {
+        if editing {
+            // The build is Home's picker's to change; this dialog keeps the saved one.
+        } else if let Some(build) = bound.as_deref() {
             form = form
                 .child(tr("Game build"))
                 .child(div().text_color(rgb(p.muted)).child(trf(
@@ -292,7 +323,7 @@ impl Launcher {
                 }))
                 .child(versions);
         }
-        let mut start = row();
+        let mut start = row().when(editing, |d| d.hidden());
         let copy_lock = self.profile_copy_lock();
         for (id, duplicate, label) in [
             ("new-empty", false, tr("Start empty")),
@@ -372,8 +403,17 @@ impl Launcher {
         let body = div()
             .flex()
             .flex_col()
-            .child(crate::sheets::title(tr("New profile").into()))
-            .child(div().text_color(rgb(p.muted)).child(if bound.is_some() {
+            .child(crate::sheets::title(
+                if editing {
+                    tr("Edit profile")
+                } else {
+                    tr("New profile")
+                }
+                .into(),
+            ))
+            .child(div().text_color(rgb(p.muted)).child(if editing {
+                tr("Rename it, move it to a group or pick another icon.")
+            } else if bound.is_some() {
                 tr("Name the copy and pick an icon.")
             } else {
                 tr("Name it, pick what it plays, then an icon.")
@@ -385,33 +425,7 @@ impl Launcher {
                     .child(form.child(start).child(icons)),
             )
             .children(error.map(|e| div().text_color(rgb(p.danger)).child(e)))
-            .child(
-                row()
-                    .justify_end()
-                    .child(button("new-cancel", tr("Cancel")).on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.close_instance_dialog();
-                            cx.notify();
-                        },
-                    )))
-                    .child(
-                        primary(
-                            "new-save",
-                            if busy {
-                                tr("Creating…")
-                            } else {
-                                tr("Create")
-                            },
-                        )
-                        .when(!ready, |d| d.opacity(0.45).tab_stop(false))
-                        .when(ready, |d| {
-                            d.on_click(cx.listener(|this, _, _, cx| {
-                                this.save_instance(cx);
-                                cx.notify();
-                            }))
-                        }),
-                    ),
-            );
+            .child(self.profile_dialog_foot(editing, busy, ready, discarding, cx));
         Some(crate::sheets::modal_frame(
             "new-profile",
             680.,
@@ -419,5 +433,68 @@ impl Launcher {
             cx,
             Launcher::close_instance_dialog,
         ))
+    }
+
+    /// Cancel and Create (or Save), or, once a close found edits not saved, the question
+    /// whether to drop them: Keep editing goes back to the form, Discard closes it.
+    fn profile_dialog_foot(
+        &self,
+        editing: bool,
+        busy: bool,
+        ready: bool,
+        discarding: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let row = div().flex().items_center().justify_end().gap(px(8.));
+        if discarding {
+            return row
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(tr("Discard your changes?")),
+                )
+                .child(button("new-keep", tr("Keep editing")).on_click(cx.listener(
+                    |this, _, _, cx| {
+                        if let Some(d) = &mut this.instances.dialog {
+                            d.discarding = false;
+                        }
+                        cx.notify();
+                    },
+                )))
+                .child(
+                    crate::settings::danger(button("new-discard", tr("Discard"))).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.instances.dialog = None;
+                            cx.notify();
+                        }),
+                    ),
+                );
+        }
+        row.child(
+            button("new-cancel", tr("Cancel")).on_click(cx.listener(|this, _, _, cx| {
+                this.close_instance_dialog();
+                cx.notify();
+            })),
+        )
+        .child(
+            primary(
+                "new-save",
+                match (editing, busy) {
+                    (true, true) => tr("Saving…"),
+                    (true, false) => tr("Save"),
+                    (false, true) => tr("Creating…"),
+                    (false, false) => tr("Create"),
+                },
+            )
+            .when(!ready, |d| d.opacity(0.45).tab_stop(false))
+            .when(ready, |d| {
+                d.on_click(cx.listener(|this, _, _, cx| {
+                    this.save_instance(cx);
+                    cx.notify();
+                }))
+            }),
+        )
     }
 }

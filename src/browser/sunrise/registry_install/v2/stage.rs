@@ -9,23 +9,30 @@ const MAX_ATTESTATION_BYTES: u64 = 1 << 20;
 /// attestation bundles.
 pub(crate) fn fetch_release_bytes(url: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
     if !download::github_release_asset(url) {
-        return Err(format!(
-            "{url} is not a GitHub release asset URL allowed by the Sunrise v2 registry."
+        return Err(trf(
+            "{url} is not a GitHub release asset URL allowed by the Sunrise v2 registry.",
+            &[("url", url)],
         ));
     }
     let agent = download::agent(url)?;
-    let response = agent
-        .get(url)
-        .call()
-        .map_err(|e| format!("download failed for {url}: {e}"))?;
+    let response = agent.get(url).call().map_err(|e| {
+        trf(
+            "download failed for {url}: {error}",
+            &[("url", url), ("error", &e.to_string())],
+        )
+    })?;
     let mut limited = response.into_reader().take(max_bytes.saturating_add(1));
     let mut bytes = Vec::new();
-    limited
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("reading {url}: {e}"))?;
+    limited.read_to_end(&mut bytes).map_err(|e| {
+        trf(
+            "reading {url}: {error}",
+            &[("url", url), ("error", &e.to_string())],
+        )
+    })?;
     if bytes.len() as u64 > max_bytes {
-        return Err(format!(
-            "{url} exceeded maximum allowed size of {max_bytes} bytes"
+        return Err(trf(
+            "{url} exceeded maximum allowed size of {max_bytes} bytes",
+            &[("url", url), ("max_bytes", &max_bytes.to_string())],
         ));
     }
     Ok(bytes)

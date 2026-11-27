@@ -1,4 +1,5 @@
-//! Native library build identities, as the game's tools stamp them and its loader compares them.
+//! Native library build identity, shared by the game's library loader and the SDK/registry tools.
+use sha2::{Digest, Sha256};
 
 /// A native library's build identity, which the builder stamps on the library, the build record
 /// keeps and the loader compares, fields separated by spaces:
@@ -47,9 +48,13 @@ impl<'a> LibraryIdentity<'a> {
         self.dependencies
             .split(',')
             .map(|dependency| {
-                dependency
-                    .split_once('=')
-                    .filter(|(id, digest)| !id.is_empty() && crate::index::hex64(digest).is_ok())
+                dependency.split_once('=').filter(|(id, digest)| {
+                    !id.is_empty()
+                        && digest.len() == 64
+                        && digest
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                })
             })
             .collect()
     }
@@ -65,7 +70,13 @@ pub fn library_identity<'a>(
 ) -> String {
     let mut dependencies: Vec<_> = linked
         .into_iter()
-        .map(|(id, identity)| format!("{id}={}", crate::index::sha256(identity.as_bytes())))
+        .map(|(id, identity)| {
+            let digest: String = Sha256::digest(identity.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            format!("{id}={digest}")
+        })
         .collect();
     dependencies.sort();
     let dependencies = if dependencies.is_empty() {
@@ -74,4 +85,16 @@ pub fn library_identity<'a>(
         dependencies.join(",")
     };
     format!("{build} {id} {version} {rust} {source} {dependencies}")
+}
+
+/// The library suffix the SDK host can load, including hosts with a `-server` suffix.
+pub fn library_extension(host: &str) -> Result<&'static str, String> {
+    host.split('-')
+        .find_map(|part| match part {
+            "darwin" => Some("dylib"),
+            "linux" => Some("so"),
+            "windows" => Some("dll"),
+            _ => None,
+        })
+        .ok_or_else(|| format!("unknown native library extension for SDK host {host}"))
 }

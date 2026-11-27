@@ -449,7 +449,7 @@ impl Launcher {
                                             this.change_policy(
                                                 new,
                                                 etag.clone(),
-                                                "Done: friends you share this computer with reach only the Minecraft server.",
+                                                tr("Done: friends you share this computer with reach only the Minecraft server."),
                                             );
                                         }
                                     },
@@ -491,7 +491,7 @@ impl Launcher {
                                         this.change_policy(
                                             undo,
                                             etag.clone(),
-                                            "Tailscale's default access controls are back.",
+                                            tr("Tailscale's default access controls are back."),
                                         );
                                     }
                                 },

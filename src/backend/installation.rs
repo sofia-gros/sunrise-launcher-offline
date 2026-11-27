@@ -221,10 +221,9 @@ pub(crate) fn install_as_cancellable(
     transfer: Transfer<'_, impl Fn(f32)>,
 ) -> Result<Option<ReceiptFailure>, String> {
     let Transfer { stop, progress } = transfer;
-    let (url, size) = release
-        .asset
-        .as_ref()
-        .ok_or_else(|| format!("{tag} has no build for this platform."))?;
+    let (url, size) = release.asset.as_ref().ok_or_else(|| {
+        crate::i18n::trf("{tag} has no build for this platform.", &[("tag", tag)])
+    })?;
     install_image(
         release,
         tag,
@@ -266,7 +265,10 @@ fn finish_image(
         || !fs::symlink_metadata(top.join(CLIENT))
             .is_ok_and(|meta| meta.is_file() && !crate::native_cache::linked(&meta))
     {
-        return Err(format!("The download has no {CLIENT}"));
+        return Err(crate::i18n::trf(
+            "The download has no {client}",
+            &[("client", CLIENT)],
+        ));
     }
     #[cfg(unix)]
     {

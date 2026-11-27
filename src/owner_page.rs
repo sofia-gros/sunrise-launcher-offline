@@ -55,7 +55,9 @@ impl Launcher {
         let configured = account::client_id().is_some();
         let state = match &self.sign_in_state {
             _ if !configured => Shown::Error(tr(account::NOT_CONFIGURED)),
-            Some(SignInState::Starting) => Shown::Starting("Asking Microsoft…"),
+            Some(SignInState::Starting) => {
+                Shown::Starting(crate::i18n::tr_key("Asking Microsoft…"))
+            }
             Some(SignInState::Working(phase)) => Shown::Starting(phase.label()),
             Some(SignInState::Code(code)) => Shown::Code(&code.verification_uri, &code.user_code),
             Some(SignInState::Done(Err(e))) => Shown::Error(e),

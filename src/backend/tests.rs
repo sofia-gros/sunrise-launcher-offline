@@ -462,20 +462,26 @@ fn mojang_downloads_only_for_an_owner() {
             // A Windows checkout has CRLF line ends: the searches below look for "\n".
             let mut text = fs::read_to_string(&path).unwrap().replace("\r\n", "\n");
             text.truncate(text.find("#[cfg(test)]").unwrap_or(text.len()));
-            sources.push((name, in_tests, text));
+            // Looked up by path below: two files can share a name (`reuse.rs`).
+            let path = path
+                .strip_prefix(&src)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            sources.push((name, in_tests, text, path));
         }
     }
     let calls: Vec<_> = sources
         .iter()
-        .filter(|(_, tests, _)| !tests)
-        .flat_map(|(name, _, text)| {
+        .filter(|(_, tests, ..)| !tests)
+        .flat_map(|(name, _, text, _)| {
             text.matches("mojang::download(")
                 .map(move |_| name.as_str())
         })
         .collect();
     assert_eq!(calls, ["assets.rs"]);
-    let source = |file: &str| &sources.iter().find(|(n, ..)| n == file).unwrap().2;
-    let assets = source("assets.rs");
+    let source = |file: &str| &sources.iter().find(|(.., p)| p == file).unwrap().2;
+    let assets = source("backend/prepare/assets.rs");
     let body = |f: &str| {
         let start = assets.find(&format!(" fn {f}(")).unwrap();
         &assets[start..start + assets[start + 1..].find("\n}\n").unwrap()]
@@ -495,14 +501,17 @@ fn mojang_downloads_only_for_an_owner() {
         let start = text.find(&format!("\npub fn {f}(")).unwrap();
         &text[start..start + text[start + 1..].find("\n}\n").unwrap()]
     };
-    assert!(public("reuse.rs", "reuse_prepared_everywhere").contains("refill_own_store("));
-    assert!(!public("assets.rs", "complete_assets").contains("refill_own_store("));
+    assert!(
+        public("backend/prepare/reuse.rs", "reuse_prepared_everywhere")
+            .contains("refill_own_store(")
+    );
+    assert!(!public("backend/prepare/assets.rs", "complete_assets").contains("refill_own_store("));
     for host in [
         "piston-data",
         "libraries.minecraft.net",
         "resources.download.minecraft.net",
     ] {
-        for (name, tests, text) in &sources {
+        for (name, tests, text, _) in &sources {
             assert!(
                 *tests || name == "mojang.rs" || !text.contains(host),
                 "{name} names {host}"

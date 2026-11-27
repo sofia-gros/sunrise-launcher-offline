@@ -251,21 +251,43 @@ fn show(profile: Option<String>, as_json: bool) -> Result<(), Error> {
         true => Profile::open(&instance.home, None)?.active()?,
         false => None,
     };
+    let channel = match instance.channel {
+        instances::Channel::Stable => "stable",
+        instances::Channel::Nightly => "nightly",
+        instances::Channel::Dev => "dev",
+    };
     if as_json {
         json(serde_json::json!({
             "profile": instance.id,
             "build": active.as_ref().map(|a| a.base()),
             "image": active.as_ref().map(|a| a.executable()),
             "generation": active.as_ref().map(|a| a.generation()),
+            "channel": channel,
+            "pinned": instance.version,
         }));
     } else {
-        let build = active
-            .as_ref()
-            .map_or_else(|| tr("Not initialized"), |a| a.base());
-        println!(
-            "{}",
-            trf("Profile game build: {build}", &[("build", build)])
-        );
+        // A profile has no build of its own until it is first played. Say what it follows,
+        // as Home's picker does, rather than a bare "Not initialized" beside a window that
+        // shows a build for it.
+        let line = match (&active, &instance.version) {
+            (Some(active), _) => trf("Profile game build: {build}", &[("build", active.base())]),
+            (None, Some(pin)) => trf(
+                "Profile game build: not played yet; it stays on {build}",
+                &[("build", pin)],
+            ),
+            (None, None) => trf(
+                "Profile game build: not played yet; it follows the newest {channel} build",
+                &[(
+                    "channel",
+                    match instance.channel {
+                        instances::Channel::Stable => tr("Stable"),
+                        instances::Channel::Nightly => tr("Nightly"),
+                        instances::Channel::Dev => tr("Dev"),
+                    },
+                )],
+            ),
+        };
+        println!("{line}");
     }
     Ok(())
 }

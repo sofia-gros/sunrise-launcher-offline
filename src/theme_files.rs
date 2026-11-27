@@ -291,17 +291,17 @@ fn open_root(root: &Path) -> Result<Option<Dir>, Reason> {
         Err(e) => return Err(Reason::Io(e.to_string())),
     };
     if linked(&meta) || !meta.is_dir() {
-        return Err(Reason::Linked("folder"));
+        return Err(Reason::Linked(crate::i18n::tr_key("folder")));
     }
     let (Some(parent), Some(name)) = (root.parent(), root.file_name()) else {
-        return Err(Reason::Linked("folder"));
+        return Err(Reason::Linked(crate::i18n::tr_key("folder")));
     };
     // Opened through its parent without following: a link put there since the check above is
     // refused by the open itself.
     Dir::open_ambient_dir(parent, cap_std::ambient_authority())
         .and_then(|parent| parent.open_dir_nofollow(name))
         .map(Some)
-        .map_err(|_| Reason::Linked("folder"))
+        .map_err(|_| Reason::Linked(crate::i18n::tr_key("folder")))
 }
 
 /// Whether a link stands where the themes folder should be: nothing is opened through it.
@@ -313,7 +313,7 @@ pub fn root_linked(root: &Path) -> bool {
 fn open_folder(dir: &Dir, name: &str) -> Result<Dir, Reason> {
     dir.open_dir_nofollow(name)
         .map_err(|e| match dir.symlink_metadata(name) {
-            Ok(meta) if !meta.is_dir() => Reason::Linked("folder"),
+            Ok(meta) if !meta.is_dir() => Reason::Linked(crate::i18n::tr_key("folder")),
             _ => Reason::Io(e.to_string()),
         })
 }
@@ -497,7 +497,7 @@ fn picture_bytes(folder: &Dir, name: &str) -> Result<Vec<u8>, Reason> {
         folder,
         &name,
         MAX_PICTURE,
-        "picture",
+        crate::i18n::tr_key("picture"),
         Reason::PictureMissing(name.clone()),
         Reason::PictureTooBig(name.clone()),
     )?;
@@ -608,7 +608,7 @@ fn read(themes: &Dir, root: &Path, slug: &str) -> Result<Local, Reason> {
         &folder,
         FILE,
         MAX_TOML,
-        "theme.toml",
+        crate::i18n::tr_key("theme.toml"),
         Reason::NoFile,
         Reason::TooLong,
     )?;

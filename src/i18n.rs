@@ -652,11 +652,42 @@ pub fn tr(en: &str) -> &str {
 
 /// `en` in the launcher's language with its `{name}` holes filled.
 pub fn trf(en: &str, args: &[(&str, &str)]) -> String {
-    let mut out = tr(en).to_string();
-    for (name, value) in args {
-        out = out.replace(&format!("{{{name}}}"), value);
+    fill(tr(en), args)
+}
+
+/// `template` with each `{name}` hole that `args` names replaced by its value, in one pass over
+/// the template. A value goes in as it is: a path that happens to contain `{file}` is never filled
+/// in turn. Braces that name no argument stay as written.
+fn fill(template: &str, args: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let hole = after.find('}').and_then(|close| {
+            let name = &after[..close];
+            let value = args.iter().find(|(n, _)| *n == name)?.1;
+            Some((value, close))
+        });
+        match hole {
+            Some((value, close)) => {
+                out.push_str(value);
+                rest = &after[close + 1..];
+            }
+            None => {
+                out.push('{');
+                rest = after;
+            }
+        }
     }
+    out.push_str(rest);
     out
+}
+
+/// Marks `en` as a catalog key that reaches [`tr`] or [`trf`] later, through a constant, a
+/// field or a variable, so `lang/en.json`'s completeness test finds it. It changes nothing.
+pub const fn tr_key(en: &'static str) -> &'static str {
+    en
 }
 
 #[cfg(test)]

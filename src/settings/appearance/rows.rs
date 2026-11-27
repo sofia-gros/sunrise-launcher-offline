@@ -308,8 +308,8 @@ impl Launcher {
         ));
         let layout = self.settings.world_layout;
         let layouts = [
-            (backend::WorldLayout::Rows, "Rows"),
-            (backend::WorldLayout::Tiles, "Tiles"),
+            (backend::WorldLayout::Rows, crate::i18n::tr_key("Rows")),
+            (backend::WorldLayout::Tiles, crate::i18n::tr_key("Tiles")),
         ]
         .into_iter()
         .map(|(way, label)| {
@@ -365,7 +365,7 @@ impl Launcher {
                                     this.ui.settings.appearance.error = Some(format!(
                                         "{}: {}",
                                         dir.display(),
-                                        theme_files::Reason::Linked("folder").text()
+                                        theme_files::Reason::Linked(crate::i18n::tr_key("folder")).text()
                                     ));
                                     cx.notify();
                                     return;

@@ -191,7 +191,7 @@ impl SecretStore for Bounded {
     }
 }
 
-pub const NO_KEYCHAIN: &str = "No keychain available: you are signed in until the launcher closes, then you will have to sign in again.";
+pub const NO_KEYCHAIN: &str = crate::i18n::tr_key("No keychain available: you are signed in until the launcher closes, then you will have to sign in again.");
 
 /// What the keychain answered when [`store`] fell back to memory.
 static NO_KEYCHAIN_WHY: OnceLock<String> = OnceLock::new();
@@ -202,9 +202,14 @@ pub fn no_keychain() -> Option<String> {
     if store().persistent() {
         return None;
     }
+    use crate::i18n::{tr, trf};
     Some(match NO_KEYCHAIN_WHY.get() {
-        Some(why) => format!("{NO_KEYCHAIN} The keychain said: {why}"),
-        None => NO_KEYCHAIN.into(),
+        Some(why) => format!(
+            "{} {}",
+            tr(NO_KEYCHAIN),
+            trf("The keychain said: {why}", &[("why", why)])
+        ),
+        None => tr(NO_KEYCHAIN).into(),
     })
 }
 
@@ -291,7 +296,7 @@ impl Layered {
         call: impl FnOnce(&dyn SecretStore) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
         if self.is_away() {
-            return Err(KEYCHAIN_AWAY.into());
+            return Err(crate::i18n::tr(KEYCHAIN_AWAY).into());
         }
         let answer = call(self.keychain.as_ref());
         if answer.is_err() {
@@ -397,7 +402,7 @@ fn keychain_or_why() -> Result<Box<dyn SecretStore>, StoreError> {
             target_os = "windows"
         )
     )))]
-    Err("This system has no keychain.".into())
+    Err(crate::i18n::tr("This system has no keychain.").into())
 }
 
 /// Microsoft sign-ins. Linux and FreeBSD: the Secret Service with the secrets file beside it

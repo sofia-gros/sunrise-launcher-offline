@@ -74,7 +74,7 @@ pub(crate) use crate::frame::segmented;
 use crate::paint::palette;
 use model::Row;
 
-const ADDED_PENDING: &str = "Added · builds when you play";
+const ADDED_PENDING: &str = crate::i18n::tr_key("Added · builds when you play");
 
 /// The read-only Home view uses the same Installed classification as the full rows.
 pub(crate) use model::ManualBadge;

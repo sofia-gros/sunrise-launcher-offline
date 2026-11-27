@@ -70,12 +70,14 @@ impl FileStore {
                     )
                 })?;
                 let secrets = serde_json::from_slice(&json).map_err(|e| {
-                    format!(
-                        "{} can't be read ({:?} error at line {}, column {}).",
-                        self.path.display(),
-                        e.classify(),
-                        e.line(),
-                        e.column()
+                    crate::i18n::trf(
+                        "{file} can't be read ({kind} error at line {line}, column {column}).",
+                        &[
+                            ("file", &self.path.display().to_string()),
+                            ("kind", &format!("{:?}", e.classify())),
+                            ("line", &e.line().to_string()),
+                            ("column", &e.column().to_string()),
+                        ],
                     )
                 })?;
                 // Sealed under the old key: sealed again under this install's. Every read runs
@@ -173,10 +175,12 @@ impl FileStore {
         let path = self.path.with_extension("key");
         match std::fs::read(&path) {
             Ok(bytes) => <[u8; 32]>::try_from(bytes).map(Some).map_err(|_| {
-                format!(
-                    "{} is damaged. Remove it and {} and sign in again.",
-                    path.display(),
-                    self.path.display()
+                crate::i18n::trf(
+                    "{key} is damaged. Remove it and {file} and sign in again.",
+                    &[
+                        ("key", &path.display().to_string()),
+                        ("file", &self.path.display().to_string()),
+                    ],
                 )
                 .into()
             }),

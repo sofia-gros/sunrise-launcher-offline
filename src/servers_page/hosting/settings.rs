@@ -70,9 +70,9 @@ impl Launcher {
             background.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.server_command(
                     if service {
-                        "Turning off running in the background"
+                        crate::i18n::tr_key("Turning off running in the background")
                     } else {
-                        "Setting it to run in the background"
+                        crate::i18n::tr_key("Setting it to run in the background")
                     },
                     vec![
                         "service".into(),
@@ -239,7 +239,7 @@ impl Launcher {
             cx,
             |this, _| {
                 if let Some(dir) = this.servers.open.clone() {
-                    this.servers.busy = Some("Moving server to trash".into());
+                    this.servers.busy = Some(crate::i18n::tr_key("Moving server to trash").into());
                     let tx = this.servers.tx.clone();
                     std::thread::spawn(move || {
                         let result = servers::delete(&dir);

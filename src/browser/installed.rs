@@ -204,9 +204,9 @@ pub fn plan(
         ));
     }
     if project.kind.folder().is_none() {
-        return Err(format!(
-            "{} isn't a pack Sunrise installs as a file.",
-            project.title
+        return Err(trf(
+            "{title} isn't a pack Sunrise installs as a file.",
+            &[("title", &project.title)],
         ));
     }
     let mut steps = Vec::new();
@@ -235,28 +235,46 @@ fn add(
         return Ok(());
     }
     if depth > MAX_DEPTH {
-        return Err(format!("{}'s dependencies go too deep.", project.title));
+        return Err(trf(
+            "{title}'s dependencies go too deep.",
+            &[("title", &project.title)],
+        ));
     }
     if let Support::No(why) = project.support(game) {
-        return Err(format!("{} doesn't run in Sunrise: {why}", project.title));
+        return Err(trf(
+            "{title} doesn't run in Sunrise: {why}",
+            &[("title", &project.title), ("why", &why)],
+        ));
     }
     let versions = source.versions(&project)?;
     let Some(version) = pick(project.kind, &versions, everything, game).cloned() else {
         return Err(match versions.iter().find_map(|v| v.blocked.clone()) {
-            Some(why) => format!("{} can't be installed from here: {why}", project.title),
-            None => format!("{} has no version Sunrise runs.", project.title),
+            Some(why) => trf(
+                "{title} can't be installed from here: {why}",
+                &[("title", &project.title), ("why", &why)],
+            ),
+            None => trf(
+                "{title} has no version Sunrise runs.",
+                &[("title", &project.title)],
+            ),
         });
     };
     for id in &version.required {
         let needed = source.project(id).map_err(|_| {
-            format!(
-                "{} needs {id} on {}, which isn't a pack Sunrise loads.",
-                project.title,
-                source.id().label()
+            trf(
+                "{title} needs {id} on {source}, which isn't a pack Sunrise loads.",
+                &[
+                    ("title", &project.title),
+                    ("id", id),
+                    ("source", source.id().label()),
+                ],
             )
         })?;
         if needed.kind.folder().is_none() {
-            return Err(format!("{} needs {}.", project.title, needed.title));
+            return Err(trf(
+                "{title} needs {dependency}.",
+                &[("title", &project.title), ("dependency", &needed.title)],
+            ));
         }
         add(source, needed, everything, game, true, depth + 1, steps)?;
     }
@@ -291,7 +309,12 @@ pub(super) fn pack_path(home: &Path, kind: Kind, file: &str) -> Result<PathBuf, 
     let (folder, name) = file
         .split_once('/')
         .filter(|(folder, name)| kind.folder() == Some(*folder) && safe_name(name).is_some())
-        .ok_or_else(|| format!("{file} isn't a pack file in its expected folder."))?;
+        .ok_or_else(|| {
+            trf(
+                "{file} isn't a pack file in its expected folder.",
+                &[("file", file)],
+            )
+        })?;
     let dir = home.join(folder);
     let path = dir.join(name);
     for (part, is_dir) in [(&dir, true), (&path, false)] {
@@ -302,7 +325,10 @@ pub(super) fn pack_path(home: &Path, kind: Kind, file: &str) -> Result<PathBuf, 
                     use std::os::windows::fs::MetadataExt;
                     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
                     if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                        return Err(format!("{file} goes through a filesystem link."));
+                        return Err(trf(
+                            "{file} goes through a filesystem link.",
+                            &[("file", file)],
+                        ));
                     }
                 }
                 let plain = if is_dir {
@@ -311,7 +337,10 @@ pub(super) fn pack_path(home: &Path, kind: Kind, file: &str) -> Result<PathBuf, 
                     meta.is_file()
                 };
                 if !plain {
-                    return Err(format!("{file} isn't a pack file in a plain pack folder."));
+                    return Err(trf(
+                        "{file} isn't a pack file in a plain pack folder.",
+                        &[("file", file)],
+                    ));
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
@@ -324,9 +353,27 @@ pub(super) fn pack_path(home: &Path, kind: Kind, file: &str) -> Result<PathBuf, 
 /// A live row must still match the pack kind selected by the caller or resolved from the source.
 pub(super) fn old_pack_path(home: &Path, entry: &Entry, kind: Kind) -> Result<PathBuf, String> {
     if entry.kind != kind {
-        return Err(format!("{} has a different installed kind.", entry.title));
+        return Err(trf(
+            "{title} has a different installed kind.",
+            &[("title", &entry.title)],
+        ));
     }
     pack_path(home, kind, &entry.file)
+}
+
+/// Why a pack can't go to `relative`: another browser install has it, or something else is there.
+fn taken(relative: &str, owner: Option<&Entry>) -> String {
+    match owner {
+        Some(e) => trf(
+            "{relative} belongs to {title}, installed from the browser.",
+            &[("relative", relative), ("title", &e.title)],
+        ),
+        None => trf(
+            "{relative} is already there and wasn't installed by the browser: move it \
+             away first, or keep it.",
+            &[("relative", relative)],
+        ),
+    }
 }
 
 /// Publishes a planned Modrinth pack set. The caller holds the home lock from before the read.
@@ -354,23 +401,18 @@ fn put_packs(
             .file()
             .expect("pick keeps versions with a file");
         let folder_name = p.kind.folder().expect("plan keeps folder kinds");
-        let name = safe_name(&file.name)
-            .ok_or_else(|| format!("{:?} isn't a plain file name.", file.name))?;
+        let name = safe_name(&file.name).ok_or_else(|| {
+            trf(
+                "{name} isn't a plain file name.",
+                &[("name", &format!("{:?}", file.name))],
+            )
+        })?;
         let relative = format!("{folder_name}/{name}");
         let target = pack_path(home, p.kind, &relative)?;
         let owner = installed.entries.iter().find(|e| e.file == relative);
         let ours = owner.is_some_and(|e| e.source == p.source && e.project == p.id);
         if target.exists() && !ours {
-            return Err(match owner {
-                Some(e) => format!(
-                    "{relative} belongs to {}, installed from the browser.",
-                    e.title
-                ),
-                None => format!(
-                    "{relative} is already there and wasn't installed by the browser: move it \
-                     away first, or keep it."
-                ),
-            });
+            return Err(taken(&relative, owner));
         }
         let line = format!("{} {}", p.title, step.version.number);
         // Stage on the destination filesystem without trusting a pre-existing partial file.
@@ -419,7 +461,12 @@ pub fn remove_pack(home: &Path, selected: &Entry) -> Result<Entry, String> {
     let entry = installed
         .single(selected.source, &selected.project)?
         .cloned()
-        .ok_or_else(|| format!("{} wasn't installed by the browser.", selected.title))?;
+        .ok_or_else(|| {
+            trf(
+                "{title} wasn't installed by the browser.",
+                &[("title", &selected.title)],
+            )
+        })?;
     let path = old_pack_path(home, &entry, selected.kind)?;
     match fs::remove_file(path) {
         Ok(()) => (),
@@ -463,7 +510,12 @@ pub fn update_pack(
     let installed = Installed::read(home)?;
     let entry = installed
         .single(selected.source, &selected.project)?
-        .ok_or_else(|| format!("{} wasn't installed by the browser.", selected.title))?;
+        .ok_or_else(|| {
+            trf(
+                "{title} wasn't installed by the browser.",
+                &[("title", &selected.title)],
+            )
+        })?;
     old_pack_path(home, entry, selected.kind)?;
     if entry.source == SourceId::Sunrise {
         return Err(old_registry_pack(&entry.title));
@@ -471,7 +523,10 @@ pub fn update_pack(
     let source = super::modrinth::Modrinth;
     let project = source.project(&entry.project)?;
     if project.kind != entry.kind {
-        return Err(format!("{} has a different installed kind.", entry.title));
+        return Err(trf(
+            "{title} has a different installed kind.",
+            &[("title", &entry.title)],
+        ));
     }
     let versions = source.versions(&project)?;
     let Some(newer) = pick(project.kind, &versions, true, game).filter(|v| v.id != entry.version)
@@ -522,7 +577,10 @@ pub fn install_datapack(
     progress: &dyn Fn(f32),
 ) -> Result<DataPackInstall, String> {
     if project.kind != Kind::DataPack && !project.loaders.iter().any(|l| l == "datapack") {
-        return Err(format!("{} isn't a data pack.", project.title));
+        return Err(trf(
+            "{title} isn't a data pack.",
+            &[("title", &project.title)],
+        ));
     }
     let folder = std::env::temp_dir().join(format!(
         "sunrise-launcher-datapack-{}-{}",
@@ -531,15 +589,20 @@ pub fn install_datapack(
     ));
     let versions = source.versions(project)?;
     let version = pick(Kind::DataPack, &versions, everything, game).ok_or_else(|| {
-        format!(
-            "{} has no data pack for {}{}.",
-            project.title,
-            game,
-            if everything {
-                " or any other version"
-            } else {
-                ""
-            }
+        trf(
+            "{title} has no data pack for {game}{suffix}.",
+            &[
+                ("title", &project.title),
+                ("game", game),
+                (
+                    "suffix",
+                    if everything {
+                        tr(" or any other version")
+                    } else {
+                        ""
+                    },
+                ),
+            ],
         )
     })?;
     let file = version.file().expect("pick keeps versions with a file");

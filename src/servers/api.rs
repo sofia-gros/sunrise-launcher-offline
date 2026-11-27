@@ -82,7 +82,7 @@ impl Api {
         v["url"]
             .as_str()
             .map(str::to_string)
-            .ok_or_else(|| "the panel gave no link".into())
+            .ok_or_else(|| tr("the panel gave no link").into())
     }
 }
 

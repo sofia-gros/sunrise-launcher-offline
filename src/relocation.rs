@@ -1,4 +1,5 @@
 //! Offline data relocation: the window exits before the worker takes the migration lock.
+use crate::i18n::{tr, trf};
 use crate::{
     backend,
     data_location::{self, Roots},
@@ -97,9 +98,14 @@ fn ensure_idle(source: &Roots) -> Result<(), String> {
     let output = process::command("ps")
         .args(["-A", "-o", "comm=,args="])
         .output();
-    let output = output.map_err(|e| format!("Could not check running games and builds: {e}"))?;
+    let output = output.map_err(|e| {
+        trf(
+            "Could not check running games and builds: {error}",
+            &[("error", &e.to_string())],
+        )
+    })?;
     if !output.status.success() {
-        return Err("Could not check running games and builds; no files were moved.".into());
+        return Err(tr("Could not check running games and builds; no files were moved.").into());
     }
     let roots: Vec<_> = [&source.launcher, &source.game, &source.build]
         .iter()
@@ -107,8 +113,12 @@ fn ensure_idle(source: &Roots) -> Result<(), String> {
         .collect();
     #[cfg(windows)]
     let processes: Vec<(String, String)> = {
-        let value: Value = serde_json::from_slice(&output.stdout)
-            .map_err(|e| format!("Could not read running processes: {e}"))?;
+        let value: Value = serde_json::from_slice(&output.stdout).map_err(|e| {
+            trf(
+                "Could not read running processes: {error}",
+                &[("error", &e.to_string())],
+            )
+        })?;
         let entries = value.as_array().cloned().unwrap_or_else(|| vec![value]);
         entries
             .into_iter()
@@ -148,8 +158,9 @@ fn ensure_idle(source: &Roots) -> Result<(), String> {
                 "java" | "javaw" | "cargo" | "rustc" | "horizon-mixins"
             ))
         {
-            return Err(format!(
-                "Close games, servers and native builds before moving data ({name} is running)."
+            return Err(trf(
+                "Close games, servers and native builds before moving data ({name} is running).",
+                &[("name", name)],
             ));
         }
     }
@@ -165,7 +176,7 @@ pub(crate) fn admit_idle_profiles(source: &Roots) -> Result<(), String> {
         }
         let profile = crate::managed_play::Profile::open_at(&source.game, &source.launcher, &home)?;
         if profile.has_pending_bootstrap()? {
-            return Err(crate::i18n::tr(
+            return Err(tr(
                 "A profile is still preparing its first game. Finish preparing it before moving the data folder.",
             ).into());
         }
@@ -182,8 +193,12 @@ pub fn run_worker() -> Option<i32> {
     }
     let target = args.next().map(PathBuf::from);
     let restart = args.next().is_some_and(|a| a == "--restart");
+    // The reopened window shows this worker's error as it was worded here, so word it in the
+    // player's language. The data hasn't moved yet: the settings are where they always were.
+    crate::i18n::set(backend::Settings::load().language());
     let result = (|| {
-        let target = target.ok_or("--relocate-data needs an empty destination folder")?;
+        let target = target
+            .ok_or_else(|| tr("--relocate-data needs an empty destination folder").to_string())?;
         data_location::validate()?;
         let source = Roots {
             launcher: backend::data_dir(),

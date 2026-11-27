@@ -43,16 +43,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// The keychain service name every secret is stored under.
 pub const SERVICE: &str = crate::identity::KEYCHAIN_SERVICE;
 const SCOPE: &str = "XboxLive.signin offline_access";
-pub const NOT_CONFIGURED: &str = "This build of the launcher has no Microsoft sign-in (SUNRISE_MSA_CLIENT_ID), so it can't start the game.";
+pub const NOT_CONFIGURED: &str = crate::i18n::tr_key("This build of the launcher has no Microsoft sign-in (SUNRISE_MSA_CLIENT_ID), so it can't start the game.");
 /// What every Play says while no account in the launcher owns the game.
-pub const NEEDS_OWNER: &str =
-    "Sign in with a Microsoft account that owns Minecraft: Java Edition to play";
-const DOES_NOT_OWN: &str = "This account doesn't own Minecraft: Java Edition.";
-const NO_PROFILE: &str =
-    "This account has no Minecraft profile yet. Create one at minecraft.net, then sign in again.";
+pub const NEEDS_OWNER: &str = crate::i18n::tr_key(
+    "Sign in with a Microsoft account that owns Minecraft: Java Edition to play",
+);
+const DOES_NOT_OWN: &str = crate::i18n::tr_key("This account doesn't own Minecraft: Java Edition.");
+const NO_PROFILE: &str = crate::i18n::tr_key(
+    "This account has no Minecraft profile yet. Create one at minecraft.net, then sign in again.",
+);
 const OTHER_PROFILE: &str =
-    "The Microsoft account now has another Minecraft profile. Sign in again.";
-const SIGN_IN_AGAIN: &str = "Your Microsoft sign-in expired. Sign in again.";
+    crate::i18n::tr_key("The Microsoft account now has another Minecraft profile. Sign in again.");
+const SIGN_IN_AGAIN: &str = crate::i18n::tr_key("Your Microsoft sign-in expired. Sign in again.");
 /// The Minecraft token is renewed when it has less than this left.
 const RENEW_BEFORE: u64 = 3600;
 

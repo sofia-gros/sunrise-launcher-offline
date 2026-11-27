@@ -54,6 +54,10 @@ fn run_launcher() {
         eprintln!("{error}");
         std::process::exit(1);
     }
+    // The player's language, as soon as their settings can be read: the update hand-off, the
+    // installer, carry-over, the CLI and the MCP server all word their messages before the
+    // window would set it. Carry-over may bring in a language; the window sets it again.
+    sunrise_launcher::i18n::set(backend::Settings::load().language());
     // Windowless Windows installer commands, including the new binary's notice refresh, never
     // reach the CLI parser (so neither the MCP tools nor the completions list them).
     #[cfg(windows)]

@@ -3,7 +3,8 @@
 
 The English source text is the lookup key (`docs/architecture.md`, "Translations"), so a typo or
 an unseeded key silently falls back to English. This check reads the literals passed to `tr`
-and `trf` in `src/**/*.rs` and compares them with a runtime catalog.
+and `trf` in `src/**/*.rs` and compares them with the source catalog, `lang/en.json`, which lists
+every key (the other catalogs hold only translations).
 
 By default only keys on lines added since `--base` are checked, so the existing drift (keys
 seeded before this check existed) does not fail an unrelated pull request. `--all` checks every
@@ -37,7 +38,7 @@ def repository_root() -> Path:
 
 
 ROOT = repository_root()
-DEFAULT_CATALOG = ROOT / "lang" / "fr.json"
+DEFAULT_CATALOG = ROOT / "lang" / "en.json"
 # The calls whose key is a literal; `tr_in`'s key is its second argument.
 CALL = re.compile(r"\b(tr|trf|tr_in)\s*\(")
 

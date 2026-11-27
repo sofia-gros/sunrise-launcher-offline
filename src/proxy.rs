@@ -67,9 +67,12 @@ pub fn refuse(spec: &str) -> Option<String> {
     if spec.is_empty() {
         return None;
     }
-    sunrise_launcher_proxy::validate(spec)
-        .err()
-        .map(|error| format!("{error}. Write it as http://host:port or socks5://host:port."))
+    sunrise_launcher_proxy::validate(spec).err().map(|error| {
+        crate::i18n::trf(
+            "{error}. Write it as http://host:port or socks5://host:port.",
+            &[("error", &error.to_string())],
+        )
+    })
 }
 
 /// Update the stored setting and drop pooled routes to the old proxy.

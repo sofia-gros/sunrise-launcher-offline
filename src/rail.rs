@@ -80,7 +80,7 @@ fn profile_lock_reason(
         Some(tr(
             "Fix the data folder in Settings before changing profiles.",
         ))
-    } else if work.busy() {
+    } else if work.holds_profile() {
         Some(tr(
             "Wait for the current operation to finish before changing profiles.",
         ))
@@ -91,6 +91,25 @@ fn profile_lock_reason(
     } else {
         None
     }
+}
+
+/// The heading above each profile in the sidebar: a group's name over its first profile.
+/// `instances::list` keeps the default profile first and sorts the rest by group, so only the
+/// rest are headed: a group the default profile has would otherwise seem to hold the ungrouped
+/// profiles under it. A blank group, as an earlier launcher saved an empty field, is no group.
+fn group_headings<'a>(groups: impl Iterator<Item = Option<&'a str>>) -> Vec<Option<String>> {
+    let mut before: Option<&str> = None;
+    groups
+        .enumerate()
+        .map(|(n, group)| {
+            let group = group.filter(|g| !g.trim().is_empty());
+            let heads = n > 0 && group.is_some() && group != before;
+            if n > 0 {
+                before = group;
+            }
+            heads.then(|| group.unwrap_or_default().to_owned())
+        })
+        .collect()
 }
 
 impl Launcher {
@@ -271,6 +290,7 @@ impl Launcher {
         };
         // A small toolbar button, not a row: it names itself in its tooltip only. Ctrl+B does
         // the same, and the search lists that key.
+        let me = cx.weak_entity();
         let toggle = div()
             .flex()
             .flex_none()
@@ -289,10 +309,18 @@ impl Launcher {
                     .rounded(crate::tokens::r(crate::tokens::R_SMALL))
                     .cursor_pointer()
                     .hover(|d| d.bg(rgb(p.chrome_raised)))
-                    .tooltip(crate::glass_ui::tip(if wide {
-                        tr("Hide sidebar")
-                    } else {
-                        tr("Show sidebar")
+                    // Read when the tooltip shows: one that was on its way when the toggle was
+                    // pressed would otherwise offer what it just did.
+                    .tooltip(crate::glass_ui::tip_with(move |cx| {
+                        let wide = me
+                            .upgrade()
+                            .map_or(wide, |me| me.read(cx).settings.sidebar_expanded);
+                        if wide {
+                            tr("Hide sidebar")
+                        } else {
+                            tr("Show sidebar")
+                        }
+                        .into()
                     }))
                     .child(
                         div()
@@ -335,7 +363,33 @@ impl Launcher {
             .gap(px(4.))
             .overflow_y_scroll()
             .track_scroll(&crate::frame::scrolls("sidebar"));
+        let headings = group_headings(self.instances.list.iter().map(|i| i.group.as_deref()));
         for (n, i) in self.instances.list.clone().into_iter().enumerate() {
+            if let Some(group) = headings[n].clone() {
+                list = list.child(
+                    div()
+                        .flex_none()
+                        .h(px(22.))
+                        .mt(px(6.))
+                        .px(px(9.))
+                        .flex()
+                        .items_end()
+                        .truncate()
+                        .text_size(px(crate::tokens::SMALL))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(p.chrome_muted))
+                        .opacity(label_opacity(open))
+                        // With the names hidden a short rule still marks where a group begins.
+                        .when(!labelled, |d| {
+                            d.h(px(1.))
+                                .mt(px(4.))
+                                .mx(px(8.))
+                                .bg(rgb(p.chrome_muted))
+                                .opacity(0.5)
+                        })
+                        .when(labelled, |d| d.child(group)),
+                );
+            }
             let on = selected.as_ref() == Some(&i.id);
             let deletable = i.kind == Kind::Own && !self.location_unavailable;
             let more = on && deletable;
@@ -655,6 +709,20 @@ mod tests {
     }
 
     #[test]
+    fn groups_head_their_first_profile_and_the_pinned_default_heads_none() {
+        let heads = |groups: &[Option<&str>]| group_headings(groups.iter().copied());
+        let a = || Some("A".to_owned());
+        assert_eq!(
+            heads(&[None, None, Some("A"), Some("A"), Some("B")]),
+            [None, None, a(), None, Some("B".to_owned())]
+        );
+        // The default profile in a group, then ungrouped ones: no heading would cover them.
+        assert_eq!(heads(&[Some("A"), None, Some("A")]), [None, None, a()]);
+        // A blank group is no group.
+        assert_eq!(heads(&[None, Some(" "), Some("A")]), [None, None, a()]);
+    }
+
+    #[test]
     fn profiles_unlock_when_starting_finishes_even_while_the_game_runs() {
         let mut work = Facts {
             starting: true,
@@ -665,6 +733,20 @@ mod tests {
         work.starting = false;
         assert_eq!(profile_lock_reason(&work, true, false), None);
         assert!(profile_lock_reason(&work, false, false).is_some());
+        assert!(profile_lock_reason(&work, true, true).is_some());
+    }
+
+    #[test]
+    fn a_build_downloading_leaves_profiles_free_but_mod_changes_do_not() {
+        let mut work = Facts {
+            installing: Some(0.4),
+            ..Facts::default()
+        };
+        assert_eq!(profile_lock_reason(&work, true, false), None);
+        work.mutating = true;
+        assert!(profile_lock_reason(&work, true, false).is_some());
+        // Play waiting on the download still holds them.
+        work.mutating = false;
         assert!(profile_lock_reason(&work, true, true).is_some());
     }
 }

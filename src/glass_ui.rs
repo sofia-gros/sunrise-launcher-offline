@@ -601,15 +601,77 @@ impl Render for Tip {
     }
 }
 
+thread_local! {
+    /// Whether a menu, sheet or dialog lies over the page in the frame drawn last.
+    static PAGE_COVERED: Cell<bool> = const { Cell::new(false) };
+    /// Whether the frame is drawing the page (rail, header, page) rather than what lies over it.
+    static DRAWING_PAGE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Before the page is drawn: whether a layer will lie over it (`Launcher::layer_open`).
+pub fn tips_page(covered: bool) {
+    PAGE_COVERED.set(covered);
+    DRAWING_PAGE.set(true);
+}
+
+/// Before the layers over the page are drawn: their own tooltips always show.
+pub fn tips_layers() {
+    DRAWING_PAGE.set(false);
+}
+
+/// Whether a tooltip made while drawing the page (`on_page`) may show now. GPUI shows one half
+/// a second after the pointer stops, and a click doesn't cancel that: the button that opened a
+/// menu or dialog put its tooltip on top of it. A page under a layer shows none.
+fn tip_shows(on_page: bool) -> bool {
+    !(on_page && PAGE_COVERED.get())
+}
+
+/// What a tooltip that may not show draws: nothing.
+struct NoTip;
+
+impl Render for NoTip {
+    fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
 /// `.tooltip(ui::tip(label))`: the label of an icon-only control, on hover.
 pub fn tip(label: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView {
     let label: SharedString = label.into();
-    move |_, cx| cx.new(|_| Tip(label.clone())).into()
+    tip_with(move |_| label.clone())
+}
+
+/// A tooltip whose label is read when it shows, not when the pointer arrived: a click in
+/// between can change what the control does.
+pub fn tip_with(
+    label: impl Fn(&App) -> SharedString + 'static,
+) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView {
+    let on_page = DRAWING_PAGE.get();
+    move |_, cx| {
+        if tip_shows(on_page) {
+            let label = label(cx);
+            cx.new(|_| Tip(label)).into()
+        } else {
+            cx.new(|_| NoTip).into()
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_page_tooltip_waits_under_a_layer_and_a_layers_own_always_shows() {
+        tips_page(false);
+        assert!(tip_shows(true));
+        tips_page(true);
+        assert!(!tip_shows(true), "the page is covered");
+        tips_layers();
+        assert!(tip_shows(false), "a menu's own tooltip");
+        tips_page(false);
+        assert!(tip_shows(true), "uncovered again");
+    }
 
     #[test]
     fn a_fold_chevron_turns_only_when_its_menu_opens_or_closes() {

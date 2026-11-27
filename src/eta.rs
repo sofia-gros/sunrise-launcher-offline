@@ -322,6 +322,75 @@ pub(crate) fn record_prepare_duration(elapsed: Duration) {
     std::thread::spawn(move || save_to(&path, &updated));
 }
 
+/// Player-facing label for one install stage.
+pub(crate) fn stage_label(step: InstallProgress) -> String {
+    match step {
+        InstallProgress::PreparingBuild => tr("Getting the build ready…").into(),
+        InstallProgress::Checking => tr("Checking the mod set…").into(),
+        InstallProgress::Waiting => tr("Waiting for another build to finish…").into(),
+        InstallProgress::Downloading(f) => trf(
+            "Downloading {percent}%",
+            &[("percent", &format!("{:.0}", f * 100.))],
+        ),
+        InstallProgress::DownloadingBuild(f) => trf(
+            "Downloading the build {percent}%",
+            &[("percent", &format!("{:.0}", f * 100.))],
+        ),
+        InstallProgress::Minecraft(step, files) => {
+            use sunrise_launcher::backend::PrepareStep;
+            let count = files.map(|(done, total)| (done.to_string(), total.to_string()));
+            match (step, count) {
+                (PrepareStep::Files, None) => tr("Finding Minecraft's files…").into(),
+                (PrepareStep::Files, Some((done, total))) => trf(
+                    "Downloading Minecraft's files ({done} of {total})",
+                    &[("done", &done), ("total", &total)],
+                ),
+                (PrepareStep::Java, None) => tr("Finding Java…").into(),
+                (PrepareStep::Java, Some((done, total))) => trf(
+                    "Downloading Java ({done} of {total} files)",
+                    &[("done", &done), ("total", &total)],
+                ),
+                (PrepareStep::Sounds, _) => tr("Adding the sounds…").into(),
+                (PrepareStep::Prepare, _) => tr("Preparing Minecraft's files…").into(),
+            }
+        }
+        InstallProgress::Preparing => tr("Getting ready…").into(),
+        InstallProgress::Rust(fraction) => trf(
+            "Downloading build tools {percent}%",
+            &[("percent", &format!("{:.0}", fraction * 100.0))],
+        ),
+        InstallProgress::Tools { total, .. } => trf(
+            "Getting build tools ({size})",
+            &[("size", &sunrise_launcher::storage::format_bytes(total))],
+        ),
+        InstallProgress::Building(Some(fraction)) => trf(
+            "Building {percent}%",
+            &[(
+                "percent",
+                &format!("{:.0}", (fraction * 100.0).clamp(0.0, 100.0)),
+            )],
+        ),
+        InstallProgress::Building(None) => tr("Building").into(),
+        InstallProgress::Publishing => tr("Finishing…").into(),
+        InstallProgress::Reviewing => tr("Review changes…").into(),
+    }
+}
+
+/// Determinate fraction of one install stage, when it has one.
+pub(crate) fn stage_fraction(step: InstallProgress) -> Option<f32> {
+    match step {
+        InstallProgress::Downloading(f)
+        | InstallProgress::DownloadingBuild(f)
+        | InstallProgress::Rust(f) => Some(f),
+        InstallProgress::Minecraft(_, Some((done, total))) if total > 0 => {
+            Some(done as f32 / total as f32)
+        }
+        InstallProgress::Building(f) => f,
+        InstallProgress::Tools { done, total } if total > 0 => Some(done as f32 / total as f32),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -29,7 +29,7 @@ fn link(full: bool) -> Result<(), String> {
         // `xcode-select -p` only says where they are; running `cc` without them would open
         // Apple's install dialog by surprise.
         "macos" if !ok("xcode-select", &["-p"]) => Err(
-            "Native mods need Apple's Command Line Tools to link the game. Run `xcode-select --install` in Terminal, then build again."
+            crate::i18n::tr("Native mods need Apple's Command Line Tools to link the game. Run `xcode-select --install` in Terminal, then build again.")
                 .into(),
         ),
         "linux" => linux_needs(
@@ -79,8 +79,11 @@ pub(super) fn linux_needs(
         missing.extend(
             [
                 (pkg_config, "pkg-config"),
-                (has("alsa"), "ALSA's development files"),
-                (has("libudev"), "libudev's development files"),
+                (has("alsa"), crate::i18n::tr("ALSA's development files")),
+                (
+                    has("libudev"),
+                    crate::i18n::tr("libudev's development files"),
+                ),
             ]
             .into_iter()
             .filter(|(found, _)| !found)
@@ -136,15 +139,15 @@ pub(super) fn linux_needs(
     // `shell.nix`, so point at that rather than at a package manager that would not help.
     let how = match command {
         _ if id == "nixos" => {
-            "On NixOS they are only visible inside a shell that provides them: run `nix-shell` in the launcher's folder (its shell.nix has these packages), then build again."
+            crate::i18n::tr("On NixOS they are only visible inside a shell that provides them: run `nix-shell` in the launcher's folder (its shell.nix has these packages), then build again.")
                 .to_owned()
         }
-        _ if id == "steamos" => "SteamOS ships without them and its system is read-only, so native mods can't be built on it yet.".to_owned(),
-        Some(command) => format!("Install them in a terminal, then build again:\n{command}"),
-        None => format!("Install them with your distribution's package manager, then build again (on Debian, Ubuntu or Mint: {apt})."),
+        _ if id == "steamos" => crate::i18n::tr("SteamOS ships without them and its system is read-only, so native mods can't be built on it yet.").to_owned(),
+        Some(command) => crate::i18n::trf("Install them in a terminal, then build again:\n{command}", &[("command", command)]),
+        None => crate::i18n::trf("Install them with your distribution's package manager, then build again (on Debian, Ubuntu or Mint: {apt}).", &[("apt", apt)]),
     };
-    Err(format!(
-        "Native mods need these to build the game on Linux, and this computer lacks them: {}. {how}",
-        missing.join(", ")
+    Err(crate::i18n::trf(
+        "Native mods need these to build the game on Linux, and this computer lacks them: {missing}. {how}",
+        &[("missing", &missing.join(", ")), ("how", &how)],
     ))
 }

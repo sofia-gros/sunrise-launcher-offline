@@ -5,22 +5,21 @@ use std::{fs, path::Path};
 use sunrise_launcher_smod::manifest::USES_FILE;
 use sunrise_launcher_smod::{manifest, Package};
 
+/// The validated native project, if this directory has a package manifest. A present but
+/// invalid manifest is reported by the package reader.
 pub fn read(dir: &Path) -> Result<Option<Bundle>, String> {
-    for old in [
-        "sunrise-native.json",
-        "horizon-mixin.toml",
-        "native",
-        "rust",
-    ] {
-        if dir.join(old).exists() {
-            return Err(trf(
-                "{path}: unsupported package path {old}",
-                &[("path", &dir.display().to_string()), ("old", old)],
-            ));
+    let path = dir.join(manifest::MANIFEST);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
         }
-    }
-    if !dir.join(manifest::MANIFEST).is_file() {
-        return Ok(None);
+        Err(e) => return Err(format!("{}: {e}", path.display())),
     }
     let package = Package::read(dir)?;
     if !package.is_native() {

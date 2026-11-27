@@ -6,6 +6,8 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use crate::i18n::{tr, trf};
+
 /// Modrinth's file server: packs, and the original jars a Sunrise mod's `[[jar]]` asks for (`jars`).
 pub(crate) const MODRINTH_CDN: &str = "https://cdn.modrinth.com/";
 /// Hosts a file may come from: Modrinth's file server, and the release assets
@@ -64,9 +66,9 @@ pub(super) fn agent(url: &str) -> Result<ureq::Agent, String> {
 /// Why a file can't be downloaded at all, before any byte is read.
 pub fn refuse(file: &FileRef) -> Option<String> {
     if !HOSTS.iter().any(|h| file.url.starts_with(h)) && !github_release_asset(&file.url) {
-        return Some(format!(
-            "{} isn't on Modrinth's or Sunrise's file servers, or a GitHub release.",
-            file.url
+        return Some(trf(
+            "{url} isn't on Modrinth's or Sunrise's file servers, or a GitHub release.",
+            &[("url", &file.url)],
         ));
     }
     refuse_file(file)
@@ -75,13 +77,16 @@ pub fn refuse(file: &FileRef) -> Option<String> {
 /// [`refuse`] without the host: the name, the checksum and the size.
 fn refuse_file(file: &FileRef) -> Option<String> {
     if safe_name(&file.name).is_none() {
-        return Some(format!("{:?} isn't a plain file name.", file.name));
+        return Some(trf(
+            "{name} isn't a plain file name.",
+            &[("name", &format!("{:?}", file.name))],
+        ));
     }
     if file.checksum().is_none() {
-        return Some("Its source gives no checksum, so it can't be checked.".into());
+        return Some(tr("Its source gives no checksum, so it can't be checked.").into());
     }
     if file.size > MAX {
-        return Some("It is larger than any pack should be.".into());
+        return Some(tr("It is larger than any pack should be.").into());
     }
     None
 }
@@ -152,28 +157,38 @@ pub(super) fn save_from_anywhere(
         let mut hasher = Hasher::for_file(file);
         let (mut done, mut buf) = (0u64, vec![0u8; 1 << 16]);
         loop {
-            let n = reader
-                .read(&mut buf)
-                .map_err(|e| format!("Download interrupted: {e}"))?;
+            let n = reader.read(&mut buf).map_err(|e| {
+                trf(
+                    "Download interrupted: {error}",
+                    &[("error", &e.to_string())],
+                )
+            })?;
             if n == 0 {
                 break;
             }
             done += n as u64;
             if done > MAX || (file.size > 0 && done > file.size) {
-                return Err("The download is larger than its source says.".to_string());
+                return Err(tr("The download is larger than its source says.").to_string());
             }
             hasher.update(&buf[..n]);
             out.write_all(&buf[..n]).map_err(|e| e.to_string())?;
             progress(done as f32 / file.size.max(1) as f32);
         }
         if file.size > 0 && done != file.size {
-            return Err(format!("Got {done} bytes of {}.", file.size));
+            return Err(trf(
+                "Got {done} bytes of {size}.",
+                &[
+                    ("done", &done.to_string()),
+                    ("size", &file.size.to_string()),
+                ],
+            ));
         }
         let got = hasher.hex();
         if !got.eq_ignore_ascii_case(want) {
-            return Err(format!(
+            return Err(trf(
                 "The {algo} checksum doesn't match: the file isn't the one its source lists. \
-                 Nothing was installed."
+                 Nothing was installed.",
+                &[("algo", algo)],
             ));
         }
         out.sync_all().map_err(|e| e.to_string())?;

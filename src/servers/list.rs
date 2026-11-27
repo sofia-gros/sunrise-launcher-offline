@@ -92,14 +92,17 @@ pub fn forget_remote(host: &str, dir: &Path) -> Result<(), String> {
 /// Removes a registered, stopped server, retaining its files in the system trash.
 pub fn delete(dir: &Path) -> Result<(), String> {
     if !list().iter().any(|entry| entry.dir == dir) {
-        return Err("This server is no longer in the launcher’s list.".into());
+        return Err(tr("This server is no longer in the launcher’s list.").into());
     }
     if service_installed(dir) {
-        return Err("Turn off running in the background before deleting this server.".into());
+        return Err(tr("Turn off running in the background before deleting this server.").into());
     }
     trash_stopped_server(dir, crate::desktop_seams::to_trash)?;
     forget(dir).map_err(|e| {
-        format!("The server was moved to the trash, but its list could not be saved: {e}")
+        trf(
+            "The server was moved to the trash, but its list could not be saved: {error}",
+            &[("error", &e.to_string())],
+        )
     })
 }
 
@@ -114,7 +117,7 @@ pub(super) fn trash_stopped_server(
         .is_symlink()
         || !dir.join("server.toml").is_file()
     {
-        return Err("This is not a server folder.".into());
+        return Err(tr("This is not a server folder.").into());
     }
     let state = dir.join(".sunrise");
     fs::create_dir_all(&state).map_err(|e| e.to_string())?;
@@ -127,13 +130,18 @@ pub(super) fn trash_stopped_server(
         .open(state.join("lock"))
         .map_err(|e| e.to_string())?;
     lock.try_lock()
-        .map_err(|_| "Stop the server before deleting it.".to_string())?;
+        .map_err(|_| tr("Stop the server before deleting it.").to_string())?;
     // Windows can't move a folder while a file in it is open, the lock included: let it go
     // first. Still safe: a supervisor starting in between opens the lock again, and then the
     // move fails instead of taking a live server.
     #[cfg(windows)]
     drop(lock);
-    trash(dir).map_err(|e| format!("Could not move the server to the trash: {e}"))
+    trash(dir).map_err(|e| {
+        trf(
+            "Could not move the server to the trash: {error}",
+            &[("error", &e.to_string())],
+        )
+    })
 }
 
 /// A folder name for a server name: lower case letters, digits and dashes.

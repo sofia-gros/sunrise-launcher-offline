@@ -324,7 +324,10 @@ pub fn install(options: &Options, progress: impl Fn(Step, f32)) -> Result<PathBu
     let dir = options.dir.clone();
     clean_aside(&dir);
     if dir.file_name().is_none() {
-        return Err(format!("{} is not a folder to install in.", dir.display()));
+        return Err(crate::i18n::trf(
+            "{path} is not a folder to install in.",
+            &[("path", &dir.display().to_string())],
+        ));
     }
     let exe = dir.join(BINARY);
     progress(Step::Files, 0.05);
@@ -335,8 +338,9 @@ pub fn install(options: &Options, progress: impl Fn(Step, f32)) -> Result<PathBu
         place(&source, &exe).map_err(|e| format!("{}: {e}", exe.display()))?;
     }
     fs::write(dir.join("LICENSE"), include_str!("../assets/LICENSE"))
-        .map_err(|e| format!("The licence: {e}"))?;
-    crate::notices::write_into(&dir).map_err(|e| format!("The licences: {e}"))?;
+        .map_err(|e| crate::i18n::trf("The licence: {error}", &[("error", &e.to_string())]))?;
+    crate::notices::write_into(&dir)
+        .map_err(|e| crate::i18n::trf("The licences: {error}", &[("error", &e.to_string())]))?;
     progress(Step::Shortcuts, 0.6);
     if let Some(link) = start_menu_link() {
         write_link(&link, &exe).map_err(|e| format!("{}: {e}", link.display()))?;
@@ -345,7 +349,8 @@ pub fn install(options: &Options, progress: impl Fn(Step, f32)) -> Result<PathBu
         write_link(&link, &exe).map_err(|e| format!("{}: {e}", link.display()))?;
     }
     progress(Step::Registry, 0.85);
-    register(&dir, &exe, backend::VERSION).map_err(|e| format!("The registry: {e}"))?;
+    register(&dir, &exe, backend::VERSION)
+        .map_err(|e| crate::i18n::trf("The registry: {error}", &[("error", &e.to_string())]))?;
     progress(Step::Registry, 1.0);
     Ok(exe)
 }
@@ -534,15 +539,15 @@ pub fn uninstall(remove_data: bool, progress: impl Fn(Step, f32)) -> Result<Vec<
             if builds_are_launchers(&builds, &data, location.as_ref()) {
                 remove_all(&builds, &mut left);
             } else {
-                left.push(format!(
-                    "{} (not the launcher's own folder)",
-                    builds.display()
+                left.push(crate::i18n::trf(
+                    "{path} (not the launcher's own folder)",
+                    &[("path", &builds.display().to_string())],
                 ));
             }
         } else {
-            left.push(format!(
-                "{} (not the launcher's own folder)",
-                data.display()
+            left.push(crate::i18n::trf(
+                "{path} (not the launcher's own folder)",
+                &[("path", &data.display().to_string())],
             ));
         }
     }
@@ -596,7 +601,10 @@ pub fn run_quiet() -> Option<i32> {
         return Some(match ensure_notices() {
             Ok(()) => 0,
             Err(error) => {
-                eprintln!("The licences: {error}");
+                eprintln!(
+                    "{}",
+                    crate::i18n::trf("The licences: {error}", &[("error", &error.to_string())])
+                );
                 1
             }
         });
@@ -606,7 +614,10 @@ pub fn run_quiet() -> Option<i32> {
         Invocation::QuietUninstall => Some(match uninstall(flag("--remove-data"), |_, _| {}) {
             Ok(left) => {
                 for item in left {
-                    eprintln!("Not removed: {item}");
+                    eprintln!(
+                        "{}",
+                        crate::i18n::trf("Not removed: {item}", &[("item", &item)])
+                    );
                 }
                 0
             }

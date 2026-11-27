@@ -9,6 +9,7 @@
 //! only the rest.
 
 use crate::backend::lock::recover;
+use crate::i18n::{tr, trf};
 use crate::sources::{fetch_checked, fetch_manifest, sha1_file, sha1_hex, write_file, Fetch, Pins};
 use serde_json::Value;
 use std::fs;
@@ -109,8 +110,12 @@ pub fn download(
                 .join(relative(&text(logging, "id")?)?),
         });
     }
-    log(format!(
-        "Downloading Minecraft {v} from Mojang: the game and {libraries} libraries"
+    log(trf(
+        "Downloading Minecraft {version} from Mojang: the game and {libraries} libraries",
+        &[
+            ("version", &v.to_string()),
+            ("libraries", &libraries.to_string()),
+        ],
     ));
     fetch_all(&game, jobs, fetch, cancel, log)?;
     let index = &manifest["assetIndex"];
@@ -125,7 +130,10 @@ pub fn download(
     let assets = fetch_all(std::slice::from_ref(&index), 1, fetch, cancel, log)
         .and_then(|_| objects(&read_json(&index.path)?, dir))
         .and_then(|objects| {
-            log(format!("Downloading the sounds ({} files)", objects.len()));
+            log(trf(
+                "Downloading the sounds ({count} files)",
+                &[("count", &objects.len().to_string())],
+            ));
             // A connection that fails now and then is tried again, and a file that still fails
             // does not stop the others: the next download fetches what is left.
             let retrying = |url: &str| {
@@ -142,7 +150,10 @@ pub fn download(
         });
     match assets {
         Err(e) if e == CANCELLED => return Err(e),
-        Err(e) => log(format!("The sounds could not all be downloaded: {e}")),
+        Err(e) => log(trf(
+            "The sounds could not all be downloaded: {error}",
+            &[("error", &e.to_string())],
+        )),
         Ok(()) => {}
     }
     Ok(())
@@ -162,6 +173,27 @@ pub(crate) fn java_platform() -> Option<&'static str> {
     })
 }
 
+fn no_runtime(component: &str, platform: &str) -> String {
+    trf(
+        "Mojang has no {component} for {platform}",
+        &[("component", component), ("platform", platform)],
+    )
+}
+
+fn unreadable_manifest(component: &str, e: &serde_json::Error) -> String {
+    trf(
+        "Mojang's {component} manifest: {error}",
+        &[("component", component), ("error", &e.to_string())],
+    )
+}
+
+fn downloading_java(name: &str, count: usize) -> String {
+    trf(
+        "Downloading Minecraft's Java {name} from Mojang ({count} files)",
+        &[("name", name), ("count", &count.to_string())],
+    )
+}
+
 /// Downloads Mojang's Java runtime `component` (the version JSON's `javaVersion.component`, e.g.
 /// `java-runtime-epsilon`) into the game directory's `runtime` folder, as the official launcher
 /// lays it out: `<component>/<platform>/<component>/`. Each file is checked against its sha1;
@@ -175,12 +207,12 @@ pub fn java_runtime(
     cancel: &AtomicBool,
     log: &dyn Fn(String),
 ) -> Result<PathBuf, String> {
-    let platform = java_platform().ok_or("Mojang has no Java for this system")?;
+    let platform = java_platform().ok_or(tr("Mojang has no Java for this system"))?;
     let index: Value = serde_json::from_slice(&fetch(JAVA_RUNTIMES)?)
-        .map_err(|e| format!("Mojang's Java index: {e}"))?;
+        .map_err(|e| trf("Mojang's Java index: {error}", &[("error", &e.to_string())]))?;
     let entry = &index[platform][component][0];
     if entry.is_null() {
-        return Err(format!("Mojang has no {component} for {platform}"));
+        return Err(no_runtime(component, platform));
     }
     let manifest = &entry["manifest"];
     let manifest: Value = serde_json::from_slice(&fetch_checked(
@@ -188,7 +220,7 @@ pub fn java_runtime(
         &text(manifest, "url")?,
         &text(manifest, "sha1")?,
     )?)
-    .map_err(|e| format!("Mojang's {component} manifest: {e}"))?;
+    .map_err(|e| unreadable_manifest(component, &e))?;
     let files = manifest["files"]
         .as_object()
         .ok_or_else(|| format!("Mojang's {component} manifest lists no files"))?;
@@ -216,10 +248,7 @@ pub fn java_runtime(
         }
     }
     let name = entry["version"]["name"].as_str().unwrap_or(component);
-    log(format!(
-        "Downloading Minecraft's Java {name} from Mojang ({} files)",
-        downloads.len()
-    ));
+    log(downloading_java(name, downloads.len()));
     fetch_all(&downloads, jobs, fetch, cancel, log)?;
     #[cfg(unix)]
     {
@@ -354,14 +383,20 @@ fn objects(index: &Value, dir: &Path) -> Result<Vec<File>, String> {
 fn fetch_file(fetch: Fetch, file: &File) -> Result<Vec<u8>, String> {
     let body = fetch(&file.url)?;
     if let Some(size) = file.size.filter(|&size| size != body.len() as u64) {
-        return Err(format!(
-            "is {} bytes, not the {size} Mojang lists",
-            body.len()
+        return Err(trf(
+            "is {actual} bytes, not the {expected} Mojang lists",
+            &[
+                ("actual", &body.len().to_string()),
+                ("expected", &size.to_string()),
+            ],
         ));
     }
     match sha1_hex(&body) {
         actual if actual == file.sha1 => Ok(body),
-        actual => Err(format!("is not the one Sunrise pins (sha1 {actual})")),
+        actual => Err(trf(
+            "is not the one Sunrise pins (sha1 {actual})",
+            &[("actual", actual.as_str())],
+        )),
     }
 }
 
@@ -424,17 +459,26 @@ fn fetch_each(
             std::thread::sleep(Duration::from_millis(100));
             waited += 1;
             if waited % 10 == 0 {
-                log(format!("{} of {} files", done.load(Relaxed), files.len()));
+                log(trf(
+                    "{done} of {total} files",
+                    &[
+                        ("done", &done.load(Relaxed).to_string()),
+                        ("total", &files.len().to_string()),
+                    ],
+                ));
             }
         }
     });
     TOTAL.store(0, Relaxed);
     // As recover() does for the workers: a worker that panicked leaves at most its error here.
     match failed.into_inner().unwrap_or_else(|e| e.into_inner()) {
-        Some(e) if !stop_on_error && e != CANCELLED => Err(format!(
-            "{} of {} files failed, the first: {e}",
-            errors.load(Relaxed),
-            files.len()
+        Some(e) if !stop_on_error && e != CANCELLED => Err(trf(
+            "{failed} of {total} files failed, the first: {error}",
+            &[
+                ("failed", &errors.load(Relaxed).to_string()),
+                ("total", &files.len().to_string()),
+                ("error", e.as_str()),
+            ],
         )),
         Some(e) => Err(e),
         None => Ok(()),

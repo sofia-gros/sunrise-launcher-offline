@@ -5,6 +5,7 @@
 //! screenshots, backups, caches, or anything tied to the player's account. A world goes without
 //! its per-player files (`playerdata/`, `players/`, `stats/`, `advancements/`) and its level.dat without the
 //! player's UUID. The player's server list (`servers.dat`) stays out too.
+use crate::i18n::trf;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -58,13 +59,17 @@ pub fn export(home: &Path, name: &str, worlds: &[String], out: &Path) -> Result<
     for world in worlds {
         let dir = home.join("saves").join(world);
         if world.contains(['/', '\\']) || !dir.join("level.dat").is_file() {
-            return Err(format!("{name} has no world {world}."));
+            return Err(trf(
+                "{name} has no world {world}.",
+                &[("name", name), ("world", world)],
+            ));
         }
         walk(home, &dir, &PER_PLAYER, &mut files);
     }
     if files.is_empty() {
-        return Err(format!(
-            "{name} has nothing to share yet: no settings, packs, mods or worlds."
+        return Err(trf(
+            "{name} has nothing to share yet: no settings, packs, mods or worlds.",
+            &[("name", name)],
         ));
     }
     if let Some(dir) = out.parent() {
@@ -75,7 +80,10 @@ pub fn export(home: &Path, name: &str, worlds: &[String], out: &Path) -> Result<
     let done = written.and_then(|()| fs::rename(&part, out).map_err(|e| e.to_string()));
     if let Err(e) = done {
         let _ = fs::remove_file(&part);
-        return Err(format!("Could not export {name}: {e}"));
+        return Err(trf(
+            "Could not export {name}: {error}",
+            &[("name", name), ("error", &e)],
+        ));
     }
     Ok(Exported {
         path: out.to_path_buf(),

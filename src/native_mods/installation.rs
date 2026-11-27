@@ -25,7 +25,8 @@ pub(super) fn install(
     fs::create_dir(&partial).map_err(|e| e.to_string())?;
     copy_base(&from, &partial, target, target == Target::Client)?;
     let installed = partial.join(target.binary());
-    fs::copy(binary, &installed).map_err(|e| format!("The built game: {e}"))?;
+    fs::copy(binary, &installed)
+        .map_err(|e| trf("The built game: {error}", &[("error", &e.to_string())]))?;
     // The prebuilt game's libraries load from beside the executable.
     for library in libraries {
         library.copy_into(&partial).map_err(|error| {

@@ -1,5 +1,6 @@
 //! Addresses to share with players. Choosing one does not change the server's bind
 //! address, open router ports or claim that an internet connection has been tested.
+use crate::i18n::tr;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
@@ -61,9 +62,9 @@ fn lookup(agent: &ureq::Agent, url: &str) -> Result<Ipv4Addr, String> {
     let response = agent
         .get(url)
         .call()
-        .map_err(|_| "Public IP lookup failed".to_string())?;
+        .map_err(|_| tr("Public IP lookup failed").to_string())?;
     if response.status() != 200 {
-        return Err("Public IP lookup did not return HTTP 200".into());
+        return Err(tr("Public IP lookup did not return HTTP 200").into());
     }
     read_public_ipv4(response.into_reader())
 }
@@ -73,14 +74,14 @@ fn read_public_ipv4(reader: impl Read) -> Result<Ipv4Addr, String> {
     reader
         .take(65)
         .read_to_string(&mut body)
-        .map_err(|_| "Could not read the public IP address".to_string())?;
+        .map_err(|_| tr("Could not read the public IP address").to_string())?;
     if body.len() > 64 {
-        return Err("Invalid public IP response".into());
+        return Err(tr("Invalid public IP response").into());
     }
     let ip: Ipv4Addr = body
         .trim()
         .parse()
-        .map_err(|_| "Invalid public IP response".to_string())?;
+        .map_err(|_| tr("Invalid public IP response").to_string())?;
     let [a, b, c, d] = ip.octets();
     if ip.is_private()
         || ip.is_loopback()
@@ -96,7 +97,7 @@ fn read_public_ipv4(reader: impl Read) -> Result<Ipv4Addr, String> {
         || [a, b, c] == [192, 88, 99]
         || (a == 198 && (18..=19).contains(&b))
     {
-        return Err("The lookup did not return a public IPv4 address".into());
+        return Err(tr("The lookup did not return a public IPv4 address").into());
     }
     Ok(ip)
 }

@@ -64,7 +64,7 @@ impl Launcher {
         self.servers.console_scroll.handle.scroll_to_bottom();
         std::thread::spawn(move || {
             let result = servers::Api::open(&dir)
-                .ok_or_else(|| "The server isn't running.".to_string())
+                .ok_or_else(|| tr("The server isn't running.").to_string())
                 .and_then(|a| a.command(&line));
             if let Err(e) = result {
                 let _ = tx.send(Event::Failed(e));
@@ -91,7 +91,7 @@ impl Launcher {
                     }
                 }
             }
-            log("A new world takes a minute the first time".into());
+            log(tr("A new world takes a minute the first time").into());
             run_managed_server(&tx, &dir, &["start"], log).map(|_| String::new())
         });
     }
@@ -138,19 +138,27 @@ impl Launcher {
             Fix::UsePort(port) => {
                 self.set_setting("server.port", port.to_string());
                 self.servers.texts.remove(&Field::Port);
-                self.servers.note = Some(format!(
-                    "The server now uses port {port}. Press Start again."
+                self.servers.note = Some(trf(
+                    "The server now uses port {port}. Press Start again.",
+                    &[("port", &port.to_string())],
                 ));
             }
             Fix::Prepare => match self.selected().cloned() {
                 Some(tag) if backend::is_prepared(&tag) => {
-                    self.servers
-                        .start_job("Copying the game files", move |log| {
-                            log(format!("Copying the game files prepared for Sunrise {tag}"));
+                    self.servers.start_job(
+                        crate::i18n::tr_key("Copying the game files"),
+                        move |log| {
+                            log(trf(
+                                "Copying the game files prepared for Sunrise {tag}",
+                                &[("tag", &tag)],
+                            ));
                             servers::set_up(&tag)
-                                .map(|_| "The game files are ready. Press Start again.".to_string())
+                                .map(|_| {
+                                    tr("The game files are ready. Press Start again.").to_string()
+                                })
                                 .map_err(Problem::plain)
-                        });
+                        },
+                    );
                 }
                 _ => {
                     self.servers.create = None;
@@ -232,6 +240,12 @@ impl Launcher {
         };
         if !c.eula {
             c.eula_missing = true;
+            // The box is the form's last line, under the fold in a small window: bring it up
+            // to where the footer's message points.
+            // (`Scrollbar::page("host-create")` gives the form its handle.)
+            if let Some(body) = crate::frame::drawn_scroll("host-create") {
+                body.scroll_to_bottom();
+            }
             return;
         }
         let Some(c) = self.servers.create.as_ref() else {
@@ -316,7 +330,7 @@ impl Launcher {
             let result = (|| {
                 if servers::program().is_none() {
                     let tag =
-                        tag.ok_or_else(|| Problem::plain("Install a Sunrise version first."))?;
+                        tag.ok_or_else(|| Problem::plain(tr("Install a Sunrise version first.")))?;
                     servers::set_up(&tag).map_err(Problem::plain)?;
                 }
                 if !dir.join("server.toml").is_file() {

@@ -26,7 +26,10 @@ pub fn to_trash(path: &Path) -> Result<(), String> {
 /// Moves `path` into `dir` under a free name: the trash of a test run.
 pub fn to_folder(path: &Path, dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let name = path.file_name().ok_or("Nothing to move")?.to_string_lossy();
+    let name = path
+        .file_name()
+        .ok_or_else(|| crate::i18n::tr("Nothing to move").to_string())?
+        .to_string_lossy();
     let target = (1..)
         .map(|n| match n {
             1 => dir.join(&*name),
@@ -62,7 +65,7 @@ fn on_own_thread<T: Send>(f: impl FnOnce() -> Result<T, String> + Send) -> Resul
             .downcast_ref::<&str>()
             .map(|s| s.to_string())
             .or_else(|| panic.downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "it panicked".into());
+            .unwrap_or_else(|| crate::i18n::tr("it panicked").into());
         Err(why)
     })
 }

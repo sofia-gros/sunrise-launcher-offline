@@ -489,8 +489,8 @@ pub const TAIGA: Theme = Theme {
 };
 
 /// Sunrise's own theme's line in Settings.
-pub const TWILIGHT_NAME: &str = "Twilight";
-pub const TWILIGHT_DESCRIPTION: &str = "Indigo night and violet";
+pub const TWILIGHT_NAME: &str = crate::i18n::tr_key("Twilight");
+pub const TWILIGHT_DESCRIPTION: &str = crate::i18n::tr_key("Indigo night and violet");
 
 /// The launcher themes past Sunrise's own sky: the featured families first, then the older ones.
 pub const THEMES: [Theme; 10] = [
@@ -743,7 +743,12 @@ impl TryFrom<String> for Accent {
     type Error = String;
 
     fn try_from(name: String) -> Result<Self, Self::Error> {
-        Self::parse(&name).ok_or_else(|| format!("{name}: a colour name or a hue in degrees"))
+        Self::parse(&name).ok_or_else(|| {
+            crate::i18n::trf(
+                "{name}: a colour name or a hue in degrees",
+                &[("name", &name)],
+            )
+        })
     }
 }
 
@@ -936,7 +941,7 @@ pub fn background_picture(dir: &Path, name: &str) -> Result<image::RgbaImage, St
         .and_then(|dir| dir.open_with(name, &options))
         .map_err(said)?;
     if !file.metadata().map_err(said)?.is_file() {
-        return Err(theme_files::Reason::Linked("picture").text());
+        return Err(theme_files::Reason::Linked(crate::i18n::tr_key("picture")).text());
     }
     let mut bytes = Vec::new();
     file.take(theme_files::MAX_PICTURE + 1)

@@ -96,7 +96,10 @@ pub(crate) fn fetch_small_cancellable(
         if let Some(stop) = stop {
             stop.check()?;
         }
-        return Err(format!("Download interrupted: {e}"));
+        return Err(crate::i18n::trf(
+            "Download interrupted: {error}",
+            &[("error", &e.to_string())],
+        ));
     }
     Ok(Some(body))
 }

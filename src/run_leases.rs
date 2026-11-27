@@ -205,11 +205,23 @@ pub(crate) fn spawn(command: &mut Command, piped: bool) -> std::io::Result<std::
         match write_launch_failure(&crate::backend::data_dir().join("logs"), command, &error) {
             Ok(path) => std::io::Error::new(
                 error.kind(),
-                format!("{error}; diagnostic log: {}", path.display()),
+                crate::i18n::trf(
+                    "{error}; diagnostic log: {log}",
+                    &[
+                        ("error", &error.to_string()),
+                        ("log", &path.display().to_string()),
+                    ],
+                ),
             ),
             Err(log_error) => std::io::Error::new(
                 error.kind(),
-                format!("{error}; could not write launcher diagnostic log: {log_error}"),
+                crate::i18n::trf(
+                    "{error}; could not write launcher diagnostic log: {log_error}",
+                    &[
+                        ("error", &error.to_string()),
+                        ("log_error", &log_error.to_string()),
+                    ],
+                ),
             ),
         }
     })

@@ -229,7 +229,7 @@ impl Launcher {
         let input = if running {
             self.field(
                 Field::Command,
-                "Type a command: say Hello, time set day…",
+                crate::i18n::tr_key("Type a command: say Hello, time set day…"),
                 400.,
                 cx,
             )
@@ -302,7 +302,10 @@ impl Launcher {
                     cx,
                     move |this, _| {
                         let verb = if op { "deop" } else { "op" };
-                        this.server_command("Changing operators", vec![verb.into(), name.clone()]);
+                        this.server_command(
+                            crate::i18n::tr_key("Changing operators"),
+                            vec![verb.into(), name.clone()],
+                        );
                     },
                 )
             };
@@ -418,7 +421,7 @@ impl Launcher {
                     cx,
                     move |this, _| {
                         this.server_command(
-                            "Updating the list",
+                            crate::i18n::tr_key("Updating the list"),
                             vec!["whitelist".into(), "remove".into(), gone.clone()],
                         );
                     },

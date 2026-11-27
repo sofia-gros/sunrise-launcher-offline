@@ -208,7 +208,8 @@ pub trait Source: Send + Sync {
 /// The Modrinth loader that marks a shader pack in the Iris format.
 pub const IRIS: &str = "iris";
 /// What an Iris-format shader pack is labelled with.
-pub const IRIS_LABEL: &str = "Iris-format pack: most work, some effects may not";
+pub const IRIS_LABEL: &str =
+    crate::i18n::tr_key("Iris-format pack: most work, some effects may not");
 
 /// How well a project of `kind` made for `game_versions` and `loaders` runs in Sunrise on `game`.
 pub fn support(kind: Kind, game_versions: &[String], loaders: &[String], game: &str) -> Support {

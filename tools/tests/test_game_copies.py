@@ -47,6 +47,8 @@ SAME_BYTES = (
     ("crates/sunrise-attestation/LICENSE-APACHE-SIGSTORE", "crates/attestation/LICENSE-APACHE-SIGSTORE"),
     ("crates/sunrise-attestation/tests/verify.rs", "crates/attestation/tests/verify.rs"),
     ("crates/sunrise-attestation/tests/fixtures", "crates/attestation/tests/fixtures"),
+    ("crates/sunrise-jar-fetch/src/lib.rs", "crates/jar-fetch/src/lib.rs"),
+    ("crates/sunrise-mod-package/src/library_identity.rs", "crates/smod/src/index/library_identity.rs"),
 )
 
 # (the game's source, the launcher's copy, the edits that turn one into the other): compared as code, ignoring
@@ -110,7 +112,15 @@ SAME_CODE = (
         }"""),
     )),
     ("crates/sunrise-mod-package/src/modpack.rs", "crates/smod/src/modpack.rs", (
-        ('#[cfg(feature = "index")] impl PackMod', "impl PackMod"),
+        ('#[cfg(feature = "index-read")] impl PackMod', "impl PackMod"),
+    )),
+    ("crates/sunrise-jar-fetch/Cargo.toml", "crates/jar-fetch/Cargo.toml", (
+        ('name = "sunrise-jar-fetch"', 'name = "sunrise-launcher-jar-fetch"'),
+        ("edition.workspace = true", 'edition = "2024"'),
+        ("license.workspace = true", 'license = "PolyForm-Shield-1.0.0"'),
+        ("rust-version.workspace = true", 'rust-version = "1.95"'),
+        ("[dependencies]", "publish = false\n[dependencies]"),
+        ("[lints]\nworkspace = true", ""),
     )),
     ("crates/sunrise-attestation/Cargo.toml", "crates/attestation/Cargo.toml", (
         ("[dependencies]", "publish = false\n[dependencies]"),
@@ -135,8 +145,6 @@ MIRRORED = (
      "052665a32cf9980ffcd1d1cb51f72a918e6613d89fb2097562afb306ca4f4fe2", "src/browser/java.rs jar_title"),
     ("crates/sunrise-port-pack/src/jar.rs", "manifest_value",
      "8eba4a800351645479e1f2fc79c727bf2e3aee7bdcc97b27a3fa249791a2b33e", "src/browser/java.rs jar_title"),
-    ("crates/sunrise-native-build/src/lib.rs", "bundles",
-     "8929a560dc4a8fb4bf49243cd415b7f6bdad037278d5eaaf4c6e64f366222356", "src/native_mods/bundle.rs bundles"),
     ("crates/sunrise-native-build/src/lib.rs", "scan_bundles",
      "0186b6a99c78d6c3296063bc8d4c31134c035e787d25a146d7dc1839f20ae974",
      "src/native_mods/bundle.rs scan_bundles"),
@@ -148,7 +156,7 @@ MIRRORED = (
     ("crates/sunrise-native-build/src/lib.rs", "unpack_source",
      "356c9c82b888214518bbf5c6949f4ebfd4963e24993dda7bc11db877a33b2187", "src/github_mods.rs unpack_bounded"),
     ("crates/sunrise-native-build/src/package.rs", "read",
-     "94d760c8ea6f5452f20a6a816d88207675ed454e44cc0973240cff8069aaecf0",
+     "59c78bc534875d27f1dad3c66165b36fc520750d0d3bb4c3ae1442aeedc1b979",
      "src/native_mods/bundle/package.rs read"),
     ("crates/sunrise-native-build/src/package.rs", "copy_files",
      "ea02d6cc0ec18a4fe33804e4ee67bd2fe49e6e6d410b30fd56872f9e0c2e317a",
@@ -238,21 +246,17 @@ SAME_ITEMS = (
         ("sunrise_mod_package::", "sunrise_launcher_smod::"),
         ("""pub fn needs_mixins(&self) -> bool {
         self.manifest.native.as_ref().is_some_and(|native| {
-            !native.mixin.is_empty()
-                || !native.module.is_empty()
-                || !native.bridge.is_empty()
-                || !native.state.is_empty()
+            !native.mixin.is_empty() || !native.module.is_empty() || !native.bridge.is_empty()
         })
     }""", ""),
     ), ("pub enum Target", "impl Target", "pub const NATIVE_MANIFEST", "pub struct Bundle", "impl Bundle")),
-    ("crates/sunrise-native-build/src/lib.rs", "src/native_mods/build_log.rs", (), (
-        "pub const CANCELLED",  # Cancellation state belongs to each launcher attempt, not a process global.
-    )),
     ("crates/sunrise-native-build/src/prebuilt.rs", "src/native_mods/build_log.rs", (), (
         "pub enum Refusal", "impl std::fmt::Display for Refusal", "impl Refusal",
     )),
     ("crates/sunrise-native-build/src/package.rs", "src/native_mods/bundle/package.rs", (
         ("sunrise_mod_package::", "sunrise_launcher_smod::"), ("crate::host::trf", "trf"),
+        # The launcher's package reader has no structured state refusal: its `read` refuses state itself.
+        ("read_package(&bundle.dir, crate::host::tr)?", "Package::read(&bundle.dir)?"),
     ), ("fn checked_files", "pub fn files", "pub fn copy")),
     ("crates/sunrise-native-build/src/rust.rs", "src/rust_toolchain.rs", (), (
         "pub const WINDOWS_X64_TARGET", "pub const SCRUBBED", "const IOPRIO_WHO_PROCESS", "const LOW_IO",
@@ -266,10 +270,7 @@ SAME_ITEMS = (
         ("pub dependencies: BTreeMap<", "pub dependencies: std::collections::BTreeMap<"),
         ("pub incompatible: BTreeMap<", "pub incompatible: std::collections::BTreeMap<"),
         ("pub discouraged: BTreeMap<", "pub discouraged: std::collections::BTreeMap<"),
-    ), ("pub const API", "fn api", "pub struct Manifest", "pub struct Native", "pub enum Capability")),
-    ("crates/sunrise-mod-package/src/index/registry/builds.rs", "crates/smod/src/index/library_identity.rs", (), (
-        "pub struct LibraryIdentity", "impl<'a> LibraryIdentity", "pub fn library_identity",
-    )),
+    ), ("pub const API", "fn api", "pub struct Manifest", "pub enum Capability")),
 )
 
 
@@ -349,8 +350,8 @@ PACKAGE_FORMAT = "crates/sunrise-mod-package/src/sdk/package-format"
 
 # (the game's file and constant, the launcher's file and constant)
 FORMAT_CONSTANTS = (
-    ("crates/sunrise-mod-surface/src/uses.rs", "USES_FILE", "crates/smod/src/manifest.rs", "USES_FILE"),
-    ("crates/sunrise-mod-surface/src/uses.rs", "MAX_USES_BYTES", "crates/smod/src/manifest.rs", "MAX_USES"),
+    ("crates/sunrise-mod-surface/src/uses_meta.rs", "USES_FILE", "crates/smod/src/manifest.rs", "USES_FILE"),
+    ("crates/sunrise-mod-surface/src/uses_meta.rs", "MAX_USES_BYTES", "crates/smod/src/manifest.rs", "MAX_USES"),
     ("crates/sunrise-core/src/prepared_files.rs", "FILE_NAME", "src/preparer.rs", "DATA_FILE"),
     ("crates/sunrise-mod-package/src/mixins_tool.rs", "REV", "src/native_mods/bundle.rs", "MIXINS_REV"),
     ("crates/sunrise-core/src/version.rs", "VERSION_ID", "src/backend.rs", "PINNED_GAME"),

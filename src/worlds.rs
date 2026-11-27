@@ -268,11 +268,11 @@ fn scanned_world(path: &Path) -> std::io::Result<Option<Scanned>> {
     let hardcore = number(field("difficulty_settings").and_then(|d| d.get("hardcore"))) != 0
         || number(field("hardcore")) != 0;
     let mode = match (hardcore, number(field("GameType"))) {
-        (true, _) => "Hardcore",
-        (_, 1) => "Creative",
-        (_, 2) => "Adventure",
-        (_, 3) => "Spectator",
-        _ => "Survival",
+        (true, _) => crate::i18n::tr_key("Hardcore"),
+        (_, 1) => crate::i18n::tr_key("Creative"),
+        (_, 2) => crate::i18n::tr_key("Adventure"),
+        (_, 3) => crate::i18n::tr_key("Spectator"),
+        _ => crate::i18n::tr_key("Survival"),
     };
     let (played, last_played) = match number(field("LastPlayed")) {
         millis if millis > 0 => (

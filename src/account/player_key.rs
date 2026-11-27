@@ -59,7 +59,8 @@ impl PlayerKey {
     /// Reads `POST /player/certificates`' answer for the account `uuid`. The private key is the
     /// PKCS#8 bytes the services wrap in an `RSA PRIVATE KEY` block.
     pub fn parse(uuid: &str, answer: &Value) -> Result<Self, String> {
-        let unreadable = || "The Minecraft services' answer couldn't be read.".to_string();
+        let unreadable =
+            || crate::i18n::tr("The Minecraft services' answer couldn't be read.").to_string();
         let pair = &answer["keyPair"];
         let private_key = str_field(pair, "privateKey")
             .and_then(|pem| pem_bytes(&pem))
@@ -112,7 +113,7 @@ impl PlayerKey {
                 bytes,
                 &mut signature,
             )
-            .map_err(|_| "The rating couldn't be signed.".to_string())?;
+            .map_err(|_| crate::i18n::tr("The rating couldn't be signed.").to_string())?;
         Ok(STANDARD.encode(signature))
     }
 
@@ -133,7 +134,7 @@ impl PlayerKey {
 
 /// Asks the services for the account's certificate: a `POST` with no body, as the game does.
 fn fetch(ep: &Endpoints, token: &str, uuid: &str) -> Result<PlayerKey, String> {
-    let unreachable = "Couldn't reach Minecraft's services.";
+    let unreachable = crate::i18n::tr("Couldn't reach Minecraft's services.");
     let request = bearer(
         request_to("POST", &format!("{}/player/certificates", ep.minecraft))?,
         token,
@@ -189,12 +190,12 @@ pub fn current(account: &str) -> Result<Arc<PlayerKey>, String> {
             // A profile key needs the account's real session: the gate stays strict.
             false,
         )
-        .map_err(|_| super::NEEDS_OWNER.to_string())?;
+        .map_err(|_| crate::i18n::tr(super::NEEDS_OWNER).to_string())?;
         let _ = accounts.save_renewed();
         let (selected, secrets) = launch.session.ok_or_else(|| {
             launch
                 .offline
-                .unwrap_or_else(|| super::NEEDS_OWNER.to_string())
+                .unwrap_or_else(|| crate::i18n::tr(super::NEEDS_OWNER).to_string())
         })?;
         fetch(&ep, &secrets.minecraft_token, &selected.uuid)
     })();

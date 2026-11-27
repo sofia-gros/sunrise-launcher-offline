@@ -185,7 +185,7 @@ impl Accounts {
     /// Plays as the signed-in account `uuid`.
     pub fn play_as(&mut self, uuid: &str) -> Result<(), String> {
         if !self.accounts.iter().any(|a| a.uuid == uuid) {
-            return Err("That account isn't signed in.".into());
+            return Err(crate::i18n::tr("That account isn't signed in.").into());
         }
         self.selected = Some(uuid.to_string());
         Ok(())
@@ -372,7 +372,7 @@ impl std::fmt::Display for NoOwner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.keyring {
             Some(why) => write!(f, "{why}"),
-            None => write!(f, "{NEEDS_OWNER}."),
+            None => write!(f, "{}.", crate::i18n::tr(NEEDS_OWNER)),
         }
     }
 }

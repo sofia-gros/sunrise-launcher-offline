@@ -231,7 +231,7 @@ pub fn cleanup_launcher_updates() {
 
 #[cfg(not(target_os = "macos"))]
 pub(super) fn replace_bundle(_new: &Path, _app: &Path) -> Result<(), String> {
-    Err("App bundles are a macOS thing.".into())
+    Err(crate::i18n::tr("App bundles are a macOS thing.").into())
 }
 
 /// A launcher release downloaded and checked against its signed SHA256SUMS, waiting to take this
@@ -411,9 +411,9 @@ pub fn place_checked(
     place: impl FnOnce(&Staged) -> Result<(), String>,
 ) -> Result<(), String> {
     let not_staged = || {
-        format!(
-            "{} is not a launcher update this launcher downloaded.",
-            staged.payload.display()
+        crate::i18n::trf(
+            "{path} is not a launcher update this launcher downloaded.",
+            &[("path", &staged.payload.display().to_string())],
         )
     };
     let stage = stage_folder(work, &staged.payload).ok_or_else(not_staged)?;
@@ -435,7 +435,7 @@ pub fn place_checked(
         unpack(&archive, &archive.to_string_lossy(), &fresh, None)?;
         let payload = fresh.join(inside);
         if !payload.exists() {
-            return Err("The download has no launcher binary.".into());
+            return Err(crate::i18n::tr("The download has no launcher binary.").into());
         }
         payload
     };
@@ -500,7 +500,9 @@ pub(super) fn stage_update_with(
     fetch_manifest: impl Fn(&str) -> Result<Option<Vec<u8>>, String>,
 ) -> Result<Option<Staged>, StageUpdateError> {
     let (url, size) = release.asset.as_ref().ok_or_else(|| {
-        StageUpdateError::Download("This launcher release has no build for this platform.".into())
+        StageUpdateError::Download(
+            crate::i18n::tr("This launcher release has no build for this platform.").into(),
+        )
     })?;
     let target = launcher_version(&release.tag).unwrap_or("0");
     if installed_launcher_version(&update_target())
@@ -547,8 +549,9 @@ fn fill_stage(
     // to unpack, so this comes before the unpacking below.
     if appimage_path().is_some() {
         if !url.ends_with(".AppImage") {
-            return Err(format!(
-                "{tag} is not an AppImage, and this launcher runs from one. Install it from its release page instead."
+            return Err(crate::i18n::trf(
+                "{tag} is not an AppImage, and this launcher runs from one. Install it from its release page instead.",
+                &[("tag", tag)],
             ));
         }
         return staged(archive);
@@ -563,8 +566,8 @@ fn fill_stage(
             return staged(new);
         }
     }
-    let binary =
-        find_file(&unpacked, LAUNCHER_BINARY).ok_or("The download has no launcher binary.")?;
+    let binary = find_file(&unpacked, LAUNCHER_BINARY)
+        .ok_or_else(|| crate::i18n::tr("The download has no launcher binary.").to_string())?;
     staged(binary)
 }
 
@@ -574,9 +577,12 @@ pub fn place_staged(staged: &Staged) -> Result<(), String> {
     let new = &staged.payload;
     if let Some(appimage) = appimage_path() {
         replace_binary(new, &appimage).map_err(|e| {
-            format!(
-                "Could not replace the AppImage at {}: {e}",
-                appimage.display()
+            crate::i18n::trf(
+                "Could not replace the AppImage at {path}: {error}",
+                &[
+                    ("path", &appimage.display().to_string()),
+                    ("error", &e.to_string()),
+                ],
             )
         })?;
         return Ok(());
@@ -584,9 +590,12 @@ pub fn place_staged(staged: &Staged) -> Result<(), String> {
     match app_bundle(exe_path()) {
         Some(app) if new.extension().is_some_and(|e| e == "app") => replace_bundle(new, app)?,
         _ => replace_binary(new, exe_path()).map_err(|e| {
-            format!(
-                "Could not replace the launcher at {}: {e}",
-                exe_path().display()
+            crate::i18n::trf(
+                "Could not replace the launcher at {path}: {error}",
+                &[
+                    ("path", &exe_path().display().to_string()),
+                    ("error", &e.to_string()),
+                ],
             )
         })?,
     }
@@ -676,8 +685,11 @@ pub fn restart() -> String {
         Ok(_) => std::process::exit(0),
         Err(e) => e,
     };
-    format!(
-        "Could not start {}: {error}. Close the launcher and open it again.",
-        target.display()
+    crate::i18n::trf(
+        "Could not start {path}: {error}. Close the launcher and open it again.",
+        &[
+            ("path", &target.display().to_string()),
+            ("error", &error.to_string()),
+        ],
     )
 }

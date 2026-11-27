@@ -194,9 +194,9 @@ impl Launcher {
                         s.list = servers::list();
                         s.modes.clear();
                         self.open_server(entry.dir.clone());
-                        self.servers.note = Some(format!(
-                            "{} is ready. Press Start, then give your friends the address below.",
-                            entry.name
+                        self.servers.note = Some(trf(
+                            "{name} is ready. Press Start, then give your friends the address below.",
+                            &[("name", &entry.name)],
                         ));
                     }
                     Err(p) => s.problem = Some(p),
@@ -243,7 +243,7 @@ impl Launcher {
                     self.side_servers = s.list.clone();
                 }
                 match result {
-                    Ok(()) => s.note = Some("Server moved to the trash.".into()),
+                    Ok(()) => s.note = Some(tr("Server moved to the trash.").into()),
                     Err(e) => s.problem = Some(Problem::plain(e)),
                 }
                 true

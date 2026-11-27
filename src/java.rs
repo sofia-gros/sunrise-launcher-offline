@@ -66,7 +66,10 @@ impl Need {
                 .iter()
                 .map(|(m, c)| format!("{m} ({c})"))
                 .collect();
-            format!("Mojang has no Java {name:?}. Known: {}.", known.join(", "))
+            crate::i18n::trf(
+                "Mojang has no Java {name}. Known: {known}.",
+                &[("name", &format!("{name:?}")), ("known", &known.join(", "))],
+            )
         })?;
         Ok(Need {
             major,

@@ -1,5 +1,6 @@
 //! Modrinth's public API (api.modrinth.com/v2): no key, files with SHA-512 and SHA-1.
 use super::{details, FileRef, Kind, Project, Query, Source, SourceId, Version};
+use crate::i18n::{tr, trf};
 use serde_json::Value;
 
 pub(crate) const API: &str = "https://api.modrinth.com/v2";
@@ -18,8 +19,9 @@ fn project_type(kind: Kind) -> Option<&'static str> {
     }
 }
 
-const PACKS_ONLY: &str =
-    "Modrinth is searched for resource packs, data packs and shader packs only.";
+const PACKS_ONLY: &str = crate::i18n::tr_key(
+    "Modrinth is searched for resource packs, data packs and shader packs only.",
+);
 
 /// The kind of a Modrinth project; its shader packs are Iris-format ones ([`Project::support`]
 /// says which run). A data pack says it is a `mod` (most also ship a mod build): the search for data packs marks
@@ -172,7 +174,7 @@ impl Source for Modrinth {
     }
 
     fn search(&self, query: &Query) -> Result<Vec<Project>, String> {
-        let found = get(&search_url(query).ok_or(PACKS_ONLY)?)?;
+        let found = get(&search_url(query).ok_or_else(|| tr(PACKS_ONLY).to_string())?)?;
         Ok(found["hits"]
             .as_array()
             .into_iter()
@@ -187,7 +189,8 @@ impl Source for Modrinth {
 
     fn project(&self, id: &str) -> Result<Project, String> {
         let p = get(&format!("{API}/project/{}", encode(id)))?;
-        parse_project(&p).ok_or_else(|| format!("Modrinth: {id} is not a pack Sunrise loads."))
+        parse_project(&p)
+            .ok_or_else(|| trf("Modrinth: {id} is not a pack Sunrise loads.", &[("id", id)]))
     }
 
     fn versions(&self, project: &Project) -> Result<Vec<Version>, String> {
@@ -217,7 +220,7 @@ impl Source for Modrinth {
 pub fn categories(kind: Kind) -> Result<Vec<String>, String> {
     let wanted = match kind {
         Kind::DataPack => "mod",
-        other => project_type(other).ok_or(PACKS_ONLY)?,
+        other => project_type(other).ok_or_else(|| tr(PACKS_ONLY).to_string())?,
     };
     Ok(pack_categories(
         &get(&format!("{API}/tag/category"))?,
@@ -252,14 +255,22 @@ fn get(url: &str) -> Result<Value, String> {
         .call()
         .map_err(|e| match e {
             ureq::Error::Status(429, _) => {
-                "Modrinth asks to slow down: try again in a minute.".into()
+                tr("Modrinth asks to slow down: try again in a minute.").into()
             }
-            ureq::Error::Status(code, _) => format!("Modrinth answered {code}."),
-            ureq::Error::Transport(t) => format!("No connection to Modrinth: {t}"),
+            ureq::Error::Status(code, _) => {
+                trf("Modrinth answered {code}.", &[("code", &code.to_string())])
+            }
+            ureq::Error::Transport(t) => trf(
+                "No connection to Modrinth: {error}",
+                &[("error", &t.to_string())],
+            ),
         })?;
-    response
-        .into_json()
-        .map_err(|e| format!("Modrinth's answer wasn't readable: {e}"))
+    response.into_json().map_err(|e| {
+        trf(
+            "Modrinth's answer wasn't readable: {error}",
+            &[("error", &e.to_string())],
+        )
+    })
 }
 
 /// Percent-encoding for a query value or a path segment.

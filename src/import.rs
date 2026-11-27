@@ -8,6 +8,7 @@
 //! [`crate::export::FOLDERS`], `saves/`), and every path is checked to stay inside its folder.
 use crate::browser::installed;
 use crate::export::{FILES, FOLDERS};
+use crate::i18n::{tr, trf};
 use crate::instances::{self, Instance};
 use crate::packs;
 use crate::zip_intake::{self, Archive};
@@ -50,7 +51,6 @@ fn name_of(file: &Path) -> String {
 
 /// What `file` is, from its name and what is inside.
 pub fn what(file: &Path) -> Result<Dropped, String> {
-    let name = name_of(file);
     let ext = file
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase());
@@ -62,8 +62,9 @@ pub fn what(file: &Path) -> Result<Dropped, String> {
         // than this function's "nothing in it that Sunrise reads".
         Some("exe" | "gz" | "tgz") => return Ok(Dropped::Build),
         Some("mrpack") => {
-            return Err(format!(
-                "{name} is a Modrinth modpack: Sunrise doesn't import those."
+            return Err(trf(
+                "{name} is a Modrinth modpack: Sunrise doesn't import those.",
+                &[("name", &name_of(file))],
             ))
         }
         Some("zip") => {}
@@ -71,8 +72,11 @@ pub fn what(file: &Path) -> Result<Dropped, String> {
         // extension, so a file nothing else claims is read before giving up.
         _ if is_build(file) => return Ok(Dropped::Build),
         _ => {
-            let kinds = "a .zip, a .sshader or a Sunrise game build";
-            return Err(format!("{name} can't be imported: drop {kinds}."));
+            let kinds = crate::i18n::tr_key("a .zip, a .sshader or a Sunrise game build");
+            return Err(trf(
+                "{name} can't be imported: drop {kinds}.",
+                &[("name", &name_of(file)), ("kinds", tr(kinds))],
+            ));
         }
     }
     let zip = open(file)?;
@@ -83,8 +87,9 @@ pub fn what(file: &Path) -> Result<Dropped, String> {
         .map_err(|e| e.to_string())?;
     let under = |p: &str| names.iter().any(|n| n.starts_with(p));
     if !has("pack.mcmeta") && (has("manifest.json") || prism_instance(&names)) {
-        return Err(format!(
-            "{name} is a Java modpack: Sunrise doesn't import those."
+        return Err(trf(
+            "{name} is a Java modpack: Sunrise doesn't import those.",
+            &[("name", &name_of(file))],
         ));
     }
     if has("pack.mcmeta") {
@@ -107,8 +112,9 @@ pub fn what(file: &Path) -> Result<Dropped, String> {
     if is_build(file) {
         return Ok(Dropped::Build);
     }
-    Err(format!(
-        "{name} is neither a pack, a shared profile nor a game build: nothing in it that Sunrise reads."
+    Err(trf(
+        "{name} is neither a pack, a shared profile nor a game build: nothing in it that Sunrise reads.",
+        &[("name", &name_of(file))],
     ))
 }
 
@@ -148,7 +154,10 @@ pub fn import_into(
     create: &dyn Fn(&str) -> Result<Instance, String>,
 ) -> Result<Instance, String> {
     if what(file)? != Dropped::Instance {
-        return Err(format!("{} is not a shared profile.", name_of(file)));
+        return Err(trf(
+            "{name} is not a shared profile.",
+            &[("name", &name_of(file))],
+        ));
     }
     import_any(file, progress, create, MAX_IMPORT)
 }
@@ -172,7 +181,12 @@ fn import_any(
             n => format!("{base} ({n})"),
         })
         .find_map(|name| create(&name).ok())
-        .ok_or_else(|| format!("Could not make a profile called {base}."))?;
+        .ok_or_else(|| {
+            trf(
+                "Could not make a profile called {name}.",
+                &[("name", &base)],
+            )
+        })?;
     let home = instance.home.clone();
     let filled = fill(&mut zip, &home, progress, limit);
     if let Err(e) = filled {
@@ -218,7 +232,10 @@ fn fill(
                 &[("file", &name_of(&to)), ("limit", &size_text(limit))],
             ));
         }
-        progress(&format!("Copying {name}"), (i + 1) as f32 / count as f32);
+        progress(
+            &trf("Copying {name}", &[("name", &name)]),
+            (i + 1) as f32 / count as f32,
+        );
     }
     Ok(())
 }

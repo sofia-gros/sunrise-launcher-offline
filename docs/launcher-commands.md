@@ -796,7 +796,7 @@ Search for packs Sunrise loads, or the registry's mods and modpacks.
 - `TEXT`
 - `--kind` (mod, resource, modpack, shader, datapack)
 - `--everything`: Also what was made for other versions or runs only partly, each marked
-- `--source` (modrinth, sunrise)
+- `--source` (modrinth, sunrise): Where to search (default: Sunrise's registry for `--kind mod`, Modrinth otherwise)
 - `--instance`: The profile (default: the selected one)
 
 MCP: `mods_search`.
@@ -811,7 +811,7 @@ Install a pack or a Sunrise mod and what it needs into a profile, by its id or s
 - `--world`: Install the project's data pack into this world of the profile (its name or folder)
 - `--instance`: The profile (default: the selected one)
 - `--everything`: Allow a version made for another Minecraft version
-- `--source` (modrinth, sunrise)
+- `--source` (modrinth, sunrise): Where it comes from (default: Sunrise's registry when it lists the project, else Modrinth)
 
 MCP: `mods_install`.
 

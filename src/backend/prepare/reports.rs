@@ -453,7 +453,10 @@ pub(crate) fn preparer_staged(
     let minecraft = {
         let pins = read_json(&dir.join("research-lock.json"))
             .and_then(|lock| sources::Pins::read(&lock))
-            .ok_or("The version's research-lock.json doesn't pin the Minecraft files")?;
+            .ok_or_else(|| {
+                crate::i18n::tr("The version's research-lock.json doesn't pin the Minecraft files")
+                    .to_string()
+            })?;
         let own = data_dir().join("minecraft");
         let mut known = vec![("Sunrise's own download", own.clone())];
         known.extend(

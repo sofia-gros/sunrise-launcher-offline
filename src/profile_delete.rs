@@ -235,23 +235,34 @@ impl Launcher {
         let p = palette();
         let at = tokens::FRAME_INSET + crate::rail::rail_width(self.rail_open()) + 8.;
         let name = target.name.clone();
+        let item = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .reach()
+                .flex()
+                .items_center()
+                .h(px(tokens::FIELD))
+                .px(px(8.))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(p.hover)))
+                .child(label)
+        };
+        let edited = target.clone();
+        let edit = item("profile-menu-edit", tr("Edit profile…")).on_click(cx.listener(
+            move |this, _, _, cx| {
+                this.close_profile_action();
+                this.edit_profile(&edited, cx);
+            },
+        ));
         let target = target.clone();
-        let item = div()
-            .id("profile-menu-delete")
-            .reach()
-            .flex()
-            .items_center()
-            .h(px(tokens::FIELD))
-            .px(px(8.))
-            .cursor_pointer()
+        let delete = item("profile-menu-delete", tr("Delete profile…"))
             .text_color(rgb(p.danger))
-            .hover(|s| s.bg(rgb(p.hover)))
-            .child(tr("Delete profile…"))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.confirm_profile_delete(&target);
                 cx.notify();
             }));
-        let action_height = tokens::FIELD + 44.; // 26 for the title, 16 padding and 2 border.
+        // Two rows, 26 for the title, 16 padding and 2 border.
+        let action_height = 2. * tokens::FIELD + 44.;
         div()
             .id("profile-menu")
             .absolute()
@@ -309,7 +320,8 @@ impl Launcher {
                             .text_color(rgb(p.muted))
                             .child(name),
                     )
-                    .child(item),
+                    .child(edit)
+                    .child(delete),
             )
     }
 }

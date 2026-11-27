@@ -223,7 +223,12 @@ pub(super) fn find_in(all: &[Instance], query: &str) -> Result<Instance, String>
         .or_else(|| all.iter().find(|i| i.name.eq_ignore_ascii_case(q)))
         .or_else(|| all.iter().find(|i| bare(&i.id) == q))
         .cloned()
-        .ok_or_else(|| format!("No profile {q}: sunrise-launcher instance list shows them"))
+        .ok_or_else(|| {
+            crate::i18n::trf(
+                "No profile {query}: sunrise-launcher instance list shows them",
+                &[("query", q)],
+            )
+        })
 }
 
 /// Resolve headless Play without repairing unrelated profile metadata on a refused request.

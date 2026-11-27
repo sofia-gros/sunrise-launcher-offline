@@ -152,20 +152,24 @@ pub(super) fn set_up_problem(error: SetUpError) -> Problem {
     }
 }
 
-const NEEDS_VERSION: &str = "Install a Sunrise game build first, then prepare it.";
+const NEEDS_VERSION: &str =
+    crate::i18n::tr_key("Install a Sunrise game build first, then prepare it.");
 
 /// Creates a server: its folder, the world (a copy when asked), `init` and the settings, then adds it to
 /// the list. `tag` is the installed version whose programs and game files it uses when none are set up.
 pub fn create(spec: &NewServer, tag: Option<&str>, log: &dyn Fn(String)) -> Result<Entry, Problem> {
     if !spec.eula {
         return Err(Problem {
-            message: "Running a server needs your agreement to the Minecraft EULA.".into(),
+            message: tr("Running a server needs your agreement to the Minecraft EULA.").into(),
             fix: Some(Fix::AgreeEula),
         });
     }
     if program().is_none() || !game_files_ready() {
         let tag = tag.ok_or_else(|| Problem::plain(tr(NEEDS_VERSION)))?;
-        log(format!("Setting up the server programs from Sunrise {tag}"));
+        log(trf(
+            "Setting up the server programs from Sunrise {tag}",
+            &[("tag", tag)],
+        ));
         set_up(tag).map_err(set_up_problem)?;
     }
     let name = if spec.name.trim().is_empty() {
@@ -183,10 +187,16 @@ pub fn create(spec: &NewServer, tag: Option<&str>, log: &dyn Fn(String)) -> Resu
                 .file_name()
                 .map(|n| slug(&n.to_string_lossy()))
                 .unwrap_or_else(|| "world".into());
-            log(format!("Copying the world {}", from.display()));
+            log(trf(
+                "Copying the world {folder}",
+                &[("folder", &from.display().to_string())],
+            ));
             copy_world(from, &dir.join(&world)).map_err(|e| {
                 let _ = fs::remove_dir_all(&dir);
-                Problem::plain(format!("Couldn't copy the world: {e}"))
+                Problem::plain(trf(
+                    "Couldn't copy the world: {error}",
+                    &[("error", &e.to_string())],
+                ))
             })?;
             world
         }
@@ -199,7 +209,7 @@ pub fn create(spec: &NewServer, tag: Option<&str>, log: &dyn Fn(String)) -> Resu
         p
     };
     let init = init_args(spec, &world, port);
-    log("Writing the server's settings".into());
+    log(tr("Writing the server's settings").into());
     run(&dir, &init.iter().map(String::as_str).collect::<Vec<_>>()).map_err(undo)?;
     let settings = settings_args(spec, panel);
     run(

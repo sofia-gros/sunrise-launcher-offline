@@ -78,7 +78,8 @@ pub const PICTURE_SIDE: u32 = 128;
 /// Any image file's `bytes` as a picture: PNG, scaled down to fit [`PICTURE_SIDE`].
 pub fn picture(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
     crate::browser::images::fit_png(bytes, PICTURE_SIDE, 8192, 256 << 20).ok_or_else(|| {
-        "That file isn't a picture the launcher can read (PNG, JPEG, GIF, WebP).".into()
+        crate::i18n::tr("That file isn't a picture the launcher can read (PNG, JPEG, GIF, WebP).")
+            .into()
     })
 }
 

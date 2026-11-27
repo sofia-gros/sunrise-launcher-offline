@@ -417,8 +417,16 @@ impl Launcher {
     ) {
         self.mods_state.notice = None;
         self.mods.message = None;
+        // Signed out, an install can't start: rather than only a line on the page, the sign-in
+        // Play uses opens, and Install works once it is done.
+        let signs_in = kind == Kind::InstallV2
+            && self.accounts.selected().is_none()
+            && !sunrise_launcher::developer_offline::selected();
         if let Err(why) = self.queue_registry_change(kind, card.to_owned(), ids, displayed_names) {
             self.mods_state.notice = Some(Err(why));
+            if signs_in {
+                self.sign_in_to_play();
+            }
         }
     }
 

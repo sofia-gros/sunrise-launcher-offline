@@ -115,7 +115,7 @@ impl Launcher {
             running.progress = stage;
             running.eta.update(
                 crate::eta::install_stage_key(stage),
-                crate::mods_page::install::stage_fraction(stage),
+                crate::eta::stage_fraction(stage),
                 Instant::now(),
             );
         }
@@ -200,7 +200,7 @@ impl Launcher {
         &self,
         cx: &mut Context<Self>,
     ) -> Option<Stateful<Div>> {
-        use crate::mods_page::install::{stage_fraction, stage_label};
+        use crate::eta::{stage_fraction, stage_label};
         let running = self.ui.sheets.switching.provider.as_ref()?;
         let switch = &running.switch;
         let body = if let Some((preview, _)) = &running.question {

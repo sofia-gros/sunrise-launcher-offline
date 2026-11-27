@@ -33,6 +33,45 @@ impl V2Collection {
             .collect()
     }
 
+    /// Install's label for `count` members, and when it takes only some, a tooltip saying why
+    /// the rest wait, rather than a bare Install beside "1 of 4 mods fit build".
+    pub(in crate::mods) fn install_label(
+        &self,
+        cards: &[V2Card],
+        count: usize,
+        installed: &dyn Fn(&str) -> bool,
+    ) -> (String, Option<String>) {
+        let all = self.members.len();
+        let unfit = all - self.fitting(cards);
+        let optional = self
+            .members
+            .iter()
+            .filter(|&&(i, default)| !default && cards[i].fit.fits() && !installed(&cards[i].id))
+            .count();
+        let count = count.to_string();
+        let of = [("count", count.as_str()), ("all", &all.to_string())];
+        let why = match (unfit > 0, optional > 0) {
+            (true, false) => Some(trf(
+                "Installs {count} of its {all} mods: the rest don't fit this build yet.",
+                &of,
+            )),
+            (false, true) => Some(trf(
+                "Installs {count} of its {all} mods: the rest are optional. Open it to add them.",
+                &of,
+            )),
+            (true, true) => Some(trf(
+                "Installs {count} of its {all} mods: some don't fit this build yet and some are optional. Open it to choose.",
+                &of,
+            )),
+            (false, false) => None,
+        };
+        let label = match why {
+            Some(_) => trf("Install {count}", &[("count", &count)]),
+            None => tr("Install").to_owned(),
+        };
+        (label, why)
+    }
+
     /// What Install installs: the picked members that fit and aren't installed, in the
     /// collection's order. A member that doesn't fit the build is left out.
     pub(in crate::mods) fn to_install(

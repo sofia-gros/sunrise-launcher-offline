@@ -314,14 +314,16 @@ pub fn release_notes(tag: Option<&str>) -> Result<Release, String> {
     match tag {
         Some(tag) => release_selection::by_tag(&releases, tag)
             .cloned()
-            .ok_or_else(|| format!("No Sunrise release is tagged {tag}.")),
+            .ok_or_else(|| {
+                crate::i18n::trf("No Sunrise release is tagged {tag}.", &[("tag", tag)])
+            }),
         None => releases
             .into_iter()
             .find(|release| {
                 crate::instances::Channel::of_release(release)
                     != Some(crate::instances::Channel::Dev)
             })
-            .ok_or_else(|| "No release is published yet.".into()),
+            .ok_or_else(|| crate::i18n::tr("No release is published yet.").into()),
     }
 }
 
@@ -471,7 +473,7 @@ fn install_explicit_tag_from(
     let (candidates, target) = game_releases_candidates(list, settings);
     let mut release = release_selection::by_tag(&candidates, tag)
         .cloned()
-        .ok_or_else(|| format!("No Sunrise release is tagged {tag}."))?;
+        .ok_or_else(|| crate::i18n::trf("No Sunrise release is tagged {tag}.", &[("tag", tag)]))?;
     if let Some(target) = target {
         check_sdk_offer_strict(&mut release, target, base, keys)?;
     }
@@ -495,10 +497,13 @@ fn install_offered_tag(
             .following(releases)
             .builds(releases)
             .next()
-            .ok_or("No release has a build for this platform yet.")?
+            .ok_or_else(|| {
+                crate::i18n::tr("No release has a build for this platform yet.").to_string()
+            })?
     } else {
-        release_selection::by_tag(releases, tag)
-            .ok_or_else(|| format!("No Sunrise release is tagged {tag}."))?
+        release_selection::by_tag(releases, tag).ok_or_else(|| {
+            crate::i18n::trf("No Sunrise release is tagged {tag}.", &[("tag", tag)])
+        })?
     };
     install_selected_release(release, Some(releases), as_update, install)
 }
@@ -510,7 +515,10 @@ fn install_selected_release(
     install: impl FnOnce(&Release) -> Result<InstallOutcome, String>,
 ) -> Result<String, String> {
     if release.asset.is_none() {
-        return Err(format!("{} has no build for this platform.", release.tag));
+        return Err(crate::i18n::trf(
+            "{tag} has no build for this platform.",
+            &[("tag", &release.tag)],
+        ));
     }
     let before = installed();
     let outcome = install(release)?;

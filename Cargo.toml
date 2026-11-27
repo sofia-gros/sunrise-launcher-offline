@@ -7,8 +7,8 @@ description = "Downloads, prepares and starts Sunrise builds"
 
 [workspace]
 # The copies in crates/ are checked and tested with the launcher.
-members = ["crates/addresses", "crates/attestation", "crates/bench", "crates/friends", "crates/launcher-domain", "crates/smod", "crates/mcp", "crates/nbt", "crates/proxy", "crates/release-verify", "crates/resolver", "crates/sdk", "crates/shader-api", "crates/system", "crates/telemetry", "crates/theme"]
-default-members = [".", "crates/addresses", "crates/attestation", "crates/bench", "crates/friends", "crates/launcher-domain", "crates/smod", "crates/mcp", "crates/nbt", "crates/proxy", "crates/release-verify", "crates/resolver", "crates/sdk", "crates/shader-api", "crates/system", "crates/telemetry", "crates/theme"]
+members = ["crates/addresses", "crates/attestation", "crates/bench", "crates/friends", "crates/jar-fetch", "crates/launcher-domain", "crates/launcher-paths", "crates/smod", "crates/mcp", "crates/nbt", "crates/proxy", "crates/release-verify", "crates/resolver", "crates/sdk", "crates/shader-api", "crates/system", "crates/telemetry", "crates/theme"]
+default-members = [".", "crates/addresses", "crates/attestation", "crates/bench", "crates/friends", "crates/jar-fetch", "crates/launcher-domain", "crates/launcher-paths", "crates/smod", "crates/mcp", "crates/nbt", "crates/proxy", "crates/release-verify", "crates/resolver", "crates/sdk", "crates/shader-api", "crates/system", "crates/telemetry", "crates/theme"]
 
 [[test]]
 name = "managed_play_process"
@@ -58,8 +58,10 @@ sunrise-launcher-bench = { path = "crates/bench" }
 sunrise-launcher-friends = { path = "crates/friends" }
 sunrise-launcher-smod = { path = "crates/smod" }
 sunrise-launcher-domain = { path = "crates/launcher-domain" }
+sunrise-launcher-paths = { path = "crates/launcher-paths" }
 sunrise-launcher-mcp = { path = "crates/mcp" }
 sunrise-launcher-nbt = { path = "crates/nbt" }
+sunrise-launcher-jar-fetch = { path = "crates/jar-fetch" }
 sunrise-launcher-proxy = { path = "crates/proxy" }
 sunrise-launcher-release-verify = { path = "crates/release-verify" }
 sunrise-launcher-resolver = { path = "crates/resolver" }

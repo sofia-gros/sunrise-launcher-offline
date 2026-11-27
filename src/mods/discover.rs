@@ -674,8 +674,11 @@ impl Launcher {
                         .into_any_element()
                 }
                 None => {
+                    let (label, why) =
+                        collection.install_label(cards, to_install.len(), &is_installed);
                     let (card, ids) = (id.clone(), to_install);
-                    button(("alt-collection-add", n), tr("Install"))
+                    button(("alt-collection-add", n), label)
+                        .when_some(why, |d, why| d.tooltip(crate::glass_ui::tip(why)))
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             cx.stop_propagation();
                             this.add_v2_collection(&card, ids.clone());

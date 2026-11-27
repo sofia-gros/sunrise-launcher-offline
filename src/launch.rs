@@ -251,12 +251,13 @@ fn valid_key(key: &str) -> bool {
 pub fn parse_env(text: &str) -> Result<BTreeMap<String, String>, String> {
     let mut env = BTreeMap::new();
     for word in split_args(text) {
-        let (key, value) = word
-            .split_once('=')
-            .ok_or_else(|| format!("{word}: write it as NAME=value"))?;
+        let (key, value) = word.split_once('=').ok_or_else(|| {
+            crate::i18n::trf("{word}: write it as NAME=value", &[("word", &word)])
+        })?;
         if !valid_key(key) {
-            return Err(format!(
-                "{key}: a variable's name is letters, digits and _, not starting with a digit"
+            return Err(crate::i18n::trf(
+                "{key}: a variable's name is letters, digits and _, not starting with a digit",
+                &[("key", key)],
             ));
         }
         env.insert(key.to_string(), value.to_string());
@@ -424,18 +425,27 @@ fn hook_command(line: &str, game: &Command) -> Command {
 
 /// Runs the pre-launch `line` on the legacy path. Include the end of its output in a refusal.
 fn run_first(line: &str, game: &Command) -> Result<(), String> {
-    let out = hook_command(line, game)
-        .output()
-        .map_err(|e| format!("The pre-launch command didn't run: {e}"))?;
+    let out = hook_command(line, game).output().map_err(|e| {
+        crate::i18n::trf(
+            "The pre-launch command didn't run: {error}",
+            &[("error", &e.to_string())],
+        )
+    })?;
     if out.status.success() {
         return Ok(());
     }
     let printed = String::from_utf8_lossy(&[out.stdout, out.stderr].concat()).into_owned();
     let lines: Vec<&str> = printed.trim().lines().collect();
     let code = out.status.code().unwrap_or(-1);
-    Err(format!(
-        "The pre-launch command failed (exit {code}), so the game did not start.\n{}",
-        lines[lines.len().saturating_sub(20)..].join("\n")
+    Err(crate::i18n::trf(
+        "The pre-launch command failed (exit {code}), so the game did not start.\n{output}",
+        &[
+            ("code", &code.to_string()),
+            (
+                "output",
+                &lines[lines.len().saturating_sub(20)..].join("\n"),
+            ),
+        ],
     )
     .trim_end()
     .to_owned())

@@ -1,5 +1,4 @@
 //! Resolve a mod set's passive Java jars before a launcher-managed launch.
-mod download;
 mod launch;
 use crate::browser::installed::Installed;
 use crate::i18n::{tr, trf};
@@ -9,7 +8,51 @@ use std::{
     fmt, fs, io,
     path::{Path, PathBuf},
 };
+use sunrise_launcher_jar_fetch::{Http, Modrinth};
 use sunrise_launcher_smod::manifest::{JarRef, JarRequirement, MissingJar};
+use ureq::OrAnyStatus;
+
+/// Where jars are found and downloaded from: Modrinth's API, and only its CDN.
+const MODRINTH: Modrinth<'static> = Modrinth {
+    api: crate::browser::modrinth::API,
+    cdn_host: "cdn.modrinth.com",
+};
+
+/// `sunrise-launcher-jar-fetch`'s transport: the launcher's proxy settings, and no hop off the
+/// requested `https` host.
+struct Transport;
+
+impl Http for Transport {
+    fn get(&self, url: &str) -> Result<Option<Box<dyn io::Read>>, String> {
+        // The CDN host check lives in sunrise_launcher_jar_fetch::download; this host list only
+        // blocks redirects to another host.
+        let host = url::Url::parse(url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .ok_or_else(|| format!("{url}: no host"))?;
+        Ok(crate::net::get_from_hosts(url, &[&host])?
+            .map(|response| -> Box<dyn io::Read> { response.into_reader() }))
+    }
+
+    fn post_json(&self, url: &str, body: &str) -> Result<Box<dyn io::Read>, String> {
+        let response =
+            crate::proxy::agent("jar-version-files", url, |builder| builder.redirects(0))?
+                .post(url)
+                .set("User-Agent", crate::proxy::USER_AGENT)
+                .set("Content-Type", "application/json")
+                .send_string(body)
+                .or_any_status()
+                .map_err(|e| format!("{url}: {}", e.kind()))?;
+        let status = response.status();
+        if status >= 300 {
+            return Err(trf(
+                "{url}: HTTP {status}",
+                &[("url", url), ("status", &status.to_string())],
+            ));
+        }
+        Ok(response.into_reader())
+    }
+}
 
 /// Download consent for this mod set, never a permission to execute Java code. It decides only
 /// jars that no installed Sunrise registry mod lists: those are fetched without asking.
@@ -137,29 +180,44 @@ pub fn prepare(
         jars,
         registry_mods,
         permission,
-        download::jar_urls,
-        download::download_jar,
+        |missing| {
+            let hashes: Vec<&str> = missing.iter().map(|jar| jar.sha512()).collect();
+            sunrise_launcher_jar_fetch::file_urls(&Transport, MODRINTH, &hashes)
+        },
+        |url, jar, dest| {
+            sunrise_launcher_jar_fetch::download(&Transport, MODRINTH, url, jar.sha512(), dest)
+        },
     )
+}
+
+fn jar_owners(jars: &[JarRequirement]) -> BTreeSet<String> {
+    jars.iter()
+        .flat_map(|requirement| requirement.owners.iter().cloned())
+        .collect()
 }
 
 /// Fetches every jar of `jars` into the cache for an install or update of registry mods, which
 /// asks nothing: each listing mod is a reviewed registry release. A jar Modrinth no longer has
 /// fails with [`PrepareError::NoLongerOnModrinth`].
 pub fn fetch_listed(home: &Path, jars: &[JarRequirement]) -> Result<(), PrepareError> {
-    fetch_listed_with(home, jars, download::jar_urls, download::download_jar)
+    prepare(home, jars, &jar_owners(jars), Permission::Refuse)
 }
 
+#[cfg(test)]
 fn fetch_listed_with(
     home: &Path,
     jars: &[JarRequirement],
     lookup: impl FnMut(&[&JarRef]) -> Result<BTreeMap<String, String>, String>,
     download: impl FnMut(&str, &JarRef, &Path) -> Result<(), String>,
 ) -> Result<(), PrepareError> {
-    let owners: BTreeSet<String> = jars
-        .iter()
-        .flat_map(|requirement| requirement.owners.iter().cloned())
-        .collect();
-    prepare_with(home, jars, &owners, Permission::Refuse, lookup, download)
+    prepare_with(
+        home,
+        jars,
+        &jar_owners(jars),
+        Permission::Refuse,
+        lookup,
+        download,
+    )
 }
 
 /// Prepares `jars` like [`prepare`], then copies each into `to`'s own `jars` folder: the home a
@@ -171,27 +229,11 @@ pub fn export(
     registry_mods: &BTreeSet<String>,
     permission: Permission<'_>,
 ) -> Result<(), PrepareError> {
-    export_with(
-        home,
-        to,
-        jars,
-        registry_mods,
-        permission,
-        download::jar_urls,
-        download::download_jar,
-    )
+    prepare(home, jars, registry_mods, permission)?;
+    copy_exported(home, to, jars)
 }
 
-fn export_with(
-    home: &Path,
-    to: &Path,
-    jars: &[JarRequirement],
-    registry_mods: &BTreeSet<String>,
-    permission: Permission<'_>,
-    lookup: impl FnMut(&[&JarRef]) -> Result<BTreeMap<String, String>, String>,
-    download: impl FnMut(&str, &JarRef, &Path) -> Result<(), String>,
-) -> Result<(), PrepareError> {
-    prepare_with(home, jars, registry_mods, permission, lookup, download)?;
+fn copy_exported(home: &Path, to: &Path, jars: &[JarRequirement]) -> Result<(), PrepareError> {
     if jars.is_empty() {
         return Ok(());
     }
@@ -206,6 +248,20 @@ fn export_with(
             .map_err(|source| PrepareError::Io { path, source })?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn export_with(
+    home: &Path,
+    to: &Path,
+    jars: &[JarRequirement],
+    registry_mods: &BTreeSet<String>,
+    permission: Permission<'_>,
+    lookup: impl FnMut(&[&JarRef]) -> Result<BTreeMap<String, String>, String>,
+    download: impl FnMut(&str, &JarRef, &Path) -> Result<(), String>,
+) -> Result<(), PrepareError> {
+    prepare_with(home, jars, registry_mods, permission, lookup, download)?;
+    copy_exported(home, to, jars)
 }
 
 /// Deletes from the cache each jar in `removed` that no jar in `kept` names. A cache file that
@@ -240,12 +296,11 @@ fn prepare_with(
         match fs::File::open(&path) {
             Ok(file) => {
                 let hash =
-                    download::hash_reader::<sha2::Sha512>(file, io::sink()).map_err(|source| {
-                        PrepareError::Io {
+                    sunrise_launcher_jar_fetch::hash_reader::<sha2::Sha512>(file, io::sink())
+                        .map_err(|source| PrepareError::Io {
                             path: path.clone(),
                             source,
-                        }
-                    })?;
+                        })?;
                 let actual = format!("{hash:x}");
                 if actual != jar.sha512() {
                     return Err(PrepareError::HashMismatch {

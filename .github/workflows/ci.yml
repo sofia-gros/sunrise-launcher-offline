@@ -215,7 +215,7 @@ jobs:
       - name: Release tools
         if: runner.os == 'Linux'
         # test_game_copies needs the pinned Sunrise checkout and runs in `format`, which fetches it.
-        run: python3 -m unittest tools/tests/test_release_notes.py tools/tests/test_game_copies_issue.py tools/tests/test_rerun_unacquired.py
+        run: python3 -m unittest tools/tests/test_release_notes.py tools/tests/test_game_copies_issue.py tools/tests/test_rerun_unacquired.py tools/tests/test_launcher_add_lang_keys.py
 
   # A real native mod build on Windows in the launcher's default home (%APPDATA%\sunrise\launcher), under a user name of 11
   # letters: the depth a player's build reaches, which Windows' 260-character path limit cuts short.

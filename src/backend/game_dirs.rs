@@ -29,7 +29,12 @@ pub fn no_ai() -> bool {
 
 /// Turns No AI on or off for the launcher and the game.
 pub fn set_no_ai(on: bool) -> Result<(), String> {
-    crate::no_ai::set(&game_home(), on).map_err(|e| format!("Could not save No AI: {e}"))
+    crate::no_ai::set(&game_home(), on).map_err(|e| {
+        crate::i18n::trf(
+            "Could not save No AI: {error}",
+            &[("error", &e.to_string())],
+        )
+    })
 }
 
 // ----- Logs and crash reports ---------------------------------------------------------------------
@@ -176,8 +181,12 @@ pub(super) fn tail_of(file: &Path, lines: usize) -> Result<String, String> {
 /// read comes first.
 pub fn read_logs(lines: usize, crash: bool) -> Result<(PathBuf, String), String> {
     if crash {
-        let path = newest_crash_report()
-            .ok_or_else(|| format!("No crash report in {}.", crash_reports_dir().display()))?;
+        let path = newest_crash_report().ok_or_else(|| {
+            crate::i18n::trf(
+                "No crash report in {path}.",
+                &[("path", &crash_reports_dir().display().to_string())],
+            )
+        })?;
         let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         return Ok((path, text));
     }

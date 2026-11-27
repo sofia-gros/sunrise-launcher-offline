@@ -150,7 +150,11 @@ the long version, and the CI ratchet (`tools/ci/structure_check.py`) enforces th
 ## Project specifics
 
 - **User-facing text** goes through `tr("…")` / `trf("…", &[…])`, never a bare string. Add new
-  keys to every catalog in `lang/` with `tools/launcher_add_lang_keys.py "Your string"`.
+  keys to `lang/en.json` with `tools/launcher_add_lang_keys.py "Your string"` (the other
+  catalogs hold only translations, which come through Crowdin). Change a key's English with
+  `--rename OLD NEW` so its translations move with it. A label that reaches `tr` later, through a
+  constant, a field, an array or a variable, is written `tr_key("…")` where it's defined, so
+  the completeness test (`i18n::tests::the_english_catalog_lists_every_key`) sees it.
 - **The window, CLI and MCP server share one core**, `src/backend.rs` and `src/backend/`. A
   behaviour change there affects all three, so check the CLI (`--json`) too.
 - **Copies of game files:** when a change brings in a game change, update

@@ -165,10 +165,10 @@ impl PrepareStep {
 
     pub fn name(self) -> &'static str {
         match self {
-            Self::Files => "Game files",
-            Self::Java => "Java",
-            Self::Sounds => "Sounds",
-            Self::Prepare => "Prepare",
+            Self::Files => crate::i18n::tr_key("Game files"),
+            Self::Java => crate::i18n::tr_key("Java"),
+            Self::Sounds => crate::i18n::tr_key("Sounds"),
+            Self::Prepare => crate::i18n::tr_key("Prepare"),
         }
     }
 }

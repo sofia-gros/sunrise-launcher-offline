@@ -159,13 +159,13 @@ pub(super) fn create_with_publish(
 ) -> Result<Instance, String> {
     let name = name.trim();
     if name.is_empty() {
-        return Err("A profile needs a name.".into());
+        return Err(crate::i18n::tr("A profile needs a name.").into());
     }
     let from = copy.map(CopyFrom::instance);
     if let Some(from) = from.filter(|f| f.kind == Kind::Pack) {
-        return Err(format!(
-            "{} plays its pack's mods: import the pack again for a second copy.",
-            from.name
+        return Err(crate::i18n::trf(
+            "{name} plays its pack's mods: import the pack again for a second copy.",
+            &[("name", &from.name)],
         ));
     }
     let create_error = |e: std::io::Error| {
@@ -302,9 +302,9 @@ pub(super) fn creation_parent(root: &Path, name: &str) -> std::io::Result<PathBu
     if !meta.is_dir() || crate::native_cache::linked(&meta) || path.canonicalize()? != path {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!(
-                "{} is not a directory inside the game folder",
-                path.display()
+            crate::i18n::trf(
+                "{path} is not a directory inside the game folder",
+                &[("path", &path.display().to_string())],
             ),
         ));
     }

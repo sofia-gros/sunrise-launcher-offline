@@ -75,7 +75,13 @@ pub fn hand_over(staged: &Staged, restart: bool) -> Result<(), String> {
     }
     let mut child = cmd.spawn().map_err(|e| {
         backend::remove_stage(&backend::update_work_dir(), &staged.payload);
-        format!("Could not start {}: {e}", installer.display())
+        crate::i18n::trf(
+            "Could not start {path}: {error}",
+            &[
+                ("path", &installer.display().to_string()),
+                ("error", &e.to_string()),
+            ],
+        )
     })?;
     // The pipe's other end stays open until this process exits: the installer's sign to go on.
     std::mem::forget(child.stdin.take());

@@ -317,19 +317,29 @@ pub fn find(dir: &Path, pins: &Pins) -> Result<Found, String> {
         .map(|base| base.join(format!("versions/{v}/{v}.json")))
         .find(|file| file.is_file());
     Err(match (other, listed) {
-        (Some(jar), _) => format!(
-            "{} is not the {v} release Sunrise was made for",
-            jar.strip_prefix(dir).unwrap_or(&jar).display()
+        (Some(jar), _) => trf(
+            "{file} is not the {version} release Sunrise was made for",
+            &[
+                ("file", &jar.strip_prefix(dir).unwrap_or(&jar).display().to_string()),
+                ("version", v),
+            ],
         ),
-        (None, Some(file)) => format!(
-            "{} is here but not the game itself: play {v} once in that launcher to download it",
-            // `meta\versions/…` on Windows otherwise: one separator, as the jar paths above.
-            file.strip_prefix(dir)
-                .unwrap_or(&file)
-                .to_string_lossy()
-                .replace('\\', "/")
+        (None, Some(file)) => trf(
+            "{file} is here but not the game itself: play {version} once in that launcher to download it",
+            &[
+                // `meta\versions/…` on Windows otherwise: one separator, as the jar paths above.
+                (
+                    "file",
+                    &file
+                        .strip_prefix(dir)
+                        .unwrap_or(&file)
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                ),
+                ("version", v),
+            ],
         ),
-        (None, None) => format!("no Minecraft {v} client jar"),
+        (None, None) => trf("no Minecraft {version} client jar", &[("version", v)]),
     })
 }
 
@@ -338,7 +348,10 @@ pub fn find(dir: &Path, pins: &Pins) -> Result<Found, String> {
 /// launcher Sunrise knows, the advice names it: a Prism or MultiMC instance downloads the game
 /// only when it is launched once.
 pub fn not_found(version: &str, checked: &[(PathBuf, String)], chosen: &Path) -> String {
-    let mut text = format!("Minecraft {version} was not found. Sunrise looked in:");
+    let mut text = trf(
+        "Minecraft {version} was not found. Sunrise looked in:",
+        &[("version", version)],
+    );
     for (dir, missing) in checked {
         text += &format!("\n  {} ({missing})", dir.display());
     }
@@ -350,7 +363,7 @@ pub fn not_found(version: &str, checked: &[(PathBuf, String)], chosen: &Path) ->
         text += "\n";
         text += &missing_version_file(&manifest);
     }
-    text += "\nTo fix it:\n  • ";
+    text += tr("\nTo fix it:\n  • ");
     text += &match launcher_of(chosen) {
         Some(launcher) => trf(
             "Play {version} once in {launcher} so it downloads the game, then prepare again.",
@@ -438,10 +451,13 @@ pub fn resolve(
     let Some((name, found)) = found else {
         return Ok(Resolved::NotFound(checked));
     };
-    log(format!(
-        "Using Minecraft {} from {name} ({})",
-        pins.version,
-        found.base.display()
+    log(trf(
+        "Using Minecraft {version} from {name} ({folder})",
+        &[
+            ("version", &pins.version),
+            ("name", name),
+            ("folder", &found.base.display().to_string()),
+        ],
     ));
     if found.official_layout(&pins.version) {
         return Ok(Resolved::Folder(found.base));
@@ -461,10 +477,17 @@ pub(crate) fn fetch_manifest(
         return Ok(());
     }
     let (v, sha1) = (&pins.version, &pins.manifests[0]);
-    log(format!("Downloading the {v} version file from Mojang"));
+    log(trf(
+        "Downloading the {version} version file from Mojang",
+        &[("version", v)],
+    ));
     let url = format!("https://piston-meta.mojang.com/v1/packages/{sha1}/{v}.json");
-    let body =
-        fetch_checked(fetch, &url, sha1).map_err(|e| format!("Mojang's {v} version file {e}"))?;
+    let body = fetch_checked(fetch, &url, sha1).map_err(|e| {
+        trf(
+            "Mojang's {version} version file {error}",
+            &[("version", v), ("error", &e.to_string())],
+        )
+    })?;
     write_file(path, &body)
 }
 
@@ -480,7 +503,12 @@ pub(crate) fn fetch_checked(fetch: Fetch, url: &str, sha1: &str) -> Result<Vec<u
 /// Writes a file whole: a partial one never takes its place.
 pub(crate) fn write_file(path: &Path, data: &[u8]) -> Result<(), String> {
     let error = |e: std::io::Error| format!("{}: {e}", path.display());
-    let not_a_file = || format!("{}: not a file path", path.display());
+    let not_a_file = || {
+        trf(
+            "{path}: not a file path",
+            &[("path", &path.display().to_string())],
+        )
+    };
     let (folder, name) = path.parent().zip(path.file_name()).ok_or_else(not_a_file)?;
     fs::create_dir_all(folder).map_err(error)?;
     let partial = path.with_file_name(format!("{}.partial", name.to_string_lossy()));

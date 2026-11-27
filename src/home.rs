@@ -391,7 +391,6 @@ impl Launcher {
                 },
             ]
         };
-        let signed_out = view.main == Main::SignIn;
         let play = crate::frame::input(false)
             .id("alt-play")
             .flex_none()
@@ -404,20 +403,11 @@ impl Launcher {
             .font_weight(FontWeight::BOLD)
             .text_size(px(tokens::LEAD))
             .text_color(on)
-            // Signed out: plainly disabled, a muted fill with no glow.
             // The glass edge every control has, lighter on the accent so it shows.
-            .when(!signed_out, |d| {
-                d.bg(p.play_gradient())
-                    .border_color(gpui::white().opacity(0.18))
-                    .shadow(glow(false))
-            })
-            .when(signed_out, |d| {
-                d.bg(rgb(p.hover))
-                    .text_color(rgb(p.muted))
-                    .opacity(0.8)
-                    .cursor_default()
-            })
-            // Nothing is added to the page: the reason is only a tooltip on the disabled Play.
+            .bg(p.play_gradient())
+            .border_color(gpui::white().opacity(0.18))
+            .shadow(glow(false))
+            // Nothing is added to the page: signed out, the tooltip says Play signs in first.
             .when_some(view.main.tooltip(), |d, text| {
                 d.tooltip(crate::glass_ui::tip(text))
             })

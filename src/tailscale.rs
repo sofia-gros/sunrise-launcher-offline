@@ -6,6 +6,7 @@
 //! or page, and the access token is one the player makes in the admin console and pastes here (it is
 //! kept in the system keychain). `SUNRISE_LAUNCHER_TAILSCALE` (the CLI) and `SUNRISE_TAILSCALE_API` (the
 //! API's address) point the tests at stand-ins.
+use crate::i18n::{tr, trf};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::process::Command;
@@ -175,8 +176,11 @@ pub fn parse_status(v: &Value) -> State {
                 .filter(|u| u.starts_with("https://"))
                 .map(str::to_string),
         },
-        "Stopped" => State::Off("Tailscale is switched off.".into()),
-        other => State::Off(format!("Tailscale is {}.", other.to_lowercase())),
+        "Stopped" => State::Off(tr("Tailscale is switched off.").into()),
+        other => State::Off(trf(
+            "Tailscale is {state}.",
+            &[("state", &other.to_lowercase())],
+        )),
     }
 }
 
@@ -187,14 +191,15 @@ pub fn open_app() -> Result<(), String> {
     } else if cfg!(windows) {
         Command::new(r"C:\Program Files\Tailscale\tailscale-ipn.exe").status()
     } else {
-        return Err(format!(
-            "Run `{LINUX_LOGIN}` in a terminal and open the link it prints."
+        return Err(trf(
+            "Run `{command}` in a terminal and open the link it prints.",
+            &[("command", LINUX_LOGIN)],
         ));
     };
     match result {
         Ok(s) if s.success() => Ok(()),
         Ok(_) | Err(_) => {
-            Err("Tailscale's app didn't open: start it from your applications.".into())
+            Err(tr("Tailscale's app didn't open: start it from your applications.").into())
         }
     }
 }

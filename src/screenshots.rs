@@ -50,13 +50,25 @@ pub fn find(home: &Path, query: &str) -> Result<Shot, String> {
     list(home)
         .into_iter()
         .find(|s| s.name == query || Path::new(&s.name).file_stem().is_some_and(|n| n == query))
-        .ok_or_else(|| format!("No screenshot {query} in {}", folder(home).display()))
+        .ok_or_else(|| {
+            crate::i18n::trf(
+                "No screenshot {query} in {path}",
+                &[
+                    ("query", query),
+                    ("path", &folder(home).display().to_string()),
+                ],
+            )
+        })
 }
 
 /// Moves the screenshot to the system's trash.
 pub fn delete(shot: &Shot) -> Result<(), String> {
-    crate::desktop_seams::to_trash(&shot.path)
-        .map_err(|e| format!("Could not move {} to the trash: {e}", shot.name))
+    crate::desktop_seams::to_trash(&shot.path).map_err(|e| {
+        crate::i18n::trf(
+            "Could not move {name} to the trash: {error}",
+            &[("name", &shot.name), ("error", &e)],
+        )
+    })
 }
 
 #[cfg(test)]

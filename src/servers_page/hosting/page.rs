@@ -526,7 +526,9 @@ impl Launcher {
                 tr("Back up now"),
                 idle,
                 cx,
-                |this, _| this.server_command("Backing up", vec!["backup".into()]),
+                |this, _| {
+                    this.server_command(crate::i18n::tr_key("Backing up"), vec!["backup".into()])
+                },
             ))),
         );
         if self.older_sunrise() {
@@ -583,10 +585,11 @@ impl Launcher {
                     this.servers.confirm_restore = None;
                     if let Some(dir) = this.servers.open.clone() {
                         let (name, restored) = (name.clone(), restored.clone());
-                        this.servers.start_job("Restoring", move |log| {
-                            servers::run_streamed(&dir, &["restore", &name, "--yes"], log)
-                                .map(|_| restored)
-                        });
+                        this.servers
+                            .start_job(crate::i18n::tr_key("Restoring"), move |log| {
+                                servers::run_streamed(&dir, &["restore", &name, "--yes"], log)
+                                    .map(|_| restored)
+                            });
                     }
                 },
             );

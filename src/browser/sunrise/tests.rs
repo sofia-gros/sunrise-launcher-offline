@@ -116,17 +116,20 @@ fn play_waits_for_a_writer_before_the_journal_is_visible_and_unlocks_before_fetc
     thread::scope(|scope| {
         let (enter, entering) = mpsc::channel();
         let (done, completion) = mpsc::channel();
+        let (released, release) = mpsc::channel();
         let index = Arc::new(registry.clone());
         scope.spawn(move || {
             enter.send(()).unwrap();
             let result = check_before_play(home, &[], || {
-                assert!(
-                    thread::scope(|scope| scope
-                        .spawn(|| { crate::browser::try_lock_home(home).is_some() })
-                        .join()
-                        .unwrap()),
-                    "Play must not hold the browser lock during a fetch"
-                );
+                // A blocking lock returns only once Play has let go. The wait for it is bounded
+                // so a Play that still held the lock fails here, and then lets go as it unwinds.
+                scope.spawn(move || {
+                    drop(crate::browser::lock_home(home).unwrap());
+                    released.send(()).unwrap();
+                });
+                release
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("Play must not hold the browser lock during a fetch");
                 Some(index)
             });
             done.send(result).unwrap();

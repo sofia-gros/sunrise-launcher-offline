@@ -348,9 +348,9 @@ pub fn make_in(
         }
     }
     if path.exists() && !plays(&path, id) {
-        return Err(format!(
-            "{} is already on the desktop, and isn't this profile's shortcut.",
-            path.file_name().unwrap().to_string_lossy()
+        return Err(crate::i18n::trf(
+            "{name} is already on the desktop, and isn't this profile's shortcut.",
+            &[("name", &path.file_name().unwrap().to_string_lossy())],
         ));
     }
     let mut made = vec![path.clone()];
@@ -423,7 +423,7 @@ fn menu() -> Option<PathBuf> {
 }
 
 fn desktop_or_err() -> Result<PathBuf, String> {
-    desktop_dir().ok_or_else(|| "This computer has no desktop folder.".into())
+    desktop_dir().ok_or_else(|| crate::i18n::tr("This computer has no desktop folder.").into())
 }
 
 /// Makes the shortcut on this computer's desktop that plays `id`, starting `exe`.

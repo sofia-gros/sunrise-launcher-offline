@@ -9,6 +9,8 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use crate::i18n::{tr, trf};
+
 /// Hosts images may come from.
 const HOSTS: [&str; 4] = [
     "https://cdn.modrinth.com/",
@@ -38,10 +40,12 @@ fn dir(home: &Path) -> PathBuf {
 /// Why `url` is never fetched.
 pub fn refuse(url: &str) -> Option<&'static str> {
     if !HOSTS.iter().any(|h| url.starts_with(h)) {
-        return Some("not on Modrinth's or Sunrise's image servers over HTTPS");
+        return Some(tr(
+            "not on Modrinth's or Sunrise's image servers over HTTPS",
+        ));
     }
     if url.len() > 2048 || url.contains(char::is_whitespace) {
-        return Some("not a plain URL");
+        return Some(tr("not a plain URL"));
     }
     None
 }
@@ -119,7 +123,10 @@ pub fn fetch(home: &Path, url: &str, size: u32) -> Result<PathBuf, String> {
         .read_to_end(&mut bytes)
         .map_err(|e| format!("{url}: {e}"))?;
     if bytes.len() as u64 > MAX_DOWNLOAD {
-        return Err(format!("{url}: larger than {} MB", MAX_DOWNLOAD >> 20));
+        return Err(trf(
+            "{url}: larger than {size} MB",
+            &[("url", url), ("size", &(MAX_DOWNLOAD >> 20).to_string())],
+        ));
     }
     let stored = store(home, url, size, &bytes)?;
     let _ = fs::write(validators(&stored), tags);
@@ -191,9 +198,12 @@ pub fn store_v2(
     bytes: &[u8],
 ) -> Result<PathBuf, String> {
     if bytes.len() as u64 > MAX_V2_IMAGE {
-        return Err(format!(
-            "{relative_path}: larger than {} MB",
-            MAX_V2_IMAGE >> 20
+        return Err(trf(
+            "{path}: larger than {size} MB",
+            &[
+                ("path", relative_path),
+                ("size", &(MAX_V2_IMAGE >> 20).to_string()),
+            ],
         ));
     }
     sunrise_launcher_smod::index_v2::verify_image_bytes(project_id, relative_path, bytes)?;
@@ -268,18 +278,25 @@ fn read_v2_bytes(index_location: &str, relative_path: &str) -> Result<Vec<u8>, S
             .read_to_end(&mut bytes)
             .map_err(|e| format!("{url}: {e}"))?;
         if bytes.len() as u64 > MAX_V2_IMAGE {
-            return Err(format!("{url}: larger than {} MB", MAX_V2_IMAGE >> 20));
+            return Err(trf(
+                "{url}: larger than {size} MB",
+                &[("url", &url), ("size", &(MAX_V2_IMAGE >> 20).to_string())],
+            ));
         }
         return Ok(bytes);
     }
     if index_location.contains("://") {
-        return Err(format!(
-            "{index_location}: v2 images require an https:// index or local file path"
+        return Err(trf(
+            "{index_location}: v2 images require an https:// index or local file path",
+            &[("index_location", index_location)],
         ));
     }
-    let base = Path::new(index_location)
-        .parent()
-        .ok_or_else(|| format!("{index_location}: index path has no parent directory"))?;
+    let base = Path::new(index_location).parent().ok_or_else(|| {
+        trf(
+            "{index_location}: index path has no parent directory",
+            &[("index_location", index_location)],
+        )
+    })?;
     let file = base.join(relative_path);
     let mut bytes = Vec::new();
     fs::File::open(&file)
@@ -288,10 +305,12 @@ fn read_v2_bytes(index_location: &str, relative_path: &str) -> Result<Vec<u8>, S
         .read_to_end(&mut bytes)
         .map_err(|e| format!("{}: {e}", file.display()))?;
     if bytes.len() as u64 > MAX_V2_IMAGE {
-        return Err(format!(
-            "{}: larger than {} MB",
-            file.display(),
-            MAX_V2_IMAGE >> 20
+        return Err(trf(
+            "{file}: larger than {size} MB",
+            &[
+                ("file", &file.display().to_string()),
+                ("size", &(MAX_V2_IMAGE >> 20).to_string()),
+            ],
         ));
     }
     Ok(bytes)

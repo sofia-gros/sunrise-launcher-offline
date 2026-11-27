@@ -1,0 +1,20 @@
+# Crowdin sync for the launcher's catalogs (docs/architecture.md, "Translations").
+# lang/en.json is the source and lists every key; each translation file holds only what has
+# been translated, so untranslated strings fall back to the English key at runtime.
+files:
+  - source: /lang/en.json
+    translation: /lang/%two_letters_code%.json
+    # Keep the catalogs sparse: an exported untranslated string would read as a finished
+    # translation that merely repeats the English. Crowdin's default fills untranslated entries
+    # with the source text, and its GitHub integration may not honour this per-file option, so
+    # "Skip untranslated strings" must also be on in the project's Settings > Export. Check the
+    # first export PR: an untranslated key must be missing from lang/<code>.json, not English.
+    skip_untranslated_strings: true
+    languages_mapping:
+      two_letters_code:
+        # Crowdin gives both Portuguese variants "pt"; the launcher's Brazilian table is pt-br.
+        pt-BR: pt-br
+        # Custom languages in the Crowdin project (Crowdin's list has neither); named here so
+        # their files don't depend on what Crowdin takes as a custom language's two-letter code.
+        lmo: lmo
+        szl: szl

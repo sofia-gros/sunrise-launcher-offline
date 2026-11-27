@@ -185,16 +185,20 @@ impl Downloader {
                             .and_then(|v| v.to_str().ok())
                             != Some(expected.as_str())
                     {
-                        return Err(Failure::range(
+                        return Err(Failure::range(crate::i18n::tr(
                             "Server ignored or changed the requested byte range",
-                        ));
+                        )));
                     }
                 } else if response.status() != StatusCode::OK {
-                    return Err(Failure::range("Unexpected partial response"));
+                    return Err(Failure::range(crate::i18n::tr(
+                        "Unexpected partial response",
+                    )));
                 }
                 let tag = strong_etag(response);
                 if validator.as_ref().is_some_and(|v| tag.as_ref() != Some(v)) {
-                    return Err(Failure::range("Resource changed during transfer"));
+                    return Err(Failure::range(crate::i18n::tr(
+                        "Resource changed during transfer",
+                    )));
                 }
                 if validator.is_none() {
                     validator = tag;
@@ -208,7 +212,9 @@ impl Downloader {
                     .zip(response.content_length())
                     .is_some_and(|(a, b)| a != b)
                 {
-                    return Err(Failure::range("Inconsistent Content-Length"));
+                    return Err(Failure::range(crate::i18n::tr(
+                        "Inconsistent Content-Length",
+                    )));
                 }
                 let mut file = fs::OpenOptions::new().write(true).open(path).await?;
                 if file_offset == 0 && copied == 0 {
@@ -221,7 +227,9 @@ impl Downloader {
                 let body = async {
                     while let Some(chunk) = response.chunk().await? {
                         if expected.is_some_and(|n| received + chunk.len() as u64 > n) {
-                            return Err(Failure::range("Response exceeds expected length"));
+                            return Err(Failure::range(crate::i18n::tr(
+                                "Response exceeds expected length",
+                            )));
                         }
                         writer.write_all(&chunk).await?;
                         if hashed {

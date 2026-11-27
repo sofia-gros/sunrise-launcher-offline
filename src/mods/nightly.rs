@@ -15,7 +15,8 @@ pub(super) use jobs::Event;
 pub(super) use project::{short_sha, source_error};
 
 const FRESH: Duration = Duration::from_secs(600);
-pub(super) const SOURCE_ID_CONFLICT: &str = "Another installed mod uses this ID.";
+pub(super) const SOURCE_ID_CONFLICT: &str =
+    crate::i18n::tr_key("Another installed mod uses this ID.");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SourcePresence<'a> {

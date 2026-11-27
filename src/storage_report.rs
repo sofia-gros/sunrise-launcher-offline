@@ -46,16 +46,20 @@ pub(crate) fn category_label(category: Category) -> &'static str {
 /// What a row holds, and that clearing it costs only a download or a rebuild.
 pub(crate) fn category_about(category: Category) -> &'static str {
     match category {
-        Category::BuildFiles => "What building native mods leaves behind: made again when needed.",
-        Category::PrebuiltGames => {
-            "The game packages native mods are built against: downloaded again when needed."
+        Category::BuildFiles => {
+            crate::i18n::tr_key("What building native mods leaves behind: made again when needed.")
         }
-        Category::SpareGameBuilds => {
-            "Game builds kept for running servers: downloaded again when needed."
+        Category::PrebuiltGames => crate::i18n::tr_key(
+            "The game packages native mods are built against: downloaded again when needed.",
+        ),
+        Category::SpareGameBuilds => crate::i18n::tr_key(
+            "Game builds kept for running servers: downloaded again when needed.",
+        ),
+        Category::RustCompiler => crate::i18n::tr_key(
+            "The compiler that builds native mods: downloaded again the next time one is built.",
+        ),
+        Category::OtherCaches => {
+            crate::i18n::tr_key("Other downloads kept to make the launcher faster.")
         }
-        Category::RustCompiler => {
-            "The compiler that builds native mods: downloaded again the next time one is built."
-        }
-        Category::OtherCaches => "Other downloads kept to make the launcher faster.",
     }
 }

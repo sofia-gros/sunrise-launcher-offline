@@ -56,7 +56,9 @@ pub(super) fn build_client(config: &Config, proxy: Option<&str>) -> Result<Clien
             url.scheme(),
             "http" | "https" | "socks4" | "socks4a" | "socks5" | "socks5h"
         ) {
-            return Err(Failure::permanent("Unsupported proxy scheme"));
+            return Err(Failure::permanent(crate::i18n::tr(
+                "Unsupported proxy scheme",
+            )));
         }
         builder = builder.proxy(reqwest::Proxy::all(proxy)?);
     }

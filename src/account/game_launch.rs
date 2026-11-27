@@ -34,13 +34,13 @@ pub fn token_for(
         .get(&account.uuid)?
         .and_then(|s| serde_json::from_str::<Secrets>(&s).ok())
         .ok_or_else(|| {
-            format!(
-                "{} is no longer signed in on this computer. Sign in again.",
-                account.name
+            crate::i18n::trf(
+                "{name} is no longer signed in on this computer. Sign in again.",
+                &[("name", &account.name)],
             )
         })?;
     if secrets.sign_in_required {
-        return Err(SIGN_IN_AGAIN.into());
+        return Err(crate::i18n::tr(SIGN_IN_AGAIN).into());
     }
     if secrets.minecraft_expires_at > now() + RENEW_BEFORE {
         return Ok(secrets.minecraft_token);
@@ -57,7 +57,7 @@ pub fn token_for(
         }
         Check::DoesNot(secrets) => {
             let _ = keep(&secrets);
-            Err(DOES_NOT_OWN.into())
+            Err(crate::i18n::tr(DOES_NOT_OWN).into())
         }
         Check::NoAnswer(e, secrets) => {
             let _ = keep(&secrets);
@@ -113,9 +113,9 @@ pub fn launch(
         };
         let Some(secrets) = read else {
             if plays {
-                pass.offline = Some(format!(
-                    "{} is no longer signed in on this computer. Sign in again.",
-                    account.name
+                pass.offline = Some(crate::i18n::trf(
+                    "{name} is no longer signed in on this computer. Sign in again.",
+                    &[("name", &account.name)],
                 ));
             }
             continue;
@@ -134,7 +134,7 @@ pub fn launch(
                 pass.owner = Some((renewed, secrets.clone()));
                 (None, secrets)
             }
-            Check::DoesNot(secrets) => (Some(DOES_NOT_OWN.to_string()), secrets),
+            Check::DoesNot(secrets) => (Some(crate::i18n::tr(DOES_NOT_OWN).to_string()), secrets),
             Check::NoAnswer(e, secrets) => (Some(e.to_string()), secrets),
         };
         owned = secrets.owns;

@@ -55,14 +55,14 @@ impl Section {
     ];
 
     pub(super) fn label(self) -> &'static str {
-        match self {
+        crate::i18n::tr_key(match self {
             Section::Account => "Account",
             Section::Game => "Game",
             Section::Appearance => "Appearance",
             Section::Storage => "Storage",
             Section::Privacy => "Privacy",
             Section::Launcher => "Launcher",
-        }
+        })
     }
 
     /// Its icon in the list, from the glass set the top tabs draw theirs from.
@@ -79,14 +79,14 @@ impl Section {
     }
 
     fn about(self) -> &'static str {
-        match self {
+        crate::i18n::tr_key(match self {
             Section::Account => "Who plays, and the Microsoft accounts signed in here.",
             Section::Game => "How the game starts. Its build is chosen beside Play on Home.",
             Section::Appearance => "The theme, its accent and what is behind the pages.",
             Section::Storage => "Manage game builds, downloads and where your files are kept.",
             Section::Privacy => "What Sunrise sends, and what it never does.",
             Section::Launcher => "Language, network and this version.",
-        }
+        })
     }
 }
 

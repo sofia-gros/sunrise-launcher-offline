@@ -2,14 +2,15 @@ use super::*;
 use std::collections::BTreeSet;
 use std::path::Path;
 
-/// Every Rust file of the launcher's sources.
-fn sources(dir: &Path, out: &mut Vec<String>) {
+/// Every Rust file of the launcher's sources, with its path.
+fn sources(dir: &Path, out: &mut Vec<(std::path::PathBuf, String)>) {
     for entry in std::fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
         if path.is_dir() {
             sources(&path, out);
         } else if path.extension().is_some_and(|e| e == "rs") {
-            out.push(std::fs::read_to_string(path).unwrap());
+            let text = std::fs::read_to_string(&path).unwrap();
+            out.push((path, text));
         }
     }
 }
@@ -25,13 +26,25 @@ fn strings_in(
     let mut tokens = tokens.into_iter().peekable();
     while let Some(token) = tokens.next() {
         match token {
-            TokenTree::Ident(name) if name == "tr" || name == "trf" => {
+            TokenTree::Ident(name) if name == "tr" || name == "trf" || name == "tr_key" => {
                 if let Some(TokenTree::Group(args)) = tokens.peek() {
                     if args.delimiter() == Delimiter::Parenthesis {
-                        if let Some(TokenTree::Literal(value)) = args.stream().into_iter().next() {
-                            if let Ok(value) = syn::parse_str::<syn::LitStr>(&value.to_string()) {
-                                asked.insert(value.value());
+                        let first: Vec<TokenTree> = args
+                            .stream()
+                            .into_iter()
+                            .take_while(|t| !matches!(t, TokenTree::Punct(p) if p.as_char() == ','))
+                            .collect();
+                        match first.first() {
+                            Some(TokenTree::Literal(value)) => {
+                                if let Some(value) = text_of(value) {
+                                    asked.insert(value);
+                                }
                             }
+                            // `tr(if … { "a" } else { "b" })` and `tr(match … { … => "a" })`.
+                            Some(TokenTree::Ident(word)) if word == "if" || word == "match" => {
+                                branch_texts(first.into_iter().collect(), asked);
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -47,29 +60,320 @@ fn strings_in(
     }
 }
 
+fn text_of(literal: &proc_macro2::Literal) -> Option<String> {
+    syn::parse_str::<syn::LitStr>(&literal.to_string())
+        .ok()
+        .map(|value| value.value())
+}
+
+/// The texts an `if` or `match` chooses between: a literal that is a block's whole body
+/// (`{ "a" }`) or a match arm's whole value (`=> "a",`), at any depth.
+fn branch_texts(tokens: proc_macro2::TokenStream, asked: &mut BTreeSet<String>) {
+    use proc_macro2::{Delimiter, TokenTree};
+    let tokens: Vec<TokenTree> = tokens.into_iter().collect();
+    if let [TokenTree::Literal(value)] = tokens.as_slice() {
+        asked.extend(text_of(value));
+        return;
+    }
+    for (i, token) in tokens.iter().enumerate() {
+        match token {
+            TokenTree::Group(group) if group.delimiter() == Delimiter::Brace => {
+                branch_texts(group.stream(), asked);
+            }
+            TokenTree::Literal(value) => {
+                let after_arrow = i >= 2
+                    && matches!(&tokens[i - 1], TokenTree::Punct(p) if p.as_char() == '>')
+                    && matches!(&tokens[i - 2], TokenTree::Punct(p) if p.as_char() == '=');
+                let ends_arm = match tokens.get(i + 1) {
+                    None => true,
+                    Some(TokenTree::Punct(p)) => p.as_char() == ',',
+                    _ => false,
+                };
+                if after_arrow && ends_arm {
+                    asked.extend(text_of(value));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The English strings requested directly, plus every literal (some reach `tr` via a widget or
 /// constant). The tables' shared key set below covers those indirect translations.
 fn strings() -> (BTreeSet<String>, BTreeSet<String>) {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
-    sources(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-        &mut files,
-    );
-    for crate_src in ["crates/smod/src", "crates/sdk/src"] {
-        sources(
-            &Path::new(env!("CARGO_MANIFEST_DIR")).join(crate_src),
-            &mut files,
-        );
+    for dir in ["src", "crates/smod/src", "crates/sdk/src"] {
+        sources(&root.join(dir), &mut files);
     }
+    let parsed: Vec<(&Path, proc_macro2::TokenStream)> = files
+        .iter()
+        .map(|(path, text)| (path.as_path(), text.parse().expect("valid Rust tokens")))
+        .collect();
     let (mut asked, mut all) = (BTreeSet::new(), BTreeSet::new());
-    for file in &files {
-        strings_in(
-            file.parse().expect("valid Rust tokens"),
-            &mut asked,
-            &mut all,
-        );
+    let mut helpers = Vec::new();
+    for (path, tokens) in &parsed {
+        strings_in(tokens.clone(), &mut asked, &mut all);
+        helpers_in(tokens.clone(), path, &mut helpers);
     }
+    for (path, tokens) in &parsed {
+        helper_calls(tokens.clone(), path, &helpers, &mut asked);
+    }
+    // An empty label or a lone "…" passed to a helper is no text to translate.
+    asked.retain(|key| key.chars().any(char::is_alphabetic));
     (asked, all)
+}
+
+/// A function or closure that hands one of its parameters straight to `tr` or `trf`
+/// (`fn label(text: &str) -> Div { caption(tr(text)) }`): a literal its callers pass there is a
+/// key too. Its calls count only in its own folder, so another function of the same name
+/// elsewhere adds nothing.
+struct Helper {
+    name: String,
+    /// Where the calls that count are: the definer's folder, or its file for a closure.
+    scope: std::path::PathBuf,
+    /// The translated parameters' positions, as a call writes its arguments.
+    at: Vec<usize>,
+    /// Called as a method, `self` is not among the arguments.
+    method: bool,
+}
+
+/// `tokens` split at its top-level commas; a comma inside `<…>` belongs to a type.
+fn split_commas(tokens: proc_macro2::TokenStream) -> Vec<Vec<proc_macro2::TokenTree>> {
+    use proc_macro2::TokenTree;
+    let (mut parts, mut part, mut angle) = (Vec::new(), Vec::new(), 0usize);
+    let mut last_dash = false;
+    for token in tokens {
+        if let TokenTree::Punct(p) = &token {
+            match p.as_char() {
+                '<' => angle += 1,
+                '>' if !last_dash => angle = angle.saturating_sub(1),
+                ',' if angle == 0 => {
+                    parts.push(std::mem::take(&mut part));
+                    last_dash = false;
+                    continue;
+                }
+                _ => {}
+            }
+            last_dash = p.as_char() == '-';
+        } else {
+            last_dash = false;
+        }
+        part.push(token);
+    }
+    if !part.is_empty() {
+        parts.push(part);
+    }
+    parts
+}
+
+/// The parameter a pattern names: `text: &str` and `mut text: String` name `text`.
+fn param_name(part: &[proc_macro2::TokenTree]) -> Option<String> {
+    use proc_macro2::TokenTree;
+    part.iter().find_map(|token| match token {
+        TokenTree::Ident(name) if name != "mut" => Some(name.to_string()),
+        _ => None,
+    })
+}
+
+/// Whether `body` passes `name`, alone or borrowed, as the first argument of `tr` or `trf`.
+fn translates(body: proc_macro2::TokenStream, name: &str) -> bool {
+    use proc_macro2::{Delimiter, TokenTree};
+    let tokens: Vec<TokenTree> = body.into_iter().collect();
+    tokens.iter().enumerate().any(|(i, token)| match token {
+        TokenTree::Ident(word) if word == "tr" || word == "trf" => match tokens.get(i + 1) {
+            Some(TokenTree::Group(args)) if args.delimiter() == Delimiter::Parenthesis => {
+                let first = split_commas(args.stream())
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default();
+                let first: Vec<_> = first
+                    .iter()
+                    .filter(|t| !matches!(t, TokenTree::Punct(p) if p.as_char() == '&'))
+                    .collect();
+                matches!(first.as_slice(), [TokenTree::Ident(arg)] if arg == name)
+                    || translates(args.stream(), name)
+            }
+            _ => false,
+        },
+        TokenTree::Group(group) => translates(group.stream(), name),
+        _ => false,
+    })
+}
+
+fn helper(
+    name: String,
+    scope: &Path,
+    params: proc_macro2::TokenStream,
+    body: proc_macro2::TokenStream,
+) -> Option<Helper> {
+    let params = split_commas(params);
+    let method = params
+        .first()
+        .and_then(|first| param_name(first))
+        .is_some_and(|first| first == "self");
+    let at: Vec<usize> = params
+        .iter()
+        .enumerate()
+        .filter(|(_, part)| {
+            param_name(part).is_some_and(|p| p != "self" && translates(body.clone(), &p))
+        })
+        .map(|(i, _)| i - usize::from(method))
+        .collect();
+    (!at.is_empty()).then(|| Helper {
+        name,
+        scope: scope.to_path_buf(),
+        at,
+        method,
+    })
+}
+
+/// The helpers `tokens` defines: `fn name(…) … { … }` and `let name = |…| …;`.
+fn helpers_in(tokens: proc_macro2::TokenStream, path: &Path, out: &mut Vec<Helper>) {
+    use proc_macro2::{Delimiter, TokenTree};
+    let tokens: Vec<TokenTree> = tokens.into_iter().collect();
+    let folder = path.parent().unwrap_or(path);
+    for (i, token) in tokens.iter().enumerate() {
+        match token {
+            TokenTree::Ident(word) if word == "fn" => {
+                let Some(TokenTree::Ident(name)) = tokens.get(i + 1) else {
+                    continue;
+                };
+                let rest = &tokens[i + 2..];
+                let Some(params) = rest.iter().find_map(|t| match t {
+                    TokenTree::Group(g) if g.delimiter() == Delimiter::Parenthesis => Some(g),
+                    _ => None,
+                }) else {
+                    continue;
+                };
+                // A declaration without a body (`fn name(&self);`) ends at its semicolon.
+                let body = rest
+                    .iter()
+                    .take_while(|t| !matches!(t, TokenTree::Punct(p) if p.as_char() == ';'))
+                    .find_map(|t| match t {
+                        TokenTree::Group(g) if g.delimiter() == Delimiter::Brace => Some(g),
+                        _ => None,
+                    });
+                if let Some(body) = body {
+                    out.extend(helper(
+                        name.to_string(),
+                        folder,
+                        params.stream(),
+                        body.stream(),
+                    ));
+                }
+            }
+            TokenTree::Ident(word) if word == "let" => {
+                let (
+                    Some(TokenTree::Ident(name)),
+                    Some(TokenTree::Punct(eq)),
+                    Some(TokenTree::Punct(bar)),
+                ) = (tokens.get(i + 1), tokens.get(i + 2), tokens.get(i + 3))
+                else {
+                    continue;
+                };
+                if eq.as_char() != '=' || bar.as_char() != '|' {
+                    continue;
+                }
+                let Some(close) = tokens[i + 4..]
+                    .iter()
+                    .position(|t| matches!(t, TokenTree::Punct(p) if p.as_char() == '|'))
+                else {
+                    continue;
+                };
+                let params: proc_macro2::TokenStream =
+                    tokens[i + 4..i + 4 + close].iter().cloned().collect();
+                let body: proc_macro2::TokenStream = tokens[i + 5 + close..]
+                    .iter()
+                    .take_while(|t| !matches!(t, TokenTree::Punct(p) if p.as_char() == ';'))
+                    .cloned()
+                    .collect();
+                out.extend(helper(name.to_string(), path, params, body));
+            }
+            TokenTree::Group(group) => helpers_in(group.stream(), path, out),
+            _ => {}
+        }
+    }
+}
+
+/// The literals `tokens` passes where a helper in scope translates them.
+fn helper_calls(
+    tokens: proc_macro2::TokenStream,
+    path: &Path,
+    helpers: &[Helper],
+    asked: &mut BTreeSet<String>,
+) {
+    use proc_macro2::{Delimiter, TokenTree};
+    let tokens: Vec<TokenTree> = tokens.into_iter().collect();
+    for (i, token) in tokens.iter().enumerate() {
+        match token {
+            TokenTree::Ident(name) => {
+                let Some(TokenTree::Group(args)) = tokens.get(i + 1) else {
+                    continue;
+                };
+                if args.delimiter() != Delimiter::Parenthesis
+                    || matches!(i.checked_sub(1).map(|j| &tokens[j]), Some(TokenTree::Ident(w)) if w == "fn")
+                {
+                    continue;
+                }
+                let dotted = matches!(i.checked_sub(1).map(|j| &tokens[j]), Some(TokenTree::Punct(p)) if p.as_char() == '.');
+                let args = split_commas(args.stream());
+                for helper in helpers.iter().filter(|h| {
+                    *name == h.name && path.starts_with(&h.scope) && (!h.method || dotted)
+                }) {
+                    for &at in &helper.at {
+                        if let Some([TokenTree::Literal(value)]) = args.get(at).map(Vec::as_slice) {
+                            asked.extend(text_of(value));
+                        }
+                    }
+                }
+            }
+            TokenTree::Group(group) => helper_calls(group.stream(), path, helpers, asked),
+            _ => {}
+        }
+    }
+}
+
+/// A literal handed to a function or closure that translates that parameter is a key; one
+/// handed elsewhere, or to a same-named function in another folder, is not.
+#[test]
+fn the_scan_follows_literals_into_helpers_that_translate_them() {
+    let code = r#"
+        fn label(text: &'static str) -> Div { caption(tr(text)) }
+        fn part(&self, title: &str, n: u8) -> Div { row(tr(&title), n) }
+        fn other(text: &str) -> String { text.to_string() }
+        trait Shown { fn shown(&self, text: &str); }
+        fn render() {
+            let small = |id: &str, says: &str| tip(tr(says));
+            label("Online now");
+            self.part("Difficulty", 1);
+            small("alt-play", "Play this world");
+            other("not a key");
+        }
+    "#;
+    let (here, elsewhere) = (
+        Path::new("/src/hosting/page.rs"),
+        Path::new("/src/other/page.rs"),
+    );
+    let mut helpers = Vec::new();
+    helpers_in(code.parse().unwrap(), here, &mut helpers);
+    let mut asked = BTreeSet::new();
+    helper_calls(code.parse().unwrap(), here, &helpers, &mut asked);
+    assert_eq!(
+        asked,
+        ["Difficulty", "Online now", "Play this world"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    );
+    let mut asked = BTreeSet::new();
+    helper_calls(
+        r#"label("Somewhere else");"#.parse().unwrap(),
+        elsewhere,
+        &helpers,
+        &mut asked,
+    );
+    assert!(asked.is_empty(), "{asked:?}");
 }
 
 #[test]
@@ -91,6 +395,11 @@ fn the_scan_finds_multiline_calls_without_reading_comments_or_quoted_code() {
         trf_other("not a translation either");
         let indirect = "widget label";
         tr(indirect);
+        tr(if on { "chosen on" } else { "chosen off" });
+        trf(match n { 1 => "one {n}", _ => { "many {n}" } }, &[("n", "2")]);
+        tr(match way { Way::A => compute("not a branch"), Way::B => "branch b" });
+        const LATER: &str = tr_key("marked key");
+        trf(en, &[("name", "not a key")]);
     "###;
     let (mut asked, mut all) = (BTreeSet::new(), BTreeSet::new());
     strings_in(code.parse().unwrap(), &mut asked, &mut all);
@@ -102,6 +411,12 @@ fn the_scan_finds_multiline_calls_without_reading_comments_or_quoted_code() {
             "raw \"quotes\"",
             "escaped \"quotes\" and 中\nnext",
             "continued line",
+            "chosen on",
+            "chosen off",
+            "one {n}",
+            "many {n}",
+            "branch b",
+            "marked key",
         ]
         .into_iter()
         .map(str::to_string)
@@ -194,6 +509,42 @@ fn translations_are_valid_and_coverage_is_reported() {
     writeln!(out, "Launcher locale coverage: {} languages, {missing_count} missing entries, {stale_count} stale entries (SUNRISE_LAUNCHER_I18N_DETAILS=1 for lists).", tables.len()).unwrap();
     if show_details {
         write!(out, "{details}").unwrap();
+    }
+}
+
+/// A value is inserted as it is: a data folder whose path contains `{file}` must not have the
+/// next argument filled into it, or a recovery message names the wrong file to remove.
+#[test]
+fn a_filled_value_is_never_filled_in_turn() {
+    let said = fill(
+        "{key} is damaged. Remove it and {file} and sign in again.",
+        &[
+            ("key", "/home/a/{file}/accounts.key"),
+            ("file", "/home/a/{file}/accounts.json"),
+        ],
+    );
+    assert_eq!(
+        said,
+        "/home/a/{file}/accounts.key is damaged. Remove it and /home/a/{file}/accounts.json and sign in again."
+    );
+    // A hole named twice is filled both times; braces that name no argument stay as written.
+    assert_eq!(fill("{a}-{a} {b} {{a}} {", &[("a", "1")]), "1-1 {b} {1} {");
+}
+
+/// `lang/en.json` is the source a translation service reads: every key asked for in the code is
+/// in it, mapped to itself, or translators never see that string.
+#[test]
+fn the_english_catalog_lists_every_key() {
+    let (asked, _) = strings();
+    let english: HashMap<String, String> =
+        serde_json::from_str(Language::English.source()).expect("lang/en.json is valid");
+    let missing: Vec<_> = asked.iter().filter(|s| !english.contains_key(*s)).collect();
+    assert!(
+        missing.is_empty(),
+        "add these with tools/launcher_add_lang_keys.py: {missing:#?}"
+    );
+    for (key, said) in &english {
+        assert_eq!(key, said, "lang/en.json maps a key to other text");
     }
 }
 

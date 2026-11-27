@@ -1,6 +1,5 @@
 //! Progress counters and the snapshot the settings and CLI pages read.
 
-use crate::backend::lock::recover;
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering::Relaxed},
@@ -48,12 +47,6 @@ impl Drop for Count<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Relaxed);
     }
-}
-
-pub fn current_progress() -> Option<Progress> {
-    let metrics = recover(&VISIBLE).as_ref()?.upgrade()?;
-    let p = progress_of(&metrics);
-    (p.active + p.pending > 0).then_some(p)
 }
 
 pub(super) struct Metrics {

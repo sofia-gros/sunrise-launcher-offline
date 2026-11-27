@@ -14,17 +14,20 @@ pub(super) fn accept_sign_in(
     progress: &dyn Fn(session::Phase),
 ) -> Result<(), String> {
     if cancelled() {
-        return Err("Sign-in cancelled.".into());
+        return Err(crate::i18n::tr("Sign-in cancelled.").into());
     }
     if let Some(expected) = expected {
         if expected.uuid != account.uuid {
-            return Err(format!(
-                "Signed in as {} instead of {}. Use the Microsoft account for {} and try again.",
-                account.name, expected.name, expected.name
+            return Err(crate::i18n::trf(
+                "Signed in as {signed_in} instead of {expected}. Use the Microsoft account for {expected} and try again.",
+                &[("signed_in", &account.name), ("expected", &expected.name)],
             ));
         }
         if accounts.find(&expected.uuid).is_none() {
-            return Err("That account was signed out while sign-in was in progress. Add it again to continue.".into());
+            return Err(crate::i18n::tr(
+                "That account was signed out while sign-in was in progress. Add it again to continue.",
+            )
+            .into());
         }
     }
     let selected = accounts.selected.clone();

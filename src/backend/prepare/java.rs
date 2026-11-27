@@ -31,14 +31,15 @@ pub(in crate::backend) fn java(
         if cfg!(all(target_os = "linux", target_arch = "x86_64"))
             && !Path::new(GLIBC_LOADER).exists()
         {
-            return Err(format!(
-                "{missing}\n  • Minecraft's own Java from Mojang needs glibc ({GLIBC_LOADER} is missing; on NixOS, enable programs.nix-ld), so install compatible Java instead."
+            return Err(crate::i18n::trf(
+                "{missing}\n  • Minecraft's own Java from Mojang needs glibc ({loader} is missing; on NixOS, enable programs.nix-ld), so install compatible Java instead.",
+                &[("missing", missing), ("loader", GLIBC_LOADER)],
             ));
         }
         let fetch = |url: &str| -> Result<Vec<u8>, String> { fetch_bytes_cancellable(url, stop) };
         let runtime = data_dir().join("minecraft").join("runtime");
         mojang::java_runtime(component, &runtime, 8, &fetch, cancel, log).map_err(|e| {
-            format!("{missing}\n  • Sunrise also tried to download Minecraft's own Java from Mojang, but: {e}")
+            crate::i18n::trf("{missing}\n  • Sunrise also tried to download Minecraft's own Java from Mojang, but: {error}", &[("missing", missing), ("error", &e.to_string())])
         })
     })
 }
@@ -117,7 +118,10 @@ pub(in crate::backend) fn assets_folder(
             chosen.to_path_buf()
         }
         Err(e) => {
-            log(format!("Minecraft {version}'s assets: {e}"));
+            log(crate::i18n::trf(
+                "Minecraft {version}'s assets: {error}",
+                &[("version", version), ("error", &e.to_string())],
+            ));
             chosen.to_path_buf()
         }
     }

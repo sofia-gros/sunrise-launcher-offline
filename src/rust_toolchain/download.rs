@@ -100,12 +100,12 @@ impl<'a> CancellableHttpReader<'a> {
                 }
                 Ok(TransferChunk::Err(error)) => return Err(error),
                 Ok(TransferChunk::Data(_) | TransferChunk::Eof) => {
-                    return Err("Unexpected download state.".into());
+                    return Err(crate::i18n::tr("Unexpected download state.").into());
                 }
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => {
                     cancellation.check()?;
-                    return Err("Download worker ended unexpectedly.".into());
+                    return Err(crate::i18n::tr("Download worker ended unexpectedly.").into());
                 }
             }
         }
@@ -139,14 +139,16 @@ impl Read for CancellableHttpReader<'_> {
                 Ok(TransferChunk::Eof) => return Ok(0),
                 Ok(TransferChunk::Err(error)) => return Err(std::io::Error::other(error)),
                 Ok(TransferChunk::Ready) => {
-                    return Err(std::io::Error::other("Unexpected download state."));
+                    return Err(std::io::Error::other(crate::i18n::tr(
+                        "Unexpected download state.",
+                    )));
                 }
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => {
                     self.cancellation.check().map_err(std::io::Error::other)?;
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
-                        "Download worker ended unexpectedly.",
+                        crate::i18n::tr("Download worker ended unexpectedly."),
                     ));
                 }
             }
@@ -259,10 +261,28 @@ pub(crate) fn install_cancellable(
             &step,
             cancellation,
         )
-        .map_err(|e| format!("Rust {VERSION} ({name}): {e}"))?;
+        .map_err(|e| {
+            crate::i18n::trf(
+                "Rust {version} ({name}): {error}",
+                &[
+                    ("version", VERSION),
+                    ("name", name),
+                    ("error", &e.to_string()),
+                ],
+            )
+        })?;
         let unpacked = unpack(&archive, &partial, cancellation);
         let _ = fs::remove_file(&archive);
-        unpacked.map_err(|e| format!("Rust {VERSION} ({name}): {e}"))?;
+        unpacked.map_err(|e| {
+            crate::i18n::trf(
+                "Rust {version} ({name}): {error}",
+                &[
+                    ("version", VERSION),
+                    ("name", name),
+                    ("error", &e.to_string()),
+                ],
+            )
+        })?;
         done += bytes;
     }
     if let Some(compiler) = host.c_toolchain {
@@ -293,9 +313,9 @@ pub(crate) fn install_cancellable(
             host,
         };
         if !toolchain.compiler_available() {
-            return Err(format!(
-                "{} did not contain the compiler and linker files the launcher needs.",
-                compiler.version
+            return Err(crate::i18n::trf(
+                "{compiler} did not contain the compiler and linker files the launcher needs.",
+                &[("compiler", compiler.version)],
             ));
         }
     }

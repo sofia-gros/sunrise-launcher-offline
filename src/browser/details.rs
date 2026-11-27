@@ -81,10 +81,10 @@ pub fn category_label(slug: &str) -> String {
     let words = match slug {
         "gui" => return "GUI".into(),
         "pbr" => return "PBR".into(),
-        "worldgen" => return "World generation".into(),
-        "semi-realistic" => return "Semi-realistic".into(),
-        "vanilla-like" => return "Vanilla-like".into(),
-        "core-shaders" => return "Core shaders".into(),
+        "worldgen" => return crate::i18n::tr_key("World generation").into(),
+        "semi-realistic" => return crate::i18n::tr_key("Semi-realistic").into(),
+        "vanilla-like" => return crate::i18n::tr_key("Vanilla-like").into(),
+        "core-shaders" => return crate::i18n::tr_key("Core shaders").into(),
         _ => slug.replace('-', " "),
     };
     let mut chars = words.chars();
@@ -263,8 +263,14 @@ mod tests {
     fn categories_read_as_the_site_names_them() {
         assert_eq!(category_label("game-mechanics"), "Game mechanics");
         assert_eq!(category_label("kitchen-sink"), "Kitchen sink");
-        assert_eq!(category_label("worldgen"), "World generation");
-        assert_eq!(category_label("vanilla-like"), "Vanilla-like");
+        assert_eq!(
+            category_label("worldgen"),
+            crate::i18n::tr_key("World generation")
+        );
+        assert_eq!(
+            category_label("vanilla-like"),
+            crate::i18n::tr_key("Vanilla-like")
+        );
         assert_eq!(category_label("gui"), "GUI");
         assert_eq!(category_label("16x"), "16x");
         assert_eq!(category_label(""), "");

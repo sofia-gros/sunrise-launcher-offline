@@ -341,8 +341,8 @@ impl Launcher {
                             .p(px(3.))
                             .rounded(crate::tokens::r(crate::tokens::R_CONTROL))
                             .bg(rgb(p.field))
-                            .child(arms(false, "Wide"))
-                            .child(arms(true, "Slim")),
+                            .child(arms(false, crate::i18n::tr_key("Wide")))
+                            .child(arms(true, crate::i18n::tr_key("Slim"))),
                     ),
             )
             .child(actions)
@@ -576,8 +576,8 @@ impl Launcher {
             .flex_col()
             .gap(px(12.))
             .child(Self::section(
-                "Skin",
-                "Add a skin from a PNG file, or drop one here. Saved skins stay on this computer.",
+                crate::i18n::tr_key("Skin"),
+                crate::i18n::tr_key("Add a skin from a PNG file, or drop one here. Saved skins stay on this computer."),
             ))
             .child(tiles)
             // Files that couldn't be added, beside the one that was (chosen, with its tile).
@@ -614,7 +614,7 @@ impl Launcher {
                 );
             }
             section = section
-                .child(Self::section("Default skins", ""))
+                .child(Self::section(crate::i18n::tr_key("Default skins"), ""))
                 .child(grid);
         }
         section
@@ -626,8 +626,8 @@ impl Launcher {
         cx: &mut Context<Self>,
     ) -> Div {
         let section = div().flex().flex_col().gap(px(12.)).child(Self::section(
-            "Cape",
-            "The capes your account owns. Everyone sees the one you wear, in every launcher and on every server.",
+            crate::i18n::tr_key("Cape"),
+            crate::i18n::tr_key("The capes your account owns. Everyone sees the one you wear, in every launcher and on every server."),
         ));
         // No cape is a choice even while the account's capes can't be listed.
         let (list, problem) = match &self.skins.profile {

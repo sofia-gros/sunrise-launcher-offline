@@ -19,8 +19,9 @@ pub(super) enum ModsCmd {
         /// Also what was made for other versions or runs only partly, each marked
         #[arg(long)]
         everything: bool,
-        #[arg(long, value_enum, default_value_t = SourceArg::Modrinth)]
-        source: SourceArg,
+        /// Where to search (default: Sunrise's registry for `--kind mod`, Modrinth otherwise)
+        #[arg(long, value_enum)]
+        source: Option<SourceArg>,
         /// The profile (default: the selected one)
         #[arg(long)]
         instance: Option<String>,
@@ -39,8 +40,10 @@ pub(super) enum ModsCmd {
         /// Allow a version made for another Minecraft version
         #[arg(long)]
         everything: bool,
-        #[arg(long, value_enum, default_value_t = SourceArg::Modrinth)]
-        source: SourceArg,
+        /// Where it comes from (default: Sunrise's registry when it lists the project, else
+        /// Modrinth)
+        #[arg(long, value_enum)]
+        source: Option<SourceArg>,
     },
     /// Update what the browser installed (or one pack)
     Update {
@@ -322,10 +325,15 @@ fn search(
     text: Vec<String>,
     kind: KindArg,
     everything: bool,
-    source: SourceArg,
+    source: Option<SourceArg>,
     as_json: bool,
 ) -> Result<(), Error> {
     let Scope { game, .. } = scope;
+    // Modrinth's mods are Java mods, which Sunrise doesn't offer: a mod is the registry's.
+    let source = source.unwrap_or(match kind {
+        KindArg::Mod => SourceArg::Sunrise,
+        _ => SourceArg::Modrinth,
+    });
     let kind = match kind {
         KindArg::Resource => Kind::ResourcePack,
         KindArg::Modpack => Kind::Modpack,
@@ -381,7 +389,7 @@ fn install(
     scope: &Scope,
     project: String,
     everything: bool,
-    source: SourceArg,
+    source: Option<SourceArg>,
     world: Option<String>,
     as_json: bool,
 ) -> Result<(), Error> {
@@ -391,7 +399,15 @@ fn install(
         game,
         ..
     } = scope;
-    if let SourceArg::Sunrise = source {
+    // Unsaid, a project the registry lists is the registry's: it is never a pack, and Modrinth
+    // would only refuse it as a mod. The registry not answering leaves it to Modrinth.
+    let registry = match source {
+        Some(SourceArg::Sunrise) => true,
+        Some(SourceArg::Modrinth) => false,
+        None => sunrise::v2::index()
+            .is_ok_and(|catalog| registry_project(&catalog.index, &project).is_some()),
+    };
+    if registry {
         return install_registry(instance, project, world, everything, as_json);
     }
     let source = Modrinth;
@@ -648,6 +664,26 @@ fn switch_mod(scope: &Scope, project: String, on: bool) -> Result<(), Error> {
     Ok(())
 }
 
+/// The registry's project by its id or slug. Its slugs mix `-` and `_` (`armor-hud`,
+/// `shulker_tooltip`), so a slug typed with the other one finds it too.
+fn registry_project<'a>(
+    index: &'a sunrise_launcher_smod::index_v2::Index,
+    query: &str,
+) -> Option<&'a sunrise_launcher_smod::index_v2::Project> {
+    let swapped: String = query
+        .chars()
+        .map(|c| match c {
+            '-' => '_',
+            '_' => '-',
+            c => c,
+        })
+        .collect();
+    index
+        .project(query)
+        .or_else(|| index.project_by_slug(query))
+        .or_else(|| index.project_by_slug(&swapped))
+}
+
 fn search_registry(kind: Kind, text: Vec<String>, as_json: bool) -> Result<(), Error> {
     if kind != Kind::Mod {
         return Err(tr("Sunrise's registry lists only mods: use --kind mod.").into());
@@ -704,10 +740,7 @@ fn install_registry(
         return Err(tr("Registry mods must fit the profile's game build.").into());
     }
     let catalog = sunrise::v2::index().map_err(|error| error.to_string())?;
-    let p = catalog
-        .index
-        .project(&project)
-        .or_else(|| catalog.index.project_by_slug(&project))
+    let p = registry_project(&catalog.index, &project)
         .ok_or_else(|| trf("{mod} isn't in Sunrise's registry.", &[("mod", &project)]))?;
     let progress_line = progress(p.name.clone());
     let target = sunrise::Target::of(instance)?;

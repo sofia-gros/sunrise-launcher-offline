@@ -345,10 +345,15 @@ fn run(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped());
     let (mut child, errors) = start(command, cancellation, true, profile)?;
-    if let Some(workspace) = workspace.as_deref_mut() {
+    let live = workspace.as_deref_mut().map(|workspace| {
         workspace.allow_worker();
-    }
+        super::live_log::LiveLog::name(
+            workspace.path().to_owned(),
+            workspace.work().join("build.log"),
+        )
+    });
     let result = talk(&mut child, plan, on_mod, cancellation);
+    drop(live);
     if result.is_err() && cancellation.state().tool.take().is_some() {
         // Don't wait on a tool which is still writing after a refused protocol message.
         let _ = child.child().kill();

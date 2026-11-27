@@ -311,7 +311,7 @@ fn read_named(
                 .and_then(|t| t.get("name")?.as_str().map(str::to_string));
             (
                 name.unwrap_or_else(|| file.clone()),
-                "Sunrise shader pack".into(),
+                tr("Sunrise shader pack").into(),
                 icon,
             )
         }

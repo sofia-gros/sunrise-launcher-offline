@@ -139,7 +139,7 @@ impl Launcher {
     }
 }
 
-const NATIVE_DANGER: &str = "Native mod code is compiled and runs directly on this computer with your permissions — it can read, change, or delete your files.";
+const NATIVE_DANGER: &str = crate::i18n::tr_key("Native mod code is compiled and runs directly on this computer with your permissions — it can read, change, or delete your files.");
 
 /// A build's question about native mods nobody reviewed, waiting for the player.
 pub(crate) struct PendingUnreviewed {

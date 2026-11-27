@@ -184,8 +184,9 @@ impl Launcher {
             Field::Motd => {
                 let motd = self.servers.value(Field::Motd).trim().to_string();
                 if motd.is_empty() {
-                    self.servers.problem =
-                        Some(Problem::plain("Type the line players see under the name."));
+                    self.servers.problem = Some(Problem::plain(tr(
+                        "Type the line players see under the name.",
+                    )));
                 } else {
                     self.set_setting("server.motd", motd);
                 }
@@ -227,7 +228,7 @@ impl Launcher {
         }
         self.servers.text(Field::AddPlayer).set(String::new());
         self.server_command(
-            &format!("Letting {name} in"),
+            &trf("Letting {name} in", &[("name", &name)]),
             vec!["whitelist".into(), "add".into(), name],
         );
     }

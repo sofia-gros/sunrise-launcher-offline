@@ -371,7 +371,8 @@ pub fn client(tag: &str) -> Result<Command, String> {
 }
 
 /// What the command line adds to a refusal to play for want of an account.
-pub const SIGN_IN_HINT: &str = "Sign in with `sunrise-launcher account sign-in`.";
+pub const SIGN_IN_HINT: &str =
+    crate::i18n::tr_key("Sign in with `sunrise-launcher account sign-in`.");
 
 /// Start the game straight into a friend's world: `--server friend:CODE`.
 pub fn join_friend(cmd: &mut Command, code: &str) -> Result<(), String> {

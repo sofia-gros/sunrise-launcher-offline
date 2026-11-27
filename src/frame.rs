@@ -96,6 +96,8 @@ impl Launcher {
         if window.focused(cx).is_none() {
             window.focus(&self.root_focus, cx);
         }
+        // Tooltips made from here to the layers belong to the page (`glass_ui::tip`).
+        crate::glass_ui::tips_page(self.layer_open());
         let rail = self.sidebar(cx);
         if self.ui.rail.is_some_and(|fade| fade.moving(now)) {
             window.request_animation_frame();
@@ -317,6 +319,7 @@ impl Launcher {
                     ),
             );
         // What lies over the page, bottom to top. The top one has the keyboard (`modal`).
+        crate::glass_ui::tips_layers();
         self.versions_focus(window);
         let create = (page == Page::Hosting)
             .then(|| self.hosting_create(cx))

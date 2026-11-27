@@ -19,9 +19,9 @@ fn supervisor_command(
     {
         return Err(tr("The server command cannot change its server folder.").into());
     }
-    let program = program().ok_or(
+    let program = program().ok_or(tr(
         "The server programs aren't set up yet: create a server, or press Prepare on its page.",
-    )?;
+    ))?;
     if matches!(args.first(), Some(&"start" | &"restart" | &"run")) {
         publish_host_runtime(&dir, resources)?;
     }
@@ -360,31 +360,31 @@ impl Problem {
                 .and_then(|c| c["server"]["port"].as_u64())
                 .unwrap_or(25565) as u16;
             return Self {
-                message: format!(
-                    "Port {port} is already used by another program (maybe another server). Use a free \
-                     port instead: friends then add it to the address."
+                message: trf(
+                    "Port {port} is already used by another program (maybe another server). Use a free port instead: friends then add it to the address.",
+                    &[("port", &port.to_string())],
                 ),
                 fix: Some(Fix::UsePort(free_port(port + 1, &[]))),
             };
         }
         if has("no prepared game files") || has("not found next to the resources") {
             return Self {
-                message:
-                    "The server needs the game files from your own Minecraft. Prepare them: it \
-                          takes a few minutes, once."
-                        .into(),
+                message: tr(
+                    "The server needs the game files from your own Minecraft. Prepare them: it takes a few minutes, once.",
+                )
+                .into(),
                 fix: Some(Fix::Prepare),
             };
         }
         if has("EULA") && !has("eula=true") {
             return Self {
-                message: "Running a server needs your agreement to the Minecraft EULA.".into(),
+                message: tr("Running a server needs your agreement to the Minecraft EULA.").into(),
                 fix: Some(Fix::AgreeEula),
             };
         }
         if has("isn't up after") || has("the server stopped") {
             return Self {
-                message: "The game didn't start. Its log below says why.".into(),
+                message: tr("The game didn't start. Its log below says why.").into(),
                 fix: Some(Fix::ShowLog),
             };
         }
@@ -400,7 +400,7 @@ impl Problem {
                     .find(|l| !l.trim().is_empty())
                     .map(str::to_string)
             })
-            .unwrap_or_else(|| "sunrise-server failed without saying why".into());
+            .unwrap_or_else(|| tr("sunrise-server failed without saying why").into());
         Self::plain(capitalised(&said))
     }
 }

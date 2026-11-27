@@ -6400,8 +6400,10 @@ dependencies = [
  "sunrise-launcher-bench",
  "sunrise-launcher-domain",
  "sunrise-launcher-friends",
+ "sunrise-launcher-jar-fetch",
  "sunrise-launcher-mcp",
  "sunrise-launcher-nbt",
+ "sunrise-launcher-paths",
  "sunrise-launcher-proxy",
  "sunrise-launcher-release-verify",
  "sunrise-launcher-resolver",
@@ -6460,6 +6462,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sunrise-launcher-jar-fetch"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "sunrise-launcher-mcp"
 version = "0.1.0"
 dependencies = [
@@ -6469,6 +6480,15 @@ dependencies = [
 [[package]]
 name = "sunrise-launcher-nbt"
 version = "0.1.0"
+
+[[package]]
+name = "sunrise-launcher-paths"
+version = "0.1.0"
+dependencies = [
+ "sha1",
+ "sunrise-launcher-release-verify",
+ "tempfile",
+]
 
 [[package]]
 name = "sunrise-launcher-proxy"
