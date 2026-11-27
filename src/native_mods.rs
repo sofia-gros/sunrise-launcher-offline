@@ -41,6 +41,7 @@ pub mod local_fit;
 mod mixins;
 mod picker;
 mod reuse;
+pub(crate) use reuse::exact_client_reusable;
 pub mod sdk_cache;
 
 pub use isolate::{kept as kept_left_out, kept_current, kept_stamp, Detail, LeftOut, Why};

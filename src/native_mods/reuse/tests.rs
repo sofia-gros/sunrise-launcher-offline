@@ -1154,4 +1154,153 @@ print(json.dumps({'event': 'built', 'route': 'prebuilt-api',
     assert_eq!(fs::read_to_string(calls).unwrap(), before);
 }
 
+/// Re-enabling a mod whose set's sealed exact build is still kept on disk clears `pending`
+/// through Play's own `reuse::lookup`; a never-built set stays pending; removing the kept
+/// build in Storage invalidates `fingerprint` and brings `pending` back.
+#[test]
+fn pending_label_uses_reuse_lookup_across_reenable_never_built_and_storage_clear() {
+    if !in_child(
+        "native_mods::reuse::tests::pending_label_uses_reuse_lookup_across_reenable_never_built_and_storage_clear",
+        "SUNRISE_REUSE_PENDING_LABEL_CHILD",
+    ) {
+        return;
+    }
+    const DEVELOPER: &str = "developer-pending-reuse";
+    let developer = format!(r#"{{"revision":"{PINNED}"}}"#);
+    install_base(DEVELOPER, &[("developer.json", developer)]);
+    keep_index(PINNED, "2026-11-13");
+    let home = backend::game_home();
+    let mods_dir = home.join(INSTALLED);
+    fs::create_dir_all(&mods_dir).unwrap();
+    let pack = |id: &str, body: &str| {
+        let manifest = format!(
+            "id='{id}'\nname='{id}'\nversion='0.1.0'\napi='{}'\ncapabilities=['registries']\n[native]\ngame='26.3'\nsunrise='{PINNED}'\nmixins='{B}'\n",
+            sunrise_launcher_smod::manifest::API,
+        );
+        let bytes = sunrise_launcher_smod::manifest::Package::write_files(
+            &manifest,
+            &[
+                (
+                    "Cargo.toml",
+                    b"[package]\nname='example'\nversion='9.0.0'\n[dependencies]\nsunrise-client='0.1'\n"
+                        .as_slice(),
+                ),
+                ("src/lib.rs", body.as_bytes()),
+            ],
+        )
+        .unwrap();
+        fs::write(mods_dir.join(format!("{id}.smod")), bytes).unwrap();
+    };
+    pack("alpha", "pub fn alpha() {}\n");
+    pack("beta", "pub fn beta() {}\n");
+    pack("gamma", "pub fn gamma() {}\n");
+
+    let platform = platform_for_game(DEVELOPER).unwrap();
+    let seal_enabled = |name: &str| {
+        let root = dir(name);
+        let folder = stage_installed(&home, root.join("staged"), None)
+            .unwrap()
+            .unwrap();
+        let set = Set {
+            root,
+            folder,
+            base: DEVELOPER.into(),
+            built_on: None,
+            revision: PINNED,
+            origin: DEVELOPER.into(),
+            platform,
+            sdk_base: None,
+            local_sdk: None,
+        };
+        set.install(&BuildOptions {
+            exact_home: Some(&home),
+            ..BuildOptions::default()
+        })
+    };
+
+    // 1. Build and seal {alpha, beta}.
+    crate::browser::mod_list::set_enabled(&home, "alpha", true).unwrap();
+    crate::browser::mod_list::set_enabled(&home, "beta", true).unwrap();
+    let both = seal_enabled("pending-both");
+
+    // 2. Turn alpha off, build and seal {beta}, and make {beta} the active build.
+    crate::browser::mod_list::set_enabled(&home, "alpha", false).unwrap();
+    let beta_only = seal_enabled("pending-beta");
+    assert_ne!(both, beta_only);
+    fs::write(
+        backend::data_dir().join("settings.json"),
+        format!(r#"{{"selected":"{DEVELOPER}"}}"#),
+    )
+    .unwrap();
+    fs::write(
+        backend::data_dir().join("instances.json"),
+        format!(r#"{{"instances":{{"sunrise":{{"version":"{beta_only}"}}}}}}"#),
+    )
+    .unwrap();
+    let profile_id = [1u8; 16];
+    let zero = [0u8; 32];
+    let active: crate::managed_play::Active = serde_json::from_value(serde_json::json!({
+        "version": 1,
+        "profile": profile_id,
+        "generation": 1,
+        "base": { "tag": DEVELOPER, "executable": zero, "runtime": zero },
+        "executable": { "tag": beta_only, "executable": zero, "runtime": zero },
+        "resources": { "primary": zero, "accelerator": null },
+        "inputs": zero,
+        "receipts": [],
+    }))
+    .unwrap();
+
+    // Re-enable alpha: active build is still {beta}, but {alpha, beta} is kept and proved.
+    crate::browser::mod_list::set_enabled(&home, "alpha", true).unwrap();
+    assert_eq!(
+        crate::native_status::unbuilt(
+            &crate::native_status::enabled(&home),
+            crate::native_status::built(active.executable()).as_deref(),
+        ),
+        ["alpha"]
+    );
+    assert!(
+        crate::native_status::pending(&home, Some(&active)).is_empty(),
+        "re-enabled mod with kept sealed build must not promise a compile"
+    );
+    assert!(
+        crate::native_status::pending_for(&home, Some(&active), Profile::Optimized, None)
+            .is_empty()
+    );
+    let fingerprint_before = crate::native_status::fingerprint(&home, Some(active.executable()));
+
+    // A never-built set ({alpha, beta, gamma}) stays pending as today.
+    crate::browser::mod_list::set_enabled(&home, "gamma", true).unwrap();
+    let mut never_built = crate::native_status::pending(&home, Some(&active));
+    never_built.sort();
+    assert_eq!(never_built, ["alpha", "gamma"]);
+    crate::browser::mod_list::set_enabled(&home, "gamma", false).unwrap();
+    assert!(crate::native_status::pending(&home, Some(&active)).is_empty());
+
+    // Removing the kept {alpha, beta} build in Storage invalidates the fingerprint and brings
+    // the pending label and Build-and-play state back.
+    let report = crate::storage::Storage::open()
+        .unwrap()
+        .report(Some(crate::storage::Category::SpareGameBuilds), false)
+        .unwrap();
+    let row = report
+        .rows
+        .iter()
+        .find(|row| row.category == crate::storage::Category::SpareGameBuilds)
+        .unwrap();
+    assert!(row.kept.is_empty(), "spare build should clear cleanly");
+    assert!(!backend::version_dir(&both).exists());
+    assert!(backend::version_dir(&beta_only).exists());
+    assert_ne!(
+        crate::native_status::fingerprint(&home, Some(active.executable())),
+        fingerprint_before,
+        "removing a kept build in Storage must invalidate the Mods/Home fingerprint"
+    );
+    assert_eq!(
+        crate::native_status::pending(&home, Some(&active)),
+        ["alpha"]
+    );
+}
+
 mod unsealed;

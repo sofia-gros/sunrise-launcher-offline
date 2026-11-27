@@ -761,6 +761,100 @@ pub(super) fn before_planning(
     find(&request, &requested, progress, started)
 }
 
+/// Whether Play's exact-profile fast path (`build_exact_client` -> `pipeline` -> `reuse::find` ->
+/// [`lookup`]) already has a proved, admitted installed client build for the enabled native mods
+/// in `home` on `base` with build `profile`. Reads only kept SDK indexes and installed files on
+/// disk; fetches nothing and writes only inside a transient temp directory that drops on return.
+pub(crate) fn exact_client_reusable(base: &str, home: &Path, profile: Profile) -> bool {
+    if backend::native_mod_architecture_error().is_some() {
+        return false;
+    }
+    let (Ok(built_on), Ok(()), Ok(platform)) = (
+        checked_about(base),
+        backend::need_prepared(base),
+        platform_for_game(base),
+    ) else {
+        return false;
+    };
+    let Ok(temp) = tempfile::Builder::new()
+        .prefix("sunrise-native-reuse-")
+        .tempdir()
+    else {
+        return false;
+    };
+    let staged = temp.path().join("staged");
+    if !stage_enabled_readonly(home, &staged) {
+        return false;
+    }
+    let Ok(found) = scan_bundles(&staged) else {
+        return false;
+    };
+    let mut ids = std::collections::HashSet::new();
+    if found.is_empty() || !found.iter().all(|b| ids.insert(&b.manifest.id)) {
+        return false;
+    }
+    let incoming = temp.path().join("incoming");
+    let mut requested = Vec::with_capacity(found.len());
+    for bundle in found {
+        let dir = incoming.join(&bundle.manifest.id);
+        if copy_bundle(&bundle, &dir).is_err() {
+            return false;
+        }
+        requested.push(Bundle { dir, ..bundle });
+    }
+    let origin = built_on.as_ref().map_or(base, |about| about.base.as_str());
+    let local_sdk = developer_sdk(crate::developer_install::is_developer(origin));
+    let options = BuildOptions {
+        exact_home: Some(home),
+        ..BuildOptions::default()
+    };
+    let request = Request {
+        base,
+        folder: &staged,
+        built_on: built_on.as_ref(),
+        platform,
+        profile,
+        target: Target::Client,
+        options: &options,
+        local_sdk: local_sdk.as_deref(),
+    };
+    lookup(&request, &requested).is_some()
+}
+
+/// Read-only staging of enabled native `.smod` archives in `home` into a transient folder,
+/// matching `stage_installed` without locking or mutating `home`.
+fn stage_enabled_readonly(home: &Path, out: &Path) -> bool {
+    let mut paths: Vec<PathBuf> = fs::read_dir(home.join(INSTALLED))
+        .map(|dir| dir.flatten().map(|entry| entry.path()).collect())
+        .unwrap_or_default();
+    paths.retain(|path| path.extension().is_some_and(|ext| ext == "smod") && path.is_file());
+    paths.sort();
+    let mut seen = std::collections::HashSet::new();
+    let mut count = 0usize;
+    for path in paths {
+        let Ok(bundle) = sunrise_launcher_smod::index::native::Bundle::read(&path) else {
+            continue;
+        };
+        if !crate::browser::mod_list::is_enabled(home, &bundle.manifest.id) {
+            continue;
+        }
+        if !seen.insert(bundle.manifest.id.clone()) {
+            return false;
+        }
+        let dir = out.join(&bundle.manifest.id);
+        for (name, bytes) in &bundle.files {
+            let to = dir.join(name);
+            if fs::create_dir_all(to.parent().unwrap_or(&dir)).is_err()
+                || fs::write(&to, bytes).is_err()
+            {
+                return false;
+            }
+        }
+        count += 1;
+    }
+    count > 0
+}
+
 /// The found build, used again as the planned path uses an installed one: kept for a staged
 /// profile, said to be up to date, and counted as the newest of the builds kept (`prune`).
 pub(super) fn reused(
