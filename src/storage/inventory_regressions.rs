@@ -594,3 +594,133 @@ fn clear_refuses_units_replaced_with_different_identity_after_selection() {
         b"new rust"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn explicit_storage_clear_keeps_version_started_after_discovery_as_busy() {
+    use std::{
+        io::Read,
+        process::{Child, Command, Stdio},
+    };
+    const TEST: &str = "storage::inventory::regressions::explicit_storage_clear_keeps_version_started_after_discovery_as_busy";
+    const ACTOR: &str = "STORAGE_VERSION_IN_USE_ACTOR";
+    const TAG: &str = "v0.0.0-late-server";
+    if std::env::var_os(ACTOR).is_none() {
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(ACTOR, "1")
+            .env("SUNRISE_LAUNCHER_HOME", root.path().join("launcher"))
+            .env("SUNRISE_HOME", root.path().join("game"))
+            .env(
+                "SUNRISE_LAUNCHER_LOCATION_FILE",
+                root.path().join("location"),
+            )
+            .env("XDG_DATA_HOME", root.path().join("xdg-data"))
+            .env("XDG_CONFIG_HOME", root.path().join("xdg-config"))
+            .env("SUNRISE_NO_KEYCHAIN", "1")
+            .env("SUNRISE_LAUNCHER_NO_SELF_UPDATE", "1")
+            .env("SUNRISE_NO_AUDIO", "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    struct StopChild(Option<Child>);
+    impl Drop for StopChild {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    let data = backend::data_dir();
+    let selected = backend::version_dir("v0.0.1");
+    fs::create_dir_all(&selected).unwrap();
+    fs::write(selected.join(".installed"), b"").unwrap();
+    fs::write(data.join("settings.json"), br#"{"selected":"v0.0.1"}"#).unwrap();
+
+    // Unpinned incomplete version unit under versions/: selected by discovery as SpareGameBuilds.
+    let spare = backend::version_dir(TAG);
+    fs::create_dir_all(&spare).unwrap();
+    fs::write(spare.join("payload"), b"running server build").unwrap();
+    assert!(!backend::in_use(TAG));
+
+    let storage = Storage::at(&data).unwrap();
+    let mut running = StopChild(None);
+    let report = storage
+        .clear_observed(Some(Category::SpareGameBuilds), false, |path| {
+            if backend::plain(path.to_path_buf()) == backend::plain(spare.clone()) {
+                let marker = format!("{}/sunrise-server", spare.display());
+                let mut child = Command::new("sh")
+                    .args(["-c", "printf ready; read -r stop", "late-version-actor"])
+                    .arg(&marker)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap();
+                let mut ready = [0u8; 5];
+                child
+                    .stdout
+                    .as_mut()
+                    .unwrap()
+                    .read_exact(&mut ready)
+                    .unwrap();
+                assert_eq!(&ready, b"ready");
+                assert!(backend::in_use(TAG));
+                running.0 = Some(child);
+            }
+        })
+        .unwrap();
+
+    assert!(
+        running.0.is_some(),
+        "clear_observed did not visit the spare version unit"
+    );
+    let row = report
+        .rows
+        .iter()
+        .find(|row| row.category == Category::SpareGameBuilds)
+        .unwrap();
+    assert!(
+        row.kept.iter().any(|unit| unit.kind == KeptKind::Busy),
+        "expected Busy keep for in-use version unit, got {:?}",
+        row.kept
+            .iter()
+            .map(|u| (u.kind, u.reason.as_str()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        fs::read(spare.join("payload")).unwrap(),
+        b"running server build"
+    );
+
+    drop(running);
+    assert!(!backend::in_use(TAG));
+    let after = storage
+        .report(Some(Category::SpareGameBuilds), false)
+        .unwrap();
+    let row = after
+        .rows
+        .iter()
+        .find(|row| row.category == Category::SpareGameBuilds)
+        .unwrap();
+    assert!(
+        row.kept.is_empty(),
+        "unexpected kept units: {:?}",
+        row.kept
+            .iter()
+            .map(|u| (u.kind, u.reason.as_str()))
+            .collect::<Vec<_>>()
+    );
+    assert!(!spare.exists());
+}

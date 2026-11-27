@@ -506,6 +506,12 @@ fn delete_unit(
                     .file_name()
                     .and_then(std::ffi::OsStr::to_str)
                     .ok_or_else(|| Error::Unsafe(path.to_owned()))?;
+                // Explicit Storage Clear skips Access::for_unit and may select a build that a
+                // standalone process started using after discovery; check under the fence while
+                // keeping low-level delete_game_unit semantics unchanged.
+                if options.explicit_storage_clear && crate::backend::in_use(tag) {
+                    return Err(Error::Busy);
+                }
                 // Traditional native builds also keep the resources of their base build.
                 if let Some(build) = crate::native_mods::resource_dependent(tag) {
                     return Err(Error::ResourceDependent(build));
