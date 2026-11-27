@@ -67,6 +67,8 @@ struct Running {
     policy: SwitchPolicy,
     /// The policy its worker started with, once it has.
     started_with: Option<SwitchPolicy>,
+    /// The build choice its worker started with, once it has.
+    started_choice: Option<BuildChoice>,
     /// Set by the worker when the policy stopped it.
     refused: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -265,6 +267,24 @@ impl Launcher {
             SwitchStart::Switch => {}
         }
         let release = self.release_to_install(&tag);
+        let stop = self.stage_switch(tag.clone(), instance, identity, choice, policy);
+        if let Some(release) = release {
+            self.ui.sheets.switching.cache_download = Some(tag);
+            self.switch_progress(InstallProgress::DownloadingBuild(0.));
+            self.install_cancellable(&release, Some(stop));
+        } else {
+            self.prepare_switch();
+        }
+    }
+
+    fn stage_switch(
+        &mut self,
+        tag: String,
+        instance: instances::Instance,
+        identity: Identity,
+        choice: Option<BuildChoice>,
+        policy: SwitchPolicy,
+    ) -> native_mods::Cancellation {
         let stop = native_mods::Cancellation::default();
         let from = (instance.home.clone(), self.profile_target(&instance));
         self.ui.sheets.switching.running = Some(Running {
@@ -293,17 +313,12 @@ impl Launcher {
             }),
             policy,
             started_with: None,
+            started_choice: None,
             refused: Arc::default(),
         });
         self.switch_log_line(format!("Switching to {tag}: started"));
         self.open_sheet(Sheet::Switching);
-        if let Some(release) = release {
-            self.ui.sheets.switching.cache_download = Some(tag);
-            self.switch_progress(InstallProgress::DownloadingBuild(0.));
-            self.install_cancellable(&release, Some(stop));
-        } else {
-            self.prepare_switch();
-        }
+        stop
     }
 
     fn prepare_switch(&mut self) {
@@ -394,6 +409,7 @@ impl Launcher {
         );
         let (policy, refused) = (running.policy, running.refused.clone());
         running.started_with = Some(policy);
+        running.started_choice = choice;
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             // The steps inside the switch (sealing and checking the game files, the mod set)
@@ -1610,6 +1626,7 @@ mod tests {
             .env("SUNRISE_HOME", root.join("game"))
             .env("SUNRISE_LAUNCHER_HOME", root.join("launcher"))
             .env("SUNRISE_LAUNCHER_LOCATION_FILE", root.join("location.json"))
+            .env("SUNRISE_MOD_INDEX_V2", root.join("missing-index.signed"))
             .env("SUNRISE_NO_KEYCHAIN", "1")
             .env("SUNRISE_LAUNCHER_NO_SELF_UPDATE", "1")
             .env("SUNRISE_TELEMETRY_URL", "off")
@@ -1699,6 +1716,162 @@ mod tests {
         assert!(!sunrise_launcher::backend::version_dir(TAG)
             .join(".installed")
             .exists());
+    }
+
+    /// A picker switch stays unsaved while an unprepared build prepares (and when preparation
+    /// fails), and a completed download advances through `finish_switch_download` into the switch
+    /// worker carrying `SwitchPolicy::Ask` and `BuildChoice::Keep` without saving early before
+    /// publication (review of #616).
+    #[test]
+    fn an_undownloaded_pick_waits_for_download_and_preparation_before_starting_the_worker() {
+        if !in_scratch_child(
+            "an_undownloaded_pick_waits_for_download_and_preparation_before_starting_the_worker",
+        ) {
+            return;
+        }
+        crate::wake::UNDER_TEST_SCHEDULER.store(true, std::sync::atomic::Ordering::Relaxed);
+        let profile = sunrise_launcher::instances::create("Cabin", None).unwrap();
+        let mut settings = sunrise_launcher::backend::Settings::load();
+        settings.instance = Some(profile.id.clone());
+        settings.save().unwrap();
+        let mut app = gpui::TestAppContext::single();
+        let (shell, cx) = app.add_window_view(crate::window_root::Shell::new_for_test);
+        let launcher = shell.read_with(cx, |shell, _| shell.launcher());
+        cx.run_until_parked();
+
+        let wait_until_idle = |cx: &mut gpui::VisualTestContext| {
+            let mut ended = false;
+            for _ in 0..200 {
+                cx.executor()
+                    .advance_clock(std::time::Duration::from_millis(50));
+                cx.run_until_parked();
+                if launcher.read_with(cx, |l, _| {
+                    l.ui.sheets.switching.running.is_none() && !l.preparing
+                }) {
+                    ended = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            assert!(ended, "background switch job finished cleanly");
+        };
+
+        // Install a newer build so the following profile targets OTHER (not TAG_PREP_FAIL),
+        // keeping its saved pin None while ensuring a pick of TAG_PREP_FAIL runs a real switch.
+        const OTHER: &str = "26.3-0.1.9";
+        let other_build = sunrise_launcher::backend::version_dir(OTHER);
+        std::fs::create_dir_all(&other_build).unwrap();
+        std::fs::write(other_build.join(".installed"), []).unwrap();
+
+        // 1. An installed but unprepared build starts real preparation (no download thread) and
+        //    leaves instances.json untouched both during preparation and after preparation fails.
+        const TAG_PREP_FAIL: &str = "26.3-0.1.0";
+        let prep_build = sunrise_launcher::backend::version_dir(TAG_PREP_FAIL);
+        std::fs::create_dir_all(&prep_build).unwrap();
+        std::fs::write(prep_build.join(".installed"), []).unwrap();
+        launcher.update(cx, |l, _| {
+            l.refresh_installed();
+            l.begin_switch(
+                TAG_PREP_FAIL.into(),
+                Some(sunrise_launcher::browser::sunrise::BuildChoice::Keep),
+            );
+            let running =
+                l.ui.sheets
+                    .switching
+                    .running
+                    .as_ref()
+                    .expect("preparation switch began");
+            assert!(
+                matches!(
+                    running.progress,
+                    InstallProgress::Minecraft(sunrise_launcher::backend::PrepareStep::Files, None)
+                ),
+                "unprepared build enters preparation: {:?}",
+                running.progress
+            );
+            assert!(matches!(
+                running.pending.as_ref().and_then(|p| p.choice),
+                Some(sunrise_launcher::browser::sunrise::BuildChoice::Keep)
+            ));
+        });
+        assert_eq!(
+            saved_profile(&profile.id).version,
+            None,
+            "nothing saved while preparing"
+        );
+        wait_until_idle(cx);
+        assert_eq!(
+            launcher.read_with(cx, |l, _| l.ui.sheet),
+            Some(Sheet::Notice),
+            "failed preparation reports a notice"
+        );
+        assert_eq!(
+            saved_profile(&profile.id).version,
+            None,
+            "failed preparation leaves no saved build"
+        );
+
+        // 2. A distinct tag staged in the download phase (no competing installer thread) advances
+        //    through finish_switch_download into start_switch_worker with Ask + Keep once its
+        //    downloaded and prepared files are in place, and still saves nothing before worker
+        //    publication.
+        const TAG_DOWNLOAD_OK: &str = "26.3-0.1.1";
+        let dl_build = sunrise_launcher::backend::version_dir(TAG_DOWNLOAD_OK);
+        std::fs::create_dir_all(&dl_build).unwrap();
+        std::fs::write(dl_build.join(".installed"), []).unwrap();
+        let dl_resources = sunrise_launcher::backend::resources(TAG_DOWNLOAD_OK);
+        std::fs::create_dir_all(&dl_resources).unwrap();
+        std::fs::write(dl_resources.join("sunrise-resources.json"), "{}").unwrap();
+        assert!(sunrise_launcher::backend::check_prepared(TAG_DOWNLOAD_OK));
+        launcher.update(cx, |l, _| {
+            l.close_sheet();
+            let instance = l.selected_instance().cloned().unwrap();
+            let identity = sunrise_launcher::browser::sunrise::install_target(&instance).unwrap();
+            l.stage_switch(
+                TAG_DOWNLOAD_OK.into(),
+                instance,
+                identity,
+                Some(sunrise_launcher::browser::sunrise::BuildChoice::Keep),
+                sunrise_launcher::browser::sunrise::SwitchPolicy::Ask,
+            );
+            l.ui.sheets.switching.cache_download = Some(TAG_DOWNLOAD_OK.into());
+            l.switch_progress(InstallProgress::DownloadingBuild(0.));
+            assert_eq!(
+                saved_profile(&profile.id).version,
+                None,
+                "nothing saved while download is pending"
+            );
+            assert!(l.finish_switch_download(
+                TAG_DOWNLOAD_OK,
+                &Ok(sunrise_launcher::backend::InstallOutcome::Installed(None)),
+            ));
+            let running =
+                l.ui.sheets
+                    .switching
+                    .running
+                    .as_ref()
+                    .expect("switch worker started after download");
+            assert!(running.pending.is_none(), "pending handoff consumed");
+            assert_eq!(
+                running.started_with,
+                Some(sunrise_launcher::browser::sunrise::SwitchPolicy::Ask),
+                "worker started with picker Ask policy"
+            );
+            assert!(
+                matches!(
+                    running.started_choice,
+                    Some(sunrise_launcher::browser::sunrise::BuildChoice::Keep)
+                ),
+                "worker received BuildChoice::Keep"
+            );
+            assert_eq!(running.progress, InstallProgress::PreparingBuild);
+        });
+        wait_until_idle(cx);
+        assert_eq!(
+            saved_profile(&profile.id).version,
+            None,
+            "an unpublished switch leaves no saved build"
+        );
     }
 
     /// Home's switch to a build that is already prepared starts its worker inside
