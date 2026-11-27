@@ -374,6 +374,18 @@ pub(super) fn build_folder(commit: &str) -> PathBuf {
     root().join(commit)
 }
 
+/// The index [`index`] keeps for build `commit`, read as [`index`] reads a kept one; None when
+/// none is kept or it doesn't read. Nothing is fetched: what the fast path (`reuse`) compares
+/// with the digest a build recorded of the index it was planned from.
+pub(super) fn kept(commit: &str) -> Option<Sdk> {
+    if !super::is_revision(commit) {
+        return None;
+    }
+    let dir = build_folder(commit);
+    let bytes = fs::read(dir.join(INDEX)).ok()?;
+    checked(&bytes, commit, dir).ok()
+}
+
 /// Write `bytes` to `path` whole or not at all: beside it first, then renamed into place.
 pub(super) fn write_whole(path: &Path, bytes: &[u8]) -> Result<(), Refusal> {
     let cache = |error: std::io::Error| Refusal::Cache(format!("{}: {error}", path.display()));
@@ -532,7 +544,8 @@ fn compare_versions(a: &str, b: &str) -> Option<std::cmp::Ordering> {
     Some(parts(a)?.cmp(&parts(b)?))
 }
 
-/// The kept `surface.json` of `sdk`'s build, else fetched from `base`, checked against the index and kept. Kept, so a fit is told offline once a build was seen.
+/// The verified `surface.json` of `sdk`'s build: reused offline if it still matches the index,
+/// otherwise fetched from `base`, verified and kept.
 pub(super) fn surface_file(sdk: &Sdk, base: &Base) -> Result<PathBuf, Refusal> {
     const NAME: &str = "surface.json";
     let build = sdk.shown();
@@ -543,8 +556,7 @@ pub(super) fn surface_file(sdk: &Sdk, base: &Base) -> Result<PathBuf, Refusal> {
     let kept = sdk.dir.join(NAME);
     let listed = sdk.index.asset(NAME).map_err(|r| refused(r.to_string()))?;
     match fs::read(&kept) {
-        // Kept only once verified; a size that changed since is fetched again.
-        Ok(bytes) if bytes.len() as u64 == listed.size => return Ok(kept),
+        Ok(bytes) if sdk.index.verify(NAME, bytes.as_slice()).is_ok() => return Ok(kept),
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
             return Err(Refusal::Cache(format!("{}: {error}", kept.display())));
         }
@@ -626,6 +638,22 @@ fn route_inputs(route: &str) -> Option<&'static str> {
 /// The SDK's native build tool for this computer (its `tool` route), fetched beside the slices and kept: the program to run.
 pub(super) fn tool(sdk: &Sdk, base: &Base, progress: &dyn Fn(Fetched)) -> Result<PathBuf, Refusal> {
     let host = rust_toolchain::host().ok_or(Refusal::Host)?;
+    tool_in(
+        &super::root().join("prebuilt"),
+        sdk,
+        base,
+        host.target,
+        progress,
+    )
+}
+
+fn tool_in(
+    prebuilt: &Path,
+    sdk: &Sdk,
+    base: &Base,
+    triple: &str,
+    progress: &dyn Fn(Fetched),
+) -> Result<PathBuf, Refusal> {
     let build = sdk.shown();
     let refused = |why: String| Refusal::Refused {
         build: build.clone(),
@@ -633,7 +661,7 @@ pub(super) fn tool(sdk: &Sdk, base: &Base, progress: &dyn Fn(Fetched)) -> Result
     };
     let names = sdk
         .index
-        .route_assets("tool", host.target, Side::Client)
+        .route_assets("tool", triple, Side::Client)
         .map_err(|r| match r {
             sdk::Refusal::Missing(_) => Refusal::Host,
             sdk::Refusal::Route(_) => {
@@ -641,10 +669,7 @@ pub(super) fn tool(sdk: &Sdk, base: &Base, progress: &dyn Fn(Fetched)) -> Result
             }
             other => refused(other.to_string()),
         })?;
-    let into =
-        super::root()
-            .join("prebuilt")
-            .join(format!("{}-{}-tool", sdk.commit(), host.target));
+    let into = prebuilt.join(format!("{}-{triple}-tool", sdk.commit()));
     let mut fetched = Fetched::default();
     for name in &names {
         if !stamp_holds(sdk, name, &into) {
@@ -1014,6 +1039,20 @@ pub(super) fn build_of(version: &str, base: &Base, keys: &[PublicKey]) -> Result
     build_of_in(&root().join("versions"), version, base, keys)
 }
 
+/// Read the build id already kept for `version`, without contacting a release mirror.
+pub(super) fn kept_build_of(version: &str) -> Option<String> {
+    let file = plain_version(version).then(|| root().join("versions").join(version))?;
+    let text = fs::read_to_string(file).ok()?;
+    super::is_revision(text.trim()).then(|| text.trim().to_owned())
+}
+
+fn plain_version(version: &str) -> bool {
+    !version.is_empty()
+        && version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+}
+
 fn build_of_in(
     kept: &Path,
     version: &str,
@@ -1024,11 +1063,7 @@ fn build_of_in(
         build: version.to_owned(),
         why,
     };
-    let plain = !version.is_empty()
-        && version
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'));
-    if !plain {
+    if !plain_version(version) {
         return Err(refused(trf(
             "{version} is not a game version",
             &[("version", version)],
