@@ -32,17 +32,38 @@ pub(super) enum Confirm {
     Old(Vec<String>),
 }
 
+impl View {
+    fn stop_count(&mut self) {
+        self.generation += 1;
+        if let Some(cancel) = self.cancel.take() {
+            cancel.cancel();
+        }
+    }
+
+    fn start_count(&mut self, location_unavailable: bool) -> Option<(u64, storage::Cancel)> {
+        self.stop_count();
+        self.rows = None;
+        if location_unavailable {
+            return None;
+        }
+        let cancel = storage::Cancel::default();
+        self.cancel = Some(cancel.clone());
+        Some((self.generation, cancel))
+    }
+
+    fn accept_rows(&mut self, generation: u64, rows: Vec<Build>) {
+        if self.generation == generation {
+            self.rows = Some(rows);
+        }
+    }
+}
+
 impl Launcher {
     pub(super) fn refresh_storage_builds(&mut self) {
-        if self.location_unavailable {
+        let Some((generation, cancel)) = self.storage_builds.start_count(self.location_unavailable)
+        else {
             return;
-        }
-        self.storage_builds.generation += 1;
-        let generation = self.storage_builds.generation;
-        let cancel = storage::Cancel::default();
-        if let Some(previous) = self.storage_builds.cancel.replace(cancel.clone()) {
-            previous.cancel();
-        }
+        };
         let releases = self.game_releases().to_vec();
         let tx = self.tx.clone();
         std::thread::spawn(move || {
@@ -56,9 +77,7 @@ impl Launcher {
     }
 
     pub(super) fn stop_storage_builds_count(&mut self) {
-        if let Some(cancel) = self.storage_builds.cancel.take() {
-            cancel.cancel();
-        }
+        self.storage_builds.stop_count();
     }
 
     /// Shown on Storage: count the builds' sizes and the rows. Anywhere else: stop counting.
@@ -74,9 +93,7 @@ impl Launcher {
     }
 
     pub(super) fn storage_builds_arrived(&mut self, generation: u64, rows: Vec<Build>) {
-        if self.storage_builds.generation == generation {
-            self.storage_builds.rows = Some(rows);
-        }
+        self.storage_builds.accept_rows(generation, rows);
     }
 
     fn can_change_builds(&self) -> bool {
@@ -520,5 +537,32 @@ impl Launcher {
             ),
         ));
         group(rows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::View;
+
+    #[test]
+    fn closing_build_inventory_rejects_queued_rows() {
+        let mut view = View::default();
+        let (generation, cancel) = view.start_count(false).unwrap();
+        view.stop_count();
+        assert!(cancel.is_cancelled());
+        view.accept_rows(generation, Vec::new());
+        assert!(view.rows.is_none());
+    }
+
+    #[test]
+    fn reopening_unavailable_build_inventory_discards_previous_rows() {
+        let mut view = View::default();
+        let (generation, _) = view.start_count(false).unwrap();
+        view.accept_rows(generation, Vec::new());
+        assert!(view.rows.is_some());
+        assert!(view.start_count(true).is_none());
+        assert!(view.rows.is_none());
+        view.accept_rows(generation, Vec::new());
+        assert!(view.rows.is_none());
     }
 }
