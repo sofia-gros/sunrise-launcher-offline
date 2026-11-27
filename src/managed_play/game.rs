@@ -211,7 +211,7 @@ fn prepare(
     if !active.allow_accelerator() {
         command.env("SUNRISE_NO_DATA_FILE", "1");
     }
-    let (command, runtime) = backend::prepare_managed_command(command, &active.resource_path())?;
+    let (command, runtime) = backend::prepare_command(command)?;
     #[cfg(windows)]
     active.verify_runtime_copy(runtime.windows()?.game())?;
     Ok((command, runtime))

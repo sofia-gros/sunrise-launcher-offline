@@ -123,7 +123,7 @@ fn in_scratch_launcher(test: &str, run: impl FnOnce(&mut Launcher)) {
         return;
     }
     let mut app = gpui::TestAppContext::single();
-    let (shell, cx) = app.add_window_view(crate::window_root::Shell::new);
+    let (shell, cx) = app.add_window_view(crate::window_root::Shell::new_for_test);
     let launcher = shell.read_with(cx, |shell, _| shell.launcher());
     launcher.update(cx, |launcher, _| run(launcher));
 }

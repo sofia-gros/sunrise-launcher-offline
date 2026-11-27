@@ -3,10 +3,11 @@
 use super::*;
 
 impl Launcher {
-    pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        if sunrise_launcher::carry_over::startup_error().is_none() {
-            sunrise_launcher::storage::eviction::cleanup_after_start();
-        }
+    pub(crate) fn new_with_startup_checks(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        startup_checks: bool,
+    ) -> Self {
         crate::eta::preload_timings();
         // A press on something that then leaves the page (a row that opens its page, a tab)
         // would leave the keyboard on nothing, and Tab dead until the next click.
@@ -143,13 +144,6 @@ impl Launcher {
             corners_focused: false,
             corners_slider: crate::slider::Slider::default(),
             corners_focus: cx.focus_handle().tab_index(0).tab_stop(true),
-            cache_input: line_edit::LineEdit::new(
-                crate::settings::cache_limit_text(settings.cache_limit_gib),
-                5,
-                6,
-            ),
-            cache_focused: false,
-            cache_focus: cx.focus_handle().tab_index(0).tab_stop(true),
             proxy_focus: cx.focus_handle().tab_index(0).tab_stop(true),
             settings,
             settings_save_error: None,
@@ -274,8 +268,10 @@ impl Launcher {
         });
         this.load_profile_heads();
         this.load_auth_statuses(true);
-        this.check_updates(UpdateCheck::Startup);
-        this.fetch_links();
+        if startup_checks {
+            this.check_updates(UpdateCheck::Startup);
+            this.fetch_links();
+        }
         telemetry::send_in_background();
         telemetry::watch_playing(this.tx.clone());
         this

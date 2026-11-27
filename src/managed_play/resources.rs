@@ -80,7 +80,7 @@ impl Resources {
                 preparer::run_staged(command, &handoff, log)?;
             }
         }
-        Self::seal_prepared(base, &preparation, &handoff, None)
+        Self::seal_prepared(base, &preparation, &handoff, None, None)
     }
 
     /// Finish the shared preparation under its existing lock, before a profile needs it.
@@ -89,7 +89,23 @@ impl Resources {
         preparation: &preparer::Preparation,
         profile: Option<ProfileHandoff<'_>>,
     ) -> Result<Self, String> {
-        Self::seal_prepared(base, preparation, &preparation.handoff(profile), None)
+        Self::seal_prepared(base, preparation, &preparation.handoff(profile), None, None)
+    }
+
+    /// [`Self::prepare`] when the caller already probed `missing-extras` unlocked (startup).
+    pub(crate) fn prepare_with_missing(
+        base: &str,
+        preparation: &preparer::Preparation,
+        profile: Option<ProfileHandoff<'_>>,
+        missing: Option<preparer::Extras>,
+    ) -> Result<Self, String> {
+        Self::seal_prepared(
+            base,
+            preparation,
+            &preparation.handoff(profile),
+            None,
+            Some(missing),
+        )
     }
 
     /// [`Self::prepare`], stopping at the next step once `stop` is set.
@@ -103,7 +119,7 @@ impl Resources {
             Some(stop) => preparation.handoff_cancellable(profile, stop),
             None => preparation.handoff(profile),
         };
-        Self::seal_prepared(base, preparation, &handoff, stop)
+        Self::seal_prepared(base, preparation, &handoff, stop, None)
     }
 
     fn seal_prepared(
@@ -111,11 +127,18 @@ impl Resources {
         preparation: &preparer::Preparation,
         handoff: &preparer::Handoff<'_>,
         stop: Option<&crate::native_mods::Cancellation>,
+        probed_missing: Option<Option<preparer::Extras>>,
     ) -> Result<Self, String> {
         let check = || stop.map_or(Ok(()), crate::native_mods::Cancellation::check);
         check()?;
         backend::need_base_prepared(base, Some(preparation))?;
-        backend::complete_assets_staged(base, handoff);
+        match probed_missing {
+            None => backend::complete_assets_staged(base, handoff),
+            Some(Some(lacking)) if !lacking.is_empty() => {
+                backend::complete_assets_lacking_staged(base, handoff, lacking);
+            }
+            Some(_) => {}
+        }
         check()?;
         let root = backend::version_dir(base);
         Self::seal(&root, &backend::resources(base), stop, |resources| {

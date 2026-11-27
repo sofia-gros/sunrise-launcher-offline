@@ -124,10 +124,6 @@ pub(super) fn open(cx: &mut App, path: &Path) {
 impl Launcher {
     /// From the drain: whether the line changed (a new one, or the last one gone).
     pub(super) fn toast_tick(&mut self) -> bool {
-        // The cache cleanup after a start or a build says what it freed.
-        if let Some(freed) = sunrise_launcher::storage::eviction::take_toast() {
-            say(freed);
-        }
         let now = current().map(|l| l.1);
         let changed = now != self.toast_seen;
         self.toast_seen = now;

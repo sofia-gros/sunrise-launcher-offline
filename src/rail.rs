@@ -609,7 +609,7 @@ mod tests {
         settings.sidebar_expanded = false;
         settings.save().unwrap();
         let mut app = gpui::TestAppContext::single();
-        let (shell, cx) = app.add_window_view(crate::window_root::Shell::new);
+        let (shell, cx) = app.add_window_view(crate::window_root::Shell::new_for_test);
         let launcher = shell.read_with(cx, |shell, _| shell.launcher());
         // A frame with the sidebar `open` of the way, and no menu up.
         let draw = |cx: &mut gpui::VisualTestContext, open: f32| {
