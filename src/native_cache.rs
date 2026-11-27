@@ -9,6 +9,10 @@ use std::path::{Path, PathBuf};
 
 pub(crate) const PROFILES: [&str; 2] = ["fast", "release"];
 
+/// The folder under `native/` holding one persistent compiler work folder per game build. One
+/// letter, because Windows' path limit counts it (see `WORK_SLOT_HEX` in the native workspace).
+pub(crate) const WORK: &str = "w";
+
 #[derive(Debug)]
 pub enum Error {
     Busy,
@@ -90,6 +94,85 @@ pub(crate) fn locked(file: File, mode: LockMode) -> Result<Locked, Error> {
     })
 }
 
+/// A persistent build folder as [`Cache::work_slot`] left it.
+pub(crate) struct Provisioned {
+    pub(crate) path: PathBuf,
+    /// Nothing is in it: the build that runs there compiles everything.
+    pub(crate) cold: bool,
+}
+
+/// `name` as one folder name, never a path.
+fn single(name: &str) -> Result<&Path, Error> {
+    let path = Path::new(name);
+    let mut parts = path.components();
+    match (parts.next(), parts.next()) {
+        (Some(std::path::Component::Normal(_)), None) => Ok(path),
+        _ => Err(Error::Unsafe(path.to_owned())),
+    }
+}
+
+/// Removes `path` itself without opening what a link there points to: a symlink or a junction
+/// goes as the link, and a folder with links inside goes with each of them unlinked.
+fn remove(path: &Path) -> io::Result<()> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if linked(&meta) {
+        // A symlink to a file goes by `remove_file`; on Windows a junction or folder symlink
+        // only by `remove_dir`.
+        fs::remove_file(path).or_else(|_| fs::remove_dir(path))
+    } else if meta.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+/// Refuses a link at `path`; whether it is there at all is the caller's to say.
+fn unlinked(path: &Path) -> Result<Option<Metadata>, Error> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if linked(&meta) => Err(Error::Unsafe(path.to_owned())),
+        Ok(meta) => Ok(Some(meta)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The folders of a work slot the SDK's tool keeps and reuses, checked for links one level at a
+/// time before any of them is handed to a compiler: the slot itself, `prebuilt-build` and
+/// `prebuilt-package`, each build folder in `prebuilt-build`, and in it `target` and `stage-*`.
+fn sdk_owned(slot: &Path) -> Result<(), Error> {
+    if checked(slot, true)?.is_none() {
+        return Ok(());
+    }
+    for name in ["prebuilt-build", "prebuilt-package"] {
+        let folder = slot.join(name);
+        if unlinked(&folder)?.is_some_and(|meta| !meta.is_dir()) {
+            return Err(Error::Unsafe(folder));
+        }
+    }
+    let builds = slot.join("prebuilt-build");
+    if unlinked(&builds)?.is_none() {
+        return Ok(());
+    }
+    for build in fs::read_dir(&builds)? {
+        let build = build?.path();
+        if !unlinked(&build)?.is_some_and(|meta| meta.is_dir()) {
+            continue;
+        }
+        for entry in fs::read_dir(&build)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name == "target" || name.to_string_lossy().starts_with("stage-") {
+                unlinked(&entry.path())?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn size(path: &Path) -> Result<u64, Error> {
     let meta = fs::symlink_metadata(path)?;
     if linked(&meta) {
@@ -132,6 +215,68 @@ impl Cache {
 
     pub(crate) fn bytes(&self) -> Result<u64, Error> {
         self.process(None, false)
+    }
+
+    /// `path` as a link-free folder of this cache, made when it is absent. Anything else there (a
+    /// link, a junction, a file) is removed as itself, never followed, and replaced by an empty
+    /// folder. The lease must be held; the parent of `path` is a folder this cache already owns.
+    fn own(&self, path: &Path) -> Result<(), Error> {
+        match checked(path, true) {
+            Ok(Some(_)) => (),
+            Ok(None) => fs::create_dir(path)?,
+            Err(Error::Unsafe(_)) => {
+                remove(path)?;
+                fs::create_dir(path)?;
+            }
+            Err(error) => return Err(error),
+        }
+        self.unchanged_path(path)
+    }
+
+    /// Where [`Self::work_slot`] puts `slot`, before anything is made there.
+    pub(crate) fn work_slot_path(&self, slot: &str) -> PathBuf {
+        crate::backend::plain(self.root.join(WORK).join(slot))
+    }
+
+    /// The folder the compiler's own build folders persist in for the game build `slot` names,
+    /// `native/w/<slot>`, checked link-free below the lease. A slot holding a link where the
+    /// SDK keeps its own folders is removed whole (never followed) and made again empty: it
+    /// builds cold once, with no repair of what was there.
+    pub(crate) fn work_slot(&self, slot: &str) -> Result<Provisioned, Error> {
+        let work = self.root.join(WORK);
+        let path = work.join(single(slot)?);
+        self.own(&work)?;
+        match sdk_owned(&path) {
+            Ok(()) => (),
+            Err(Error::Unsafe(_)) => remove(&path)?,
+            Err(error) => return Err(error),
+        }
+        self.own(&path)?;
+        let cold = fs::read_dir(&path)?.next().is_none();
+        Ok(Provisioned {
+            path: crate::backend::plain(path),
+            cold,
+        })
+    }
+
+    /// [`Self::work_slot`] after removing what the slot held: the one cold build a slot that
+    /// failed gets.
+    pub(crate) fn fresh_work_slot(&self, slot: &str) -> Result<Provisioned, Error> {
+        remove(&self.root.join(WORK).join(single(slot)?))?;
+        self.work_slot(slot)
+    }
+
+    /// Cargo's home, `<build folder>/cargo`, the same folder Storage counts as build files,
+    /// checked link-free below the lease. A link there is removed as itself and the folder made
+    /// again.
+    pub(crate) fn cargo_home(&self) -> Result<PathBuf, Error> {
+        let build = self
+            .root
+            .parent()
+            .expect("the native folder is inside the build folder");
+        let path = build.join("cargo");
+        self.own(&path)?;
+        Ok(crate::backend::plain(path))
     }
     pub(crate) fn clear(&self) -> Result<u64, Error> {
         crate::cache_cleanup::Access::IncompleteGame.check()?;

@@ -2136,8 +2136,23 @@ fn build_stages(
         for bundle in &mods {
             copy_bundle(bundle, &compiled.join(&bundle.manifest.id))?;
         }
+        // A signed SDK's mods compile in the folders kept for this game build between builds,
+        // with Cargo's home and the SDK's slices where they are kept. A developer's own SDK, a
+        // build whose last compiler tree was not proved gone in this run, and a folder too deep
+        // for Windows each use the attempt's own folders, as before.
+        let slot = workspace::SlotKey::new(&revision, rust.host.target, target)
+            .and_then(|key| key.usable(local_sdk.is_some()));
+        if let Some(key) = slot {
+            let described = key.describe();
+            let note = if workspace.attach(lease, key).map_err(cache_error)? {
+                format!("Native build slot {described}")
+            } else {
+                "Native build folder not kept: its paths would be too deep for Windows".to_owned()
+            };
+            let _ = append_log(&note);
+            crate::launcher_log::line(note);
+        }
         let game = workspace.package(game).map_err(|e| e.to_string())?;
-        let work = workspace.work();
         // A package carries the registry lock `cargo sunrise-mod build` wrote; a source folder may
         // have none yet. It gets the lock `native-lock` writes, from this build's tool and with
         // the same kept game lock, which runs none of the mod's code. The author's folder is
@@ -2158,7 +2173,6 @@ fn build_stages(
         }
         // The libraries an earlier build of these mods kept (`kept`), copied in so the tool
         // compiles only the mods whose own inputs changed. Without them, every mod compiles.
-        let seeding = std::time::Instant::now();
         let mixins_from_source = MIXINS_FROM_SOURCE.load(std::sync::atomic::Ordering::Relaxed);
         let kept_store = kept::Kept::new(&root());
         let kept_plan = match (signed_sdk, expected_route) {
@@ -2185,61 +2199,104 @@ fn build_stages(
             ),
             _ => None,
         };
-        if let Some(plan) = &kept_plan {
-            let reused = kept_store.seed(&work, &plan.mods, &plan.keys);
-            if !reused.is_empty() {
-                timed(
-                    &trf(
-                        "Reusing the libraries kept from an earlier build: {mods}",
-                        &[("mods", &reused.join(", "))],
-                    ),
-                    seeding,
-                )?;
+        // A folder that held something before and fails with a plain tool failure or outputs
+        // that don't verify, once the compiler tree is proved gone, is emptied and built cold
+        // one more time (`retry_cold` allows it once).
+        let (built, libraries) = loop {
+            let work = workspace.work();
+            let seeding = std::time::Instant::now();
+            if let Some(plan) = &kept_plan {
+                let reused = kept_store.seed(&work, &plan.mods, &plan.keys);
+                if !reused.is_empty() {
+                    timed(
+                        &trf(
+                            "Reusing the libraries kept from an earlier build: {mods}",
+                            &[("mods", &reused.join(", "))],
+                        ),
+                        seeding,
+                    )?;
+                }
             }
-        }
-        let built = tool::build(
-            &rust,
-            program,
-            tool::Plan {
-                work: &work,
-                workspace: &mut workspace,
-                package: tool::Package {
-                    runtime: &game.runtime,
-                    api: &game.api,
-                    engine: &game.engine,
+            let built = tool::build(
+                &rust,
+                program,
+                tool::Plan {
+                    work: &work,
+                    workspace: &mut workspace,
+                    package: tool::Package {
+                        runtime: &game.runtime,
+                        api: &game.api,
+                        engine: &game.engine,
+                    },
+                    mods: &compiled,
+                    server: target == Target::Server,
+                    mixins_from_source,
                 },
-                mods: &compiled,
-                server: target == Target::Server,
-                mixins_from_source,
-            },
-            &|id, done, total| {
-                crate::launcher_log::line(format!("Compiling {id}"));
-                progress(Step::Mod {
-                    id: id.to_owned(),
-                    done,
-                    total,
-                })
-            },
-            cancellation,
-            options.staging.map(crate::profile_txn::Staging::handoff),
-        );
-        // Don't turn a stopped tool into an attributed compile failure.
-        cancellation.check()?;
-        let built = built.map_err(blame)?;
-        let libraries = workspace
-            .verify_outputs(
+                &|id, done, total| {
+                    crate::launcher_log::line(format!("Compiling {id}"));
+                    progress(Step::Mod {
+                        id: id.to_owned(),
+                        done,
+                        total,
+                    })
+                },
+                cancellation,
+                options.staging.map(crate::profile_txn::Staging::handoff),
+            );
+            // Without a proof that the compiler tree stopped, this folder isn't used again in
+            // this launcher run.
+            workspace.note_unproved();
+            // Don't turn a stopped tool into an attributed compile failure.
+            cancellation.check()?;
+            let built = match built {
+                Ok(built) => built,
+                Err(failure) => {
+                    let unattributed = failure.blame.is_none();
+                    let failed = blame(failure);
+                    if unattributed
+                        && matches!(
+                            failed,
+                            Failed::Tool {
+                                retryable: false,
+                                ..
+                            }
+                        )
+                        && workspace.retry_cold(lease).map_err(cache_error)?
+                    {
+                        crate::launcher_log::line(
+                            "Native build failed in a kept folder: building cold once",
+                        );
+                        continue;
+                    }
+                    return Err(failed);
+                }
+            };
+            match workspace.verify_outputs(
                 &built,
                 &game,
                 &rust,
                 *expected_route,
                 &revision,
                 mods.iter().map(|bundle| &bundle.manifest),
-            )
-            .map_err(|e| {
-                let _ = append_log(&e.to_string());
-                tr("The native build tool's output couldn't be verified. See the build log.")
+            ) {
+                Ok(libraries) => break (built, libraries),
+                Err(error) => {
+                    let _ = append_log(&error.to_string());
+                    if workspace.retry_cold(lease).map_err(cache_error)? {
+                        crate::launcher_log::line(
+                            "Native build output not verified in a kept folder: building cold once",
+                        );
+                        continue;
+                    }
+                    return Err(tr(
+                        "The native build tool's output couldn't be verified. See the build log.",
+                    )
                     .to_owned()
-            })?;
+                    .into());
+                }
+            }
+        };
+        let work = workspace.work();
         append_log(&trf(
             "Native mods route: {route}.",
             &[("route", built.route.name())],

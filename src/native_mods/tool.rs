@@ -291,7 +291,7 @@ pub(super) fn toolchain(rust: &Toolchain) -> Value {
 /// The plan's JSON line.
 fn plan_line(rust: &Toolchain, plan: &Plan<'_>) -> String {
     let mut tools = toolchain(rust);
-    tools["cargo_home"] = serde_json::json!(plan.workspace.path().join("cargo"));
+    tools["cargo_home"] = serde_json::json!(plan.workspace.cargo_home());
     serde_json::json!({
         "contract": CONTRACT,
         "work": plan.work,
