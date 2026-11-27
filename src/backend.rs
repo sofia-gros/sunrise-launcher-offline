@@ -2528,21 +2528,6 @@ pub(crate) fn reuse_prepared_for(tag: &str) {
 }
 
 fn reuse_prepared_for_cancellable(tag: &str, stop: Option<&crate::native_mods::Cancellation>) {
-    reuse_prepared_within(tag, stop, DATA_FILE_DEADLINE);
-}
-
-/// How long an install that has no Cancel of its own (Play's install, a local build's import)
-/// waits for the optional data-file writer before it stops it. A switch's Cancel stops it at
-/// any time instead.
-const DATA_FILE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
-
-/// [`reuse_prepared_for_cancellable`], waiting at most `deadline` for the data-file writer when
-/// there is no `stop` to end it.
-fn reuse_prepared_within(
-    tag: &str,
-    stop: Option<&crate::native_mods::Cancellation>,
-    deadline: std::time::Duration,
-) {
     if stop.is_some_and(crate::native_mods::Cancellation::is_stopped) {
         return;
     }
@@ -2574,55 +2559,27 @@ fn reuse_prepared_within(
     if stop.is_some_and(crate::native_mods::Cancellation::is_stopped) {
         return;
     }
-    // Written before the install returns, not on a thread of its own: a switch or Play that
-    // follows at once takes the same preparation lock, which is never waited for, so a writer
-    // still holding it made them fail with "already being prepared". It can take a while under
-    // a virus scanner (#1961), so it says so.
+    // Only an install with a Cancel writes the optional data file (a switch's): one with none
+    // (Play's install, a local build's import) skips it. The game reads its files one by one
+    // without it, and a preparer that never answers, or ignores the stop, can't hang such an
+    // install after its build is in place (review of #615). Before, it ran on a thread of its
+    // own and nothing waited for it, but that thread could still hold the preparation lock when
+    // a switch or Play that followed took it, and they failed with "already being prepared".
+    let Some(stop) = stop else {
+        crate::launcher_log::line(format!(
+            "{tag}: the optional data file is not written, as nothing could cancel it"
+        ));
+        return;
+    };
+    // Written before the install returns, not on a thread of its own, so the lock is free for
+    // what follows. It can take a while under a virus scanner (#1961), so it says so.
     crate::launcher_log::play_detail(crate::i18n::tr("Writing the game's data file"));
     let writing = crate::launcher_log::step(format!("Writing {tag}'s data file"));
-    let (result, gave_up) =
-        write_data_file_within(&version_dir(tag), &resources(tag), stop, deadline);
-    match result {
+    match write_data_file(&version_dir(tag), &resources(tag), Some(stop)) {
         Ok(()) => writing.done(""),
-        Err(_) if gave_up => {
-            writing.note(format!(
-                "stopped after {} s: nothing could cancel it, and the data file is optional",
-                deadline.as_secs()
-            ));
-            writing.cancelled();
-        }
+        Err(_) if stop.is_stopped() => writing.cancelled(),
         Err(e) => writing.failed(e),
     }
-}
-
-/// [`write_data_file`] that never waits past `deadline` when there is no `stop`: the writer
-/// gets a cancellation of its own, stopped at the deadline, so a preparer that never answers
-/// can't hang an install after its build is in place (review of #615). The lock is still
-/// held only while it runs. The flag says whether the deadline stopped it.
-fn write_data_file_within(
-    root: &Path,
-    resources: &Path,
-    stop: Option<&crate::native_mods::Cancellation>,
-    deadline: std::time::Duration,
-) -> (Result<(), String>, bool) {
-    if let Some(stop) = stop {
-        return (write_data_file(root, resources, Some(stop)), false);
-    }
-    let own = crate::native_mods::Cancellation::default();
-    let (finished, wait) = std::sync::mpsc::channel::<()>();
-    let watchdog = {
-        let own = own.clone();
-        std::thread::spawn(move || {
-            if wait.recv_timeout(deadline) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
-                own.stop();
-            }
-        })
-    };
-    let result = write_data_file(root, resources, Some(&own));
-    drop(finished);
-    let _ = watchdog.join();
-    let gave_up = result.is_err() && own.is_stopped();
-    (result, gave_up)
 }
 
 /// Writes a prepared version's `sunrise-data.bin` so its first start already reads one file, not
@@ -8322,7 +8279,8 @@ pub fn {f}("
         )
         .unwrap();
         fs::set_permissions(&preparer, fs::Permissions::from_mode(0o700)).unwrap();
-        reuse_prepared_for_cancellable(TAG, None);
+        // A switch's install, which has a Cancel and so writes the optional data file.
+        reuse_prepared_for_cancellable(TAG, Some(&crate::native_mods::Cancellation::default()));
         assert!(
             version.join("data-file-done").exists(),
             "the writer finished before the install returned"
@@ -8410,32 +8368,31 @@ pub fn {f}("
         .unwrap();
         fs::write(version.join(COMPLETE), "").unwrap();
         fs::write(resources.join(RESOURCES_MANIFEST), "{}").unwrap();
-        // A writer that would take half a minute for the install's data file, and no Cancel to
-        // stop it. A seal's cache, packed in its snapshot under `launcher-prepared` first, is
-        // answered at once: this is about the install's own writer.
+        // A writer for the install's data file that ignores the stop and would take half a
+        // minute, and no Cancel. A seal's cache, packed in its snapshot under
+        // `launcher-prepared` first, is answered at once: this is about the install's own
+        // writer, which the stand-in marks when it is asked for it.
         let preparer = version.join("sunrise-prepare");
         fs::write(
             &preparer,
-            "#!/bin/sh\ncase \"$*\" in\n  data-file*launcher-prepared*) echo '{\"format\":1,\"written\":false}';;\n  data-file*) sleep 30; echo '{\"format\":1,\"written\":true}';;\n  *) exit 2;;\nesac\n",
+            "#!/bin/sh\ntrap '' TERM\ncase \"$*\" in\n  data-file*launcher-prepared*) echo '{\"format\":1,\"written\":false}';;\n  data-file*) touch \"$(dirname \"$0\")/install-writer-asked\"; sleep 30; echo '{\"format\":1,\"written\":true}';;\n  *) exit 2;;\nesac\n",
         )
         .unwrap();
         fs::set_permissions(&preparer, fs::Permissions::from_mode(0o700)).unwrap();
-        let before = crate::launcher_log::since(0).0;
         let started = std::time::Instant::now();
-        reuse_prepared_within(TAG, None, std::time::Duration::from_secs(1));
+        reuse_prepared_for_cancellable(TAG, None);
         let took = started.elapsed();
         assert!(
             took < std::time::Duration::from_secs(10),
-            "the install waited {took:?} for a writer that never answered"
+            "the install waited {took:?} for a writer that ignores the stop"
+        );
+        assert!(
+            !version.join("install-writer-asked").exists(),
+            "an install with no Cancel doesn't start the optional writer"
         );
         assert!(
             prepare_lock(TAG).is_ok(),
-            "the stopped writer let go of the lock"
-        );
-        let (_, lines) = crate::launcher_log::since(before);
-        assert!(
-            lines.iter().any(|line| line.contains("stopped after 1 s")),
-            "{lines:?}"
+            "nothing holds the preparation lock"
         );
     }
 
