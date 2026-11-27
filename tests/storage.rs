@@ -195,7 +195,10 @@ fn unresolved_instance_caches_are_never_selected() {
         "launcher/settings.json",
         br#"{"selected":"missing-version"}"#,
     );
-    let cache = home.file("game/.sunrise-cache/precious", b"unresolved instance cache");
+    let cache = home.file(
+        "game/.sunrise-cache/behaviours-v8.bin",
+        b"unresolved instance cache",
+    );
     home.clear("other-caches");
     assert_eq!(
         fs::read(cache).unwrap(),
