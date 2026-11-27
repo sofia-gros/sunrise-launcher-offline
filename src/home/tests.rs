@@ -38,6 +38,7 @@ fn a_long_list_builds_the_rows_near_the_view() {
 
 /// Runs `test` again in a child process with scratch homes, as the other window tests do:
 /// `None` here, the scratch root in the child.
+#[cfg(debug_assertions)]
 fn scratch_child(test: &str) -> Option<std::path::PathBuf> {
     const CHILD: &str = "SUNRISE_HOME_WINDOW_TEST";
     if let Some(root) = std::env::var_os(CHILD) {
@@ -100,7 +101,7 @@ fn a_controls_tooltip_leaves_when_its_menu_opens(
     settings.instance = Some(profile.id.clone());
     settings.save().unwrap();
     let mut app = gpui::TestAppContext::single();
-    let (shell, cx) = app.add_window_view(crate::window_root::Shell::new);
+    let (shell, cx) = app.add_window_view(crate::window_root::Shell::new_for_test);
     let launcher = shell.read_with(cx, |shell, _| shell.launcher());
     cx.run_until_parked();
     // `debug_bounds` takes a static selector; the test process ends soon after.
