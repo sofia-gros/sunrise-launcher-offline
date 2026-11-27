@@ -94,6 +94,7 @@ impl Resources {
                     &minecraft,
                     backend::MinecraftFrom::Install,
                     log,
+                    diagnostics,
                     &handoff,
                 )?;
                 backend::sounds_staged(base, &minecraft, diagnostics, &handoff);
