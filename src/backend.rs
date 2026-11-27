@@ -8256,6 +8256,7 @@ pub fn {f}("
             .join("drafts")
             .join("dev-2026-11-27-ccccccc")
             .join("sunrise-linux-x86_64.tar.gz");
+        fs::create_dir_all(archive.parent().unwrap()).unwrap();
         let before = crate::launcher_log::since(0).0;
         let error = logged("Installing a private draft".into(), || {
             open_draft(&archive).map(drop)
