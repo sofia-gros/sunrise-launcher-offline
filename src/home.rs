@@ -456,7 +456,7 @@ impl Launcher {
                     }))
             })
             .reach_edge();
-        let icon_button = |id, icon, label| {
+        let icon_button = |id, icon, label: Option<&'static str>| {
             crate::frame::input(false)
                 .id(id)
                 .flex_none()
@@ -466,40 +466,48 @@ impl Launcher {
                 .cursor_pointer()
                 .hover(move |s| s.bg(rgb(p.hover)))
                 .reach_edge()
-                .tooltip(crate::glass_ui::tip(label))
+                .when_some(label, |d, label| d.tooltip(crate::glass_ui::tip(label)))
                 .child(crate::glass_ui::icon(icon, 21., rgb(p.text).into()))
         };
         // One button for the profile's own options (Sunrise Extras, its folder), in a menu
         // like the build chooser's. Mods has its tab in the top bar.
         let at = self.ui.home.menu.clone();
-        let menu = icon_button("alt-quick-menu", "settings-01", tr("Profile options"))
-            .when(self.ui.sheet == Some(Sheet::ProfileMenu), |d| {
-                d.bg(rgb(p.hover))
-            })
-            .child(
-                gpui::canvas(
-                    move |bounds, window, cx| {
-                        if at.replace(Some(bounds)) != Some(bounds) {
-                            // An open menu follows it, in the frame after this one.
-                            let window = window.window_handle();
-                            cx.defer(move |cx| {
-                                window.update(cx, |_, window, _| window.refresh()).ok();
-                            });
-                        }
-                    },
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .inset_0(),
+        // Its tooltip waits while its menu is open, as the build button's does: it would sit
+        // over the menu's first row.
+        let menu_open = self.ui.sheet == Some(Sheet::ProfileMenu);
+        let menu = icon_button(
+            "alt-quick-menu",
+            "settings-01",
+            (!menu_open).then(|| tr("Profile options")),
+        )
+        .debug_selector(|| "home-profile-menu".into())
+        .when(self.ui.sheet == Some(Sheet::ProfileMenu), |d| {
+            d.bg(rgb(p.hover))
+        })
+        .child(
+            gpui::canvas(
+                move |bounds, window, cx| {
+                    if at.replace(Some(bounds)) != Some(bounds) {
+                        // An open menu follows it, in the frame after this one.
+                        let window = window.window_handle();
+                        cx.defer(move |cx| {
+                            window.update(cx, |_, window, _| window.refresh()).ok();
+                        });
+                    }
+                },
+                |_, _, _, _| {},
             )
-            .on_click(cx.listener(|this, _, _, cx| {
-                if this.ui.sheet == Some(Sheet::ProfileMenu) {
-                    this.close_sheet();
-                } else {
-                    this.open_sheet(Sheet::ProfileMenu);
-                }
-                cx.notify();
-            }));
+            .absolute()
+            .inset_0(),
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            if this.ui.sheet == Some(Sheet::ProfileMenu) {
+                this.close_sheet();
+            } else {
+                this.open_sheet(Sheet::ProfileMenu);
+            }
+            cx.notify();
+        }));
         let act = view.act.clone().map(|act| {
             let id = match act {
                 crate::launch_state::Act::StopBuild => "alt-build-stop",
@@ -676,7 +684,12 @@ impl Launcher {
         let at = self.ui.home.picker.clone();
         div()
             .id("alt-build")
-            .when_some(version, |d, tag| d.tooltip(crate::glass_ui::tip(tag)))
+            .debug_selector(|| "home-build".into())
+            // Not while its menu is open: the tag would sit over the menu's heading.
+            .when_some(
+                version.filter(|_| self.ui.sheet != Some(Sheet::Build)),
+                |d, tag| d.tooltip(crate::glass_ui::tip(tag)),
+            )
             .min_w(px(120.))
             .max_w(px(340.))
             .rounded(crate::tokens::r(crate::tokens::R_CONTROL))

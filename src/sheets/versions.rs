@@ -620,7 +620,7 @@ impl Launcher {
                 div()
                     .rounded(crate::tokens::r(crate::tokens::R_CARD))
                     .border_1()
-                    .border_color(palette().input_edge())
+                    .border_color(rgb(palette().divider))
                     .p(px(4.))
                     .child(rows)
                     .children(nothing),
