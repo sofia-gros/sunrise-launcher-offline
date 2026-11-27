@@ -190,6 +190,7 @@ struct Entry {
     directory: Option<Arc<Dir>>,
     relative: PathBuf,
     path: PathBuf,
+    profile: Option<Arc<(PathBuf, String)>>,
 }
 
 impl Entry {
@@ -220,6 +221,7 @@ impl Entry {
             directory: root.directory.clone(),
             relative: relative.to_owned(),
             path,
+            profile: None,
         })
     }
 
@@ -235,18 +237,27 @@ impl Entry {
     fn access(&self) -> Result<Access, Error> {
         #[cfg(test)]
         ACCESS.with(|calls| calls.set(calls.get() + 1));
-        match self.category {
-            Category::RustCompiler | Category::ModBuildCache => Ok(Access::BuildTools),
-            _ if is_compiler_attempt(&self.relative) => Ok(Access::BuildTools),
-            // No game runs from kept mod libraries: a build copies them into its workspace.
-            _ if self.relative.starts_with(BuildCache::KeptMods.relative()) => {
-                Ok(Access::BuildTools)
-            }
-            _ => Access::for_unit(&self.path),
+        if self.build_tool() {
+            Ok(Access::BuildTools)
+        } else {
+            Access::for_unit(&self.path)
         }
     }
 
+    fn build_tool(&self) -> bool {
+        matches!(
+            self.category,
+            Category::RustCompiler | Category::ModBuildCache
+        ) || is_compiler_attempt(&self.relative)
+            || self.relative.starts_with(BuildCache::KeptMods.relative())
+    }
+
+    #[cfg(test)]
     fn clear(&self) -> Result<(), Error> {
+        self.remove(false)
+    }
+
+    fn remove(&self, explicit: bool) -> Result<(), Error> {
         let owns_links =
             self.category == Category::ModBuildCache || is_compiler_attempt(&self.relative);
         if !owns_links && !self.path.try_exists()? {
@@ -255,11 +266,33 @@ impl Entry {
         let Some(root) = &self.directory else {
             return Ok(());
         };
-        let access = self.access()?;
-        if matches!(access, Access::LeasedGame) {
-            return crate::cache_cleanup::delete_game_unit(&self.path);
+        let _profile = if let Some(profile) = &self.profile {
+            let (home, version) = profile.as_ref();
+            let owner = instances::lifecycle::owner_file(&backend::game_home(), home)
+                .map_err(|_| Error::Busy)?;
+            let claim = crate::profile_txn::Admission::claim(home, owner.as_deref())
+                .map_err(|_| Error::Busy)?;
+            if backend::in_use(version) {
+                return Err(Error::Busy);
+            }
+            Some(claim)
+        } else {
+            None
+        };
+        if !explicit {
+            let access = self.access()?;
+            if matches!(access, Access::LeasedGame) {
+                return crate::cache_cleanup::delete_game_unit(&self.path);
+            }
+            access.check()?;
+        } else if !self.build_tool() && !self.relative.starts_with("native/target") {
+            let data = present(backend::data_dir().canonicalize())?;
+            if data.as_ref().is_some_and(|data| {
+                self.path.starts_with(data) || self.path.starts_with(backend::plain(data.clone()))
+            }) {
+                return crate::cache_cleanup::clear_claimed_unit(&self.path);
+            }
         }
-        access.check()?;
         let mut parent = root.try_clone()?;
         for part in self.relative.parent().unwrap_or(Path::new("")).components() {
             parent = parent.open_dir_nofollow(part.as_os_str())?;
@@ -394,13 +427,24 @@ impl Storage {
                 )?);
             }
         }
-        for relative in ["cache/github", "mod-browser", "profile-heads"] {
-            add(&mut entries, &data, relative, Category::OtherCaches)?;
+        let game = backend::game_home();
+        let overlaps_profile = |path: &Path| {
+            backend::plain(path.to_owned()) == backend::plain(game.clone())
+                || profiles.as_ref().is_some_and(|profiles| {
+                    profiles.iter().any(|profile| {
+                        backend::plain(path.to_owned()) == backend::plain(profile.home.clone())
+                    })
+                })
+        };
+        if !overlaps_profile(&data.path) {
+            for relative in ["cache/github", "mod-browser", "profile-heads"] {
+                add(&mut entries, &data, relative, Category::OtherCaches)?;
+            }
         }
         if let Some(profiles) = &profiles {
             profile_caches(&mut entries, profiles)?;
         }
-        self.detached_trash(&mut entries, &data)?;
+        self.detached_trash(&mut entries, &data, profiles.as_deref().unwrap_or(&[]))?;
         Ok(entries)
     }
 
@@ -497,13 +541,19 @@ impl Storage {
     }
 
     /// Detached trees can remain beside any managed cache after an interrupted removal.
-    fn detached_trash(&self, entries: &mut Vec<Entry>, data: &Root) -> Result<(), Error> {
+    fn detached_trash(
+        &self,
+        entries: &mut Vec<Entry>,
+        data: &Root,
+        profiles: &[instances::Instance],
+    ) -> Result<(), Error> {
         let parents: HashSet<_> = entries
             .iter()
             .filter(|entry| {
-                !PROFILE_GAME_CACHES
-                    .iter()
-                    .any(|relative| entry.relative == Path::new(relative))
+                entry.profile.is_none()
+                    && !PROFILE_GAME_CACHES
+                        .iter()
+                        .any(|relative| entry.relative == Path::new(relative))
             })
             .filter_map(|entry| entry.path.parent().map(Path::to_owned))
             .chain([
@@ -515,7 +565,13 @@ impl Storage {
         let work = self.root.join(BuildCache::ModBuildCache.relative());
         for parent in parents {
             // Detached slots inside `native/w` are already inventoried as Mod build cache.
-            if parent == work {
+            let plain = backend::plain(parent.clone());
+            if parent == work
+                || plain == backend::plain(backend::game_home())
+                || profiles
+                    .iter()
+                    .any(|profile| plain == backend::plain(profile.home.clone()))
+            {
                 continue;
             }
             let root = Root::open(&parent)?;
@@ -523,7 +579,21 @@ impl Storage {
                 continue;
             }
             for entry in children(&parent)? {
-                if entry.file_name().to_string_lossy().starts_with(".trash-") {
+                let name = entry.file_name();
+                let Some(suffix) = name.to_str().and_then(|name| name.strip_prefix(".trash-"))
+                else {
+                    continue;
+                };
+                let mut numbers = suffix.split('-');
+                if numbers.next().is_some_and(|pid| pid.parse::<u32>().is_ok())
+                    && numbers
+                        .next()
+                        .is_some_and(|stamp| stamp.parse::<u128>().is_ok())
+                    && numbers
+                        .next()
+                        .is_none_or(|counter| counter.parse::<u64>().is_ok())
+                    && numbers.next().is_none()
+                {
                     entries.push(Entry::fixed(
                         &root,
                         Path::new(&entry.file_name()),
@@ -633,7 +703,7 @@ impl Storage {
                         .clear()
                         .map(|_| ())
                 } else {
-                    entry.clear()
+                    entry.remove(retain)
                 };
                 match result {
                     // Only a cleared folder is walked again, to see what is left of it.
@@ -655,7 +725,7 @@ impl Storage {
                         row.keep(trees[index].size(&mut HashSet::new()), error, true);
                         // A busy build may be using subsequent build-tool units too. Stop
                         // this clear attempt rather than deleting more after contention.
-                        if matches!(entry.access()?, Access::BuildTools) {
+                        if entry.build_tool() {
                             break;
                         }
                     }
@@ -778,9 +848,14 @@ fn profile_caches(entries: &mut Vec<Entry>, profiles: &[instances::Instance]) ->
             continue;
         }
         let root = Root::open(&instance.home)?;
+        let start = entries.len();
         old_logs(entries, &root)?;
         unused_jars(entries, &root)?;
         profile_game_caches(entries, &root)?;
+        let profile = Arc::new((instance.home.clone(), version));
+        for entry in &mut entries[start..] {
+            entry.profile = Some(profile.clone());
+        }
     }
     Ok(())
 }
@@ -895,7 +970,7 @@ mod manual_tests {
         let launcher = crate::storage::tests::Home::new();
         let storage = Storage::at(&launcher.0).unwrap();
         let data = Root::open(&launcher.0).unwrap();
-        storage.detached_trash(&mut entries, &data).unwrap();
+        storage.detached_trash(&mut entries, &data, &[]).unwrap();
         assert_eq!(entries.len(), 5);
         for file in files {
             assert_eq!(
@@ -917,7 +992,14 @@ mod manual_tests {
         let file = home.seed("game/output");
         let storage = Storage::at(&home.0).unwrap();
         let root = Root::open(&home.0).unwrap();
-        let entries = vec![Entry::fixed(&root, Path::new("game"), Category::BuildFiles).unwrap()];
+        let entries = vec![Entry::fixed(&root, Path::new("game"), Category::RustCompiler).unwrap()];
+        let lock = home.seed("game/.cargo-lock");
+        let lock = fs::File::options()
+            .read(true)
+            .write(true)
+            .open(lock)
+            .unwrap();
+        lock.lock().unwrap();
         let directory = file.parent().unwrap();
         // Give inline-directory filesystems enough names to allocate directory blocks too.
         for index in 0..32 {
@@ -944,7 +1026,7 @@ mod manual_tests {
         let row = report
             .rows
             .iter()
-            .find(|row| row.category == Category::BuildFiles)
+            .find(|row| row.category == Category::RustCompiler)
             .unwrap();
         assert_eq!(row.bytes, bytes);
         assert_eq!(row.freed_bytes, 0);
