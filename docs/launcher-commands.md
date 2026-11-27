@@ -132,7 +132,7 @@ MCP: `server`, `server_command`, `server_log`, `server_stop`.
 
 ## `sunrise-launcher storage`
 
-Show disposable storage by category as JSON. Builds must be idle.
+Show disposable storage by category as JSON, or clear a category by hand with `--clear`. Read-only reports never block builds; `--clear` requires builds to be idle.
 
     sunrise-launcher storage
 
@@ -153,7 +153,7 @@ MCP: `native_lock`.
 
 ## `sunrise-launcher native-build`
 
-Native mods (docs/modding/src/how-to/native-mods.md): compile flat Rust mod projects against the profile's exact Sunrise source revision with the launcher's own Rust, as the version the profile then plays. Not sandboxed: the mods' code runs with your rights. If there are no native mods to build, it exits successfully; a server export still fails, as no engine is made.
+Native mods (docs/modding/src/how-to/native-mods.md): compile flat Rust mod projects against the profile's exact Sunrise source revision with the launcher's own Rust, as the version the profile then plays. Not sandboxed: the mods' code runs with your rights. If there are no native mods to build, it exits successfully; a server export still fails, as no engine is made. Reclaim disk by hand with `storage --clear all` or Settings → Storage.
 
     sunrise-launcher native-build [FOLDER]
 
@@ -248,11 +248,11 @@ MCP: `account_select`.
 
 ## `sunrise-launcher settings`
 
-Show the launcher's settings, or set one (the Settings page): selected-version TAG, game-architecture auto|x64|arm64, minecraft-dir PATH, server-dir PATH ("default" resets a folder), prune-old-versions on|off (delete unused old automatic downloads after an install, keeping the newest few), keep-versions N (how many of the newest to keep; "default" is 2), opening-animation on|off, cat on|off (the corner cat), proxy http://host:port|socks5://host:port ("default" removes it), while-playing stay|minimize|hide (what the window does while the game runs), language system|CODE (the window's language: en, fr, de, ja, pt-br... any language the launcher has; system follows the computer's; a wrong code lists them all), theme default|ID|local:SLUG (a built-in theme, or one of yours from the themes folder; "default" is Dawn; a wrong id lists them all), accent violet|blue|teal|green|amber|red|pink|#rrggbb|DEGREES (a named accent, any colour, or any hue; "theme" goes back to the theme's own), background PATH (your picture behind Home; "default" goes back to the theme's), scenery on|off (whether anything is behind the pages), panel-opacity PERCENT|default (glass panels over Home's background), reduced-graphics on|off (no glass blur or decorative motion), cache-limit-gib N (managed cache limit in GiB: 10, 25 (default), 50, 100; 0 disables automatic cleanup).
+Show the launcher's settings, or set one (the Settings page): selected-version TAG, game-architecture auto|x64|arm64, minecraft-dir PATH, server-dir PATH ("default" resets a folder), prune-old-versions on|off (delete unused old automatic downloads after an install, keeping the newest few), keep-versions N (how many of the newest to keep; "default" is 2), opening-animation on|off, cat on|off (the corner cat), proxy http://host:port|socks5://host:port ("default" removes it), while-playing stay|minimize|hide (what the window does while the game runs), language system|CODE (the window's language: en, fr, de, ja, pt-br... any language the launcher has; system follows the computer's; a wrong code lists them all), theme default|ID|local:SLUG (a built-in theme, or one of yours from the themes folder; "default" is Dawn; a wrong id lists them all), accent violet|blue|teal|green|amber|red|pink|#rrggbb|DEGREES (a named accent, any colour, or any hue; "theme" goes back to the theme's own), background PATH (your picture behind Home; "default" goes back to the theme's), scenery on|off (whether anything is behind the pages), panel-opacity PERCENT|default (glass panels over Home's background), reduced-graphics on|off (no glass blur or decorative motion).
 
     sunrise-launcher settings [KEY] [VALUE]
 
-- `KEY` (selected-version, minecraft-dir, server-dir, prune-old-versions, keep-versions, opening-animation, cat, game-architecture, proxy, while-playing, worlds, language, theme, accent, background, scenery, panel-opacity, reduced-graphics, cache-limit-gib)
+- `KEY` (selected-version, minecraft-dir, server-dir, prune-old-versions, keep-versions, opening-animation, cat, game-architecture, proxy, while-playing, worlds, language, theme, accent, background, scenery, panel-opacity, reduced-graphics)
 - `VALUE`: The new value (with KEY)
 
 worlds rows|tiles: how Home lists the worlds under Continue playing.

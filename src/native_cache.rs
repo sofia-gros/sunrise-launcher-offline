@@ -31,8 +31,8 @@ impl From<io::Error> for Error {
 
 pub(crate) struct Cache {
     root: PathBuf,
-    directory: Dir,
-    _lease: std::sync::Arc<Locked>,
+    _directory: Dir,
+    _lease: Locked,
 }
 
 pub(crate) use sunrise_launcher_smod::locks::{LockMode, Locked, Release};
@@ -109,15 +109,7 @@ fn size(path: &Path) -> Result<u64, Error> {
 }
 
 impl Cache {
-    pub(crate) fn share(&self) -> Result<Self, Error> {
-        Ok(Self {
-            root: self.root.clone(),
-            directory: self.directory.try_clone()?,
-            _lease: self._lease.clone(),
-        })
-    }
-
-    /// One cross-process lease covers staging, Cargo, installation/export and cleanup.
+    /// One cross-process lease covers staging, Cargo, installation/export and manual clear.
     /// OS locks release on exit, including a crash; a leftover lock file is not a busy marker.
     pub(crate) fn acquire(build_dir: &Path) -> Result<Self, Error> {
         checked(build_dir, true)?;
@@ -133,8 +125,8 @@ impl Cache {
         let lease = lock(&root.join(".build.lock"))?;
         Ok(Self {
             root,
-            directory,
-            _lease: std::sync::Arc::new(lease),
+            _directory: directory,
+            _lease: lease,
         })
     }
 

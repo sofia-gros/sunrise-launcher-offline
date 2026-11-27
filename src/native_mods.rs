@@ -243,15 +243,13 @@ pub fn is_native(version: &str) -> bool {
     version.starts_with(PREFIX)
 }
 
-/// Records the whole attempt, including selection or export after compilation.
+/// Records the whole attempt, including selection or export after compilation, inside the build lease.
 fn logged<T, E: std::fmt::Display + From<String>>(
     cancellation: &Cancellation,
     waiting: &dyn Fn(),
     build: impl FnOnce(Result<&crate::native_cache::Cache, &str>) -> Result<T, E>,
 ) -> Result<T, E> {
-    logged_then(cancellation, waiting, build, |cache| {
-        crate::storage::eviction::after_build_logged(cache, append_log, log_warning)
-    })
+    logged_then(cancellation, waiting, build, |_| {})
 }
 
 /// The build lease on the build folder. While another build or a cache cleanup holds it, this
@@ -275,15 +273,15 @@ pub(crate) fn build_lease(
     }
 }
 
-/// [`logged`] with the cleanup it runs after the result line, inside the build lease.
+/// [`logged`] with a callback after the result line, inside the build lease.
 fn logged_then<T, E: std::fmt::Display + From<String>>(
     cancellation: &Cancellation,
     waiting: &dyn Fn(),
     build: impl FnOnce(Result<&crate::native_cache::Cache, &str>) -> Result<T, E>,
-    cleanup: impl FnOnce(&crate::native_cache::Cache),
+    after_result: impl FnOnce(&crate::native_cache::Cache),
 ) -> Result<T, E> {
     // Another build or a cleanup holds the lease on the same target/: wait for it. Any other
-    // failure only stops cleanup for explicit builds. Automatic selection requires a held
+    // failure only stops cache stamping for explicit builds. Automatic selection requires a held
     // cache for its catalog and can refuse instead of accessing an unsafe tree.
     let cache = build_lease(cancellation, waiting)?.map_err(cache_error);
     clear_log()?;
@@ -291,8 +289,7 @@ fn logged_then<T, E: std::fmt::Display + From<String>>(
         log_warning(warning);
     }
     let result = build(cache.as_ref().map_err(String::as_str));
-    // The result is said first: the cleanup can take minutes on a big cache, and the log must
-    // not look stuck meanwhile.
+    // Say the result before any stamp warning or snapshot of the final log.
     match &result {
         Ok(_) => {
             let _ = append_log("Build completed.");
@@ -301,11 +298,9 @@ fn logged_then<T, E: std::fmt::Display + From<String>>(
             let _ = append_log(&format!("The build failed: {error}"));
         }
     }
-    // Keep this build lease through installation/export and the cleanup, including failed
-    // builds. It does not exclude independent game starts; automatic trimming can
-    // conservatively retain the cache. What the cleanup frees or keeps follows the result.
+    // Keep the build lease through installation/export and the result callback, even on failure.
     if let Ok(cache) = cache {
-        cleanup(&cache);
+        after_result(&cache);
     }
     result
 }
@@ -647,7 +642,7 @@ pub(crate) fn checked_about(version: &str) -> Result<Option<About>, String> {
 pub const RECORD: &str = "native-mods.json";
 
 /// The build record (`native-mods.json`) in version folder `dir`, if it parses.
-fn about_in(dir: &Path) -> Option<About> {
+pub(crate) fn about_in(dir: &Path) -> Option<About> {
     let json: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(dir.join(RECORD)).ok()?).ok()?;
     let field = |name: &str| json[name].as_str().map(str::to_owned);
@@ -2468,7 +2463,6 @@ fn finish_profile_build(
             meta.version = Some(built.version.clone());
         }
     })?;
-    // logged() runs central eviction under the retained build lease.
     if built.plan != Plan::UpToDate {
         progress(Step::Done {
             secs: built.secs,
@@ -2584,7 +2578,6 @@ pub fn build_server(
             )
             .map_err(String::from)?;
             export(&Target::Server.directory(&built.version), &output)?;
-            // logged() runs central eviction under the retained build lease.
             if built.plan != Plan::UpToDate {
                 progress(Step::Done {
                     secs: built.secs,
@@ -2720,6 +2713,8 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::process::{Command, Stdio};
+
+    mod build_completion;
 
     #[test]
     fn an_unreadable_mod_file_does_not_fail_the_build_of_the_others() {
@@ -4416,7 +4411,18 @@ mod tests {
         let cached = Target::Server.directory(version);
         let output = dir("server-independent").join("export");
         eprintln!("NATIVE_SERVER_EXPORT_STEP=export");
-        export(&cached, &output).unwrap();
+        let before = (crate::storage::walks(), crate::storage::entries_calls());
+        let engine = logged(&Cancellation::default(), &|| (), |cache| {
+            cache.map_err(str::to_owned)?;
+            export(&cached, &output)?;
+            Ok::<_, String>(output.join(Target::Server.binary()))
+        })
+        .unwrap();
+        assert_eq!(engine, output.join(Target::Server.binary()));
+        assert_eq!(
+            (crate::storage::walks(), crate::storage::entries_calls()),
+            before
+        );
         // install/export retain no files, iterators or compiler/tool children;
         // their synchronous calls have returned before this cache deletion.
         eprintln!("NATIVE_SERVER_EXPORT_STEP=remove_cache");
@@ -4837,8 +4843,7 @@ printf ']}}\n'
         assert!(after_result(&log, "Build completed.\n"), "{log}");
         assert!(!log.contains("error[E0425]"), "{log}");
         assert!(!log.contains("The build failed:"), "{log}");
-        // The result is on the log before the cleanup starts, and what the cleanup frees or
-        // keeps follows it, all while the build lease is still held.
+        // The result is logged before the completion callback, while the build lease is held.
         for (outcome, line) in [
             (Ok(()), "Build completed.\n"),
             (
@@ -4857,17 +4862,13 @@ printf ']}}\n'
                         crate::native_cache::Cache::acquire(&backend::build_dir()),
                         Err(crate::native_cache::Error::Busy)
                     ));
-                    append_log("Freed 1 MiB of old caches").unwrap();
-                    log_warning("kept");
+                    log_warning("could not stamp cache");
                 },
             );
             let _ = result;
             assert_eq!(*seen.borrow(), line);
             let log = fs::read_to_string(log_path()).unwrap();
-            assert_eq!(
-                log,
-                format!("{line}Freed 1 MiB of old caches\nwarning: kept\n")
-            );
+            assert_eq!(log, format!("{line}warning: could not stamp cache\n"));
         }
     }
 
@@ -4900,14 +4901,10 @@ printf ']}}\n'
         );
     }
 
-    /// The result line is on the log, and only what the cleanup after it said (what it freed, what
-    /// it kept as warnings) follows.
+    /// Only stamp warnings can follow the result line.
     fn after_result(log: &str, result: &str) -> bool {
-        log.split_once(result).is_some_and(|(_, after)| {
-            after
-                .lines()
-                .all(|line| line.starts_with("warning: ") || line.starts_with("Freed "))
-        })
+        log.split_once(result)
+            .is_some_and(|(_, after)| after.lines().all(|line| line.starts_with("warning: ")))
     }
 
     /// levzzz5154's decision (2026-10-29): a rebuild stays on the Sunrise the instance plays;

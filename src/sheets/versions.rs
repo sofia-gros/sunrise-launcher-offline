@@ -808,21 +808,9 @@ mod tests {
         };
         let mut app = gpui::TestAppContext::single();
         // The window as the launcher opens it: the launcher drawn as a cached view of its root.
-        let (shell, cx) = app.add_window_view(crate::window_root::Shell::new);
+        let (shell, cx) = app.add_window_view(crate::window_root::Shell::new_for_test);
         let launcher = shell.read_with(cx, |shell, _| shell.launcher());
         let handle = cx.update(|window, _| window.window_handle());
-        // The start-up fetch fails at once through the proxy; take its answer, so nothing
-        // replaces the list this test gives the picker.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while launcher.read_with(cx, |l, _| matches!(l.releases, Load::Loading)) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the release fetch answered"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            launcher.update(cx, |l, cx| l.drain(handle, cx));
-            cx.run_until_parked();
-        }
         let out = root.join("bench.json");
         launcher.update(cx, |l, _| {
             assert!(

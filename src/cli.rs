@@ -681,11 +681,12 @@ enum Cmd {
         #[arg(long)]
         accept_eula: bool,
     },
-    /// Show disposable storage by category as JSON. Builds must be idle
+    /// Show disposable storage by category as JSON, or clear a category by hand with `--clear`.
+    /// Read-only reports never block builds; `--clear` requires builds to be idle.
     ///
-    /// Rust/Cargo/temp build-tool caches remain clearable. Game-accessible caches, installed-version
-    /// removal and automatic runtime eviction retain files while any launch path lacks enforceable
-    /// lifetime exclusion; an empty process scan is not authorization. Read-only reports stay available.
+    /// Rust/Cargo/temp build-tool caches remain clearable. Game-accessible caches and installed-version
+    /// removal retain files while any launch path lacks enforceable lifetime exclusion; an empty
+    /// process scan is not authorization. Read-only reports stay available.
     /// Private launch records and raw captures are collected together only after all participating owners
     /// exit, under the exclusive permanent namespace gate. Published unit keys persist until exclusive
     /// unit removal. Registry entry counts are logged; lock entries are not age-collected.
@@ -704,7 +705,8 @@ enum Cmd {
     /// Native mods (docs/modding/src/how-to/native-mods.md): compile flat Rust mod projects against the profile's exact
     /// Sunrise source revision with the launcher's own Rust, as the version the profile then
     /// plays. Not sandboxed: the mods' code runs with your rights. If there are no native mods to build, it exits successfully; a
-    /// server export still fails, as no engine is made
+    /// server export still fails, as no engine is made. Reclaim disk by hand with `storage --clear all`
+    /// or Settings → Storage
     NativeBuild {
         /// Discover internal uses through compiler diagnostics. Prints resolved declarations
         /// as JSON for cargo sunrise-mod internals sync; never installs or selects a game
@@ -777,8 +779,7 @@ enum Cmd {
     /// hue; "theme" goes back to the theme's own), background PATH (your picture behind Home;
     /// "default" goes back to the theme's), scenery on|off (whether anything is behind the
     /// pages), panel-opacity PERCENT|default (glass panels over Home's background),
-    /// reduced-graphics on|off (no glass blur or decorative motion), cache-limit-gib N (managed cache limit
-    /// in GiB: 10, 25 (default), 50, 100; 0 disables automatic cleanup)
+    /// reduced-graphics on|off (no glass blur or decorative motion)
     #[command(after_help = tr("worlds rows|tiles: how Home lists the worlds under Continue playing."))]
     Settings {
         #[arg(value_parser = SETTING_KEYS)]
@@ -925,7 +926,7 @@ pub fn command() -> clap::Command {
 pub const AI_COMMANDS: [&str; 1] = ["mcp"];
 
 /// The keys `settings` sets.
-const SETTING_KEYS: [&str; 19] = [
+const SETTING_KEYS: [&str; 18] = [
     "selected-version",
     "minecraft-dir",
     "server-dir",
@@ -944,7 +945,6 @@ const SETTING_KEYS: [&str; 19] = [
     "scenery",
     "panel-opacity",
     "reduced-graphics",
-    "cache-limit-gib",
 ];
 
 fn on_off(value: &str) -> Result<bool, String> {
@@ -1033,20 +1033,6 @@ fn set_setting(s: &mut backend::Settings, key: &str, value: &str) -> Result<(), 
                     format!("{value}: say system or one of {}", codes.join(", "))
                 })?),
             }
-        }
-        "cache-limit-gib" => {
-            s.cache_limit_gib = match value {
-                "default" => None,
-                n => Some(
-                    n.parse::<u64>()
-                        .ok()
-                        .filter(|n| matches!(n, 0 | 10 | 25 | 50 | 100))
-                        .ok_or_else(|| {
-                            tr("Enter a cache limit in GiB; 0 disables automatic cleanup.")
-                                .to_string()
-                        })?,
-                ),
-            };
         }
         "proxy" => {
             if value == "default" || value.is_empty() {

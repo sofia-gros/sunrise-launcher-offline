@@ -44,30 +44,22 @@ fn build_tools_remain_clearable_without_claiming_game_absence() {
 }
 
 #[test]
-fn kept_mod_libraries_are_build_files_that_clear_and_count_toward_the_limit() {
+fn kept_mod_libraries_are_build_files_that_report_and_clear() {
     let home = Home::new();
     let blob = home.seed("native/kept-mods/blobs/0123");
     let index = home.seed("native/kept-mods/0123.json");
     let storage = Storage::at(&home.0).unwrap();
     assert_eq!(BuildCache::KeptMods.category(), Category::BuildFiles);
     assert!(storage.bytes(BuildCache::KeptMods).unwrap() > 0);
-    let report = storage
-        .evict_inventory(std::time::SystemTime::now(), None)
-        .unwrap();
+    let report = storage.report(None, false).unwrap();
     let row = report
         .rows
         .iter()
         .find(|row| row.category == Category::BuildFiles)
         .unwrap();
     assert!(row.bytes > 0, "Storage reports the kept libraries");
-    // A cache limit of nothing removes them, as it does every other build file.
-    storage
-        .evict_inventory(std::time::SystemTime::now(), Some(0))
-        .unwrap();
-    assert!(!blob.exists() && !index.exists());
-    let blob = home.seed("native/kept-mods/blobs/0123");
     assert!(storage.clear(BuildCache::KeptMods).unwrap() > 0);
-    assert!(!blob.exists());
+    assert!(!blob.exists() && !index.exists());
 }
 
 #[test]
@@ -80,7 +72,7 @@ fn hard_links_count_once() {
 }
 
 #[test]
-fn clears_only_fixed_cache_and_sweeps_detached_tree() {
+fn clears_only_fixed_cache_and_clears_detached_tree() {
     let home = Home::new();
     home.seed("native/source/revision/lib.rs");
     home.seed("settings.json");
@@ -100,8 +92,6 @@ fn clears_only_fixed_cache_and_sweeps_detached_tree() {
     assert!(home.0.join("settings.json").exists());
     assert!(home.0.join("worlds/keep/level.dat").exists());
     home.seed(".trash-interrupted/file");
-    assert!(matches!(storage.sweep(), Err(Error::UnprovenExclusion)));
-    assert!(home.0.join(".trash-interrupted/file").exists());
     Storage::clear_entry(
         &storage.directory,
         &storage.directory,
@@ -112,10 +102,34 @@ fn clears_only_fixed_cache_and_sweeps_detached_tree() {
 }
 
 #[test]
-fn cleanup_obeys_build_lease() {
+fn read_only_report_does_not_take_build_lease_while_manual_clear_does() {
     let home = Home::new();
-    let _storage = Storage::at(&home.0).unwrap();
-    assert!(matches!(Storage::at(&home.0), Err(Error::Busy)));
+    let output = home.seed("rust/old/payload");
+    let storage = Storage::at(&home.0).unwrap();
+    let held = Cache::acquire(&home.0).unwrap();
+    let report = storage.report(None, false).unwrap();
+    let row = report
+        .rows
+        .iter()
+        .find(|row| row.category == Category::RustCompiler)
+        .unwrap();
+    assert!(row.bytes > 0);
+    assert!(matches!(storage.clear(BuildCache::Rust), Err(Error::Busy)));
+    assert!(matches!(
+        storage.report(Some(Category::RustCompiler), false),
+        Err(Error::Busy)
+    ));
+    assert!(matches!(storage.report(None, true), Err(Error::Busy)));
+    assert!(output.exists());
+    drop(held);
+    let cleared = storage.report(Some(Category::RustCompiler), false).unwrap();
+    let row = cleared
+        .rows
+        .iter()
+        .find(|row| row.category == Category::RustCompiler)
+        .unwrap();
+    assert!(row.freed_bytes > 0);
+    assert!(!output.exists());
 }
 
 #[cfg(unix)]
@@ -124,6 +138,7 @@ fn refuses_linked_ancestor_and_descendant_before_deletion() {
     use std::os::unix::fs::symlink;
     let home = Home::new();
     home.seed("worlds/keep");
+    fs::create_dir_all(home.0.join("native")).unwrap();
     let storage = Storage::at(&home.0).unwrap();
     symlink(home.0.join("worlds"), home.0.join("native/source")).unwrap();
     assert!(storage.clear(BuildCache::Source).is_err());
@@ -209,7 +224,7 @@ fn read_only_file_can_be_removed() {
 
 #[cfg(windows)]
 #[test]
-fn held_open_file_is_kept_for_next_sweep() {
+fn held_open_file_is_kept_until_released() {
     use std::os::windows::fs::OpenOptionsExt;
     let home = Home::new();
     let file = home.seed("native/source/file");
@@ -221,7 +236,6 @@ fn held_open_file_is_kept_for_next_sweep() {
     let storage = Storage::at(&home.0).unwrap();
     assert!(storage.clear(BuildCache::Source).is_err());
     drop(held);
-    storage.sweep().unwrap();
     storage
         .trash(
             &storage.path(BuildCache::Source).unwrap(),
@@ -232,7 +246,7 @@ fn held_open_file_is_kept_for_next_sweep() {
 
 #[cfg(unix)]
 #[test]
-fn root_replacement_cannot_redirect_sweep() {
+fn root_replacement_cannot_redirect_clear() {
     let home = Home::new();
     let outside = Home::new();
     outside.seed(".trash-precious/world");
@@ -240,7 +254,6 @@ fn root_replacement_cannot_redirect_sweep() {
     let moved = home.0.with_extension("moved");
     fs::rename(&home.0, &moved).unwrap();
     std::os::unix::fs::symlink(&outside.0, &home.0).unwrap();
-    assert!(storage.sweep().is_err());
     assert!(storage.clear(BuildCache::Source).is_err());
     assert!(outside.0.join(".trash-precious/world").exists());
     fs::remove_file(&home.0).unwrap();
@@ -320,7 +333,6 @@ fn same_path_with_different_root_identity_is_refused() {
     let precious = home.seed("native/source/world");
     home.seed(".trash-precious/world");
     assert!(storage.clear(BuildCache::Source).is_err());
-    assert!(storage.sweep().is_err());
     assert!(precious.exists());
     assert!(home.0.join(".trash-precious/world").exists());
     fs::remove_dir_all(&home.0).unwrap();

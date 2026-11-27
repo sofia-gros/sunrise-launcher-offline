@@ -695,7 +695,7 @@ mod tests {
         }
         assert!(!backend::self_update_allowed());
         let mut app = gpui::TestAppContext::single();
-        let (shell, cx) = app.add_window_view(crate::window_root::Shell::new);
+        let (shell, cx) = app.add_window_view(crate::window_root::Shell::new_for_test);
         let launcher = shell.read_with(cx, |shell, _| shell.launcher());
         cx.run_until_parked();
         assert!(cx.debug_bounds("launcher-update").is_none(), "no offer yet");

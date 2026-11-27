@@ -117,7 +117,6 @@ impl Launcher {
         };
         self.ui.sheets.profile_action = match result {
             Ok(gone) => {
-                storage::eviction::request_cleanup();
                 let heading = trf("{name} is in the Trash.", &[("name", &gone.name)]);
                 if let Some(error) = failed_save {
                     Some(Action::Problem {
@@ -362,7 +361,7 @@ mod tests {
         settings.instance = Some(cabin.id.clone());
         settings.save().unwrap();
         let mut app = gpui::TestAppContext::single();
-        let (shell, cx) = app.add_window_view(crate::window_root::Shell::new);
+        let (shell, cx) = app.add_window_view(crate::window_root::Shell::new_for_test);
         let launcher = shell.read_with(cx, |shell, _| shell.launcher());
         cx.run_until_parked();
         let row = |cx: &mut gpui::VisualTestContext, id: &str| {
@@ -413,7 +412,7 @@ mod tests {
         settings.instance = Some(first.id.clone());
         settings.save().unwrap();
         let mut app = gpui::TestAppContext::single();
-        let (shell, cx) = app.add_window_view(crate::window_root::Shell::new);
+        let (shell, cx) = app.add_window_view(crate::window_root::Shell::new_for_test);
         let launcher = shell.read_with(cx, |shell, _| shell.launcher());
         cx.run_until_parked();
         let rows = |cx: &mut gpui::VisualTestContext| {
@@ -474,7 +473,7 @@ mod tests {
         settings.prune_old_versions = Some(false);
         settings.save().unwrap();
         let mut app = gpui::TestAppContext::single();
-        let (shell, cx) = app.add_window_view(crate::window_root::Shell::new);
+        let (shell, cx) = app.add_window_view(crate::window_root::Shell::new_for_test);
         let launcher = shell.read_with(cx, |shell, _| shell.launcher());
         let window = cx.update(|window, _| window.window_handle());
         launcher.update(cx, |launcher, cx| {
@@ -525,7 +524,7 @@ mod tests {
         let settings_path = root.join("launcher/settings.json");
 
         let mut app = gpui::TestAppContext::single();
-        let (shell, cx) = app.add_window_view(crate::window_root::Shell::new);
+        let (shell, cx) = app.add_window_view(crate::window_root::Shell::new_for_test);
         let launcher = shell.read_with(cx, |shell, _| shell.launcher());
         launcher.update(cx, |launcher, cx| {
             launcher.self_update = SelfUpdate::Ready(Release {
