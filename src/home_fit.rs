@@ -82,12 +82,35 @@ struct Answer {
 #[derive(Default)]
 pub(crate) struct ModsFit {
     key: Option<Key>,
-    asked: Option<Instant>,
+    /// When the current check finished: retry/recheck age and the background timer both count
+    /// from completion so a slow failure still pauses before retrying.
+    completed: Option<Instant>,
+    /// Set by the periodic refresh timer once it fires for this check.
+    due: bool,
     answer: Arc<OnceLock<Answer>>,
     /// The last answer, shown while a recheck runs.
     shown: Option<Arc<Fit>>,
     /// Why Home last didn't ask, as logged: said again only when it changes.
     idle: Option<&'static str>,
+}
+
+fn refresh_delay(failed: bool) -> Duration {
+    if failed {
+        RETRY
+    } else {
+        RECHECK
+    }
+}
+
+impl ModsFit {
+    fn is_stale(&self, now: Instant) -> bool {
+        self.due
+            || self.answer.get().is_some_and(|answer| {
+                self.completed.is_some_and(|completed| {
+                    now.saturating_duration_since(completed) >= refresh_delay(answer.failed)
+                })
+            })
+    }
 }
 
 /// One line in launcher.log about Home's suggestion, so a report shows why it was or wasn't made.
@@ -251,10 +274,7 @@ impl Launcher {
         };
         let now = Instant::now();
         let state = &self.ui.home.fit;
-        let stale = state.answer.get().is_some_and(|answer| {
-            let age = state.asked.map_or(Duration::MAX, |asked| now - asked);
-            age > if answer.failed { RETRY } else { RECHECK }
-        });
+        let stale = state.is_stale(now);
         if state.key.as_ref() != Some(&key) || stale {
             // Only now, not on every frame: the candidates are the picker's list, in the
             // order Home prefers. The build the profile is on is dropped on the check's thread,
@@ -270,7 +290,8 @@ impl Launcher {
             }
             let answer = Arc::new(OnceLock::new());
             state.key = Some(key.clone());
-            state.asked = Some(now);
+            state.completed = None;
+            state.due = false;
             state.answer = answer.clone();
             let home = key.home.clone();
             let work = cx.background_executor().spawn(async move {
@@ -295,16 +316,17 @@ impl Launcher {
                             "the mod index couldn't be read: {}",
                             sunrise_launcher::launcher_log::safe_error(&error.to_string())
                         ));
-                        return failed;
+                        return (failed, None);
                     }
                 };
+                let serial = catalog.index.serial;
                 let Some(checked) = sunrise_launcher::browser::sunrise::mods_fit_by_build_v2(
                     &catalog.index,
                     &home,
                     &builds,
                 ) else {
                     note("the profile's mods couldn't be read");
-                    return failed;
+                    return (failed, None);
                 };
                 let fit = decide(checked);
                 note(match &fit {
@@ -314,14 +336,44 @@ impl Launcher {
                     }
                     None => "no other build to check".to_owned(),
                 });
-                Answer {
-                    fit: fit.map(Arc::new),
-                    failed: false,
-                }
+                (
+                    Answer {
+                        fit: fit.map(Arc::new),
+                        failed: false,
+                    },
+                    Some(serial),
+                )
             });
             cx.spawn(async move |this, cx| {
-                let _ = answer.set(work.await);
-                let _ = this.update(cx, |_, cx| cx.notify());
+                let (result, used_serial) = work.await;
+                let delay = refresh_delay(result.failed);
+                let _ = answer.set(result);
+                let finished = Instant::now();
+                let active = this
+                    .update(cx, |this, cx| {
+                        let state = &mut this.ui.home.fit;
+                        let current = Arc::ptr_eq(&state.answer, &answer);
+                        if current {
+                            state.completed = Some(finished);
+                            if let (Some(serial), Some(key)) = (used_serial, state.key.as_mut()) {
+                                key.index = Some(serial);
+                            }
+                            cx.notify();
+                        }
+                        current
+                    })
+                    .unwrap_or(false);
+                if !active {
+                    return;
+                }
+                cx.background_executor().timer(delay).await;
+                let _ = this.update(cx, |this, cx| {
+                    let state = &mut this.ui.home.fit;
+                    if Arc::ptr_eq(&state.answer, &answer) {
+                        state.due = true;
+                        cx.notify();
+                    }
+                });
             })
             .detach();
         }
@@ -436,5 +488,37 @@ mod tests {
     fn a_long_list_of_mods_is_cut_to_two_names_and_a_count() {
         assert_eq!(names(["A", "B", "C"]), "A, B, C");
         assert_eq!(names(["A", "B", "C", "D"]), "A, B and 2 more");
+    }
+
+    #[test]
+    fn mods_fit_goes_stale_at_exact_retry_and_recheck_boundaries_or_when_due() {
+        let completed = Instant::now();
+        let failed = Arc::new(OnceLock::new());
+        let _ = failed.set(Answer {
+            fit: None,
+            failed: true,
+        });
+        let mut state = ModsFit {
+            completed: Some(completed),
+            answer: failed,
+            ..Default::default()
+        };
+        assert!(!state.is_stale(completed + RETRY - Duration::from_millis(1)));
+        assert!(state.is_stale(completed + RETRY));
+        state.due = true;
+        assert!(state.is_stale(completed));
+
+        let ok = Arc::new(OnceLock::new());
+        let _ = ok.set(Answer {
+            fit: None,
+            failed: false,
+        });
+        let state = ModsFit {
+            completed: Some(completed),
+            answer: ok,
+            ..Default::default()
+        };
+        assert!(!state.is_stale(completed + RECHECK - Duration::from_millis(1)));
+        assert!(state.is_stale(completed + RECHECK));
     }
 }

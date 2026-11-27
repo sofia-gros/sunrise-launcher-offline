@@ -23,10 +23,42 @@ struct FitPreview {
     /// The inventory Home had read when it was asked: a change of mods, pins or holds asks
     /// again.
     inventory: u64,
-    asked: Instant,
+    /// The signed mod index loaded when it was asked: a newer index asks again.
+    index: Option<u64>,
+    /// When the check finished: retry/recheck age and the background timer both count from
+    /// completion so a slow failure still pauses before retrying.
+    completed: Option<Instant>,
+    /// Set by the periodic refresh timer once it fires for this check.
+    due: bool,
     /// What keeps the profile's wanted mods from this build; the inner None when the index or
     /// the mods couldn't be read, which is asked again after a while.
     checked: Arc<OnceLock<Option<Vec<sunrise_launcher::browser::sunrise::Blocker>>>>,
+}
+
+impl FitPreview {
+    fn needs_refresh(
+        &self,
+        home: &std::path::Path,
+        tag: &str,
+        inventory: u64,
+        index: Option<u64>,
+        now: Instant,
+    ) -> bool {
+        self.home != home
+            || self.tag != tag
+            || self.inventory != inventory
+            || self.index != index
+            || self.due
+            || match (self.checked.get(), self.completed) {
+                (Some(None), Some(completed)) => {
+                    now.saturating_duration_since(completed) >= PREVIEW_RETRY
+                }
+                (Some(Some(_)), Some(completed)) => {
+                    now.saturating_duration_since(completed) >= PREVIEW_RECHECK
+                }
+                _ => false,
+            }
+    }
 }
 
 /// A failed preview is asked again after this long, a good one after the longer: the signed
@@ -586,42 +618,77 @@ impl Launcher {
                     }
                     if Some(tag.as_str()) != current {
                         let inventory = self.ui.home.mods.revision();
+                        let index = sunrise_launcher::browser::sunrise::v2::loaded_serial();
                         let now = Instant::now();
                         let request = &mut self.ui.sheets.versions.preview;
                         if request.as_ref().is_none_or(|preview| {
-                            let age = now - preview.asked;
-                            preview.home != home
-                                || preview.tag != *tag
-                                || preview.inventory != inventory
-                                || match preview.checked.get() {
-                                    Some(None) => age > PREVIEW_RETRY,
-                                    Some(Some(_)) => age > PREVIEW_RECHECK,
-                                    None => false,
-                                }
+                            preview.needs_refresh(&home, tag, inventory, index, now)
                         }) {
                             let checked = Arc::new(OnceLock::new());
                             *request = Some(FitPreview {
                                 home: home.clone(),
                                 tag: tag.clone(),
                                 inventory,
-                                asked: now,
+                                index,
+                                completed: None,
+                                due: false,
                                 checked: checked.clone(),
                             });
                             let target = tag.clone();
                             let work = cx.background_executor().spawn(async move {
-                                sunrise_launcher::browser::sunrise::v2::index()
-                                    .ok()
-                                    .and_then(|catalog| {
-                                        sunrise_launcher::browser::sunrise::switch_fit_blockers_v2(
-                                            &catalog.index,
-                                            &home,
-                                            &target,
-                                        )
-                                    })
+                                match sunrise_launcher::browser::sunrise::v2::index() {
+                                    Ok(catalog) => {
+                                        let blockers =
+                                            sunrise_launcher::browser::sunrise::switch_fit_blockers_v2(
+                                                &catalog.index,
+                                                &home,
+                                                &target,
+                                            );
+                                        (blockers.as_ref().map(|_| catalog.index.serial), blockers)
+                                    }
+                                    Err(_) => (None, None),
+                                }
                             });
                             cx.spawn(async move |this, cx| {
-                                let _ = checked.set(work.await);
-                                let _ = this.update(cx, |_, cx| cx.notify());
+                                let (used_serial, result) = work.await;
+                                let delay = if result.is_none() {
+                                    PREVIEW_RETRY
+                                } else {
+                                    PREVIEW_RECHECK
+                                };
+                                let _ = checked.set(result);
+                                let finished = Instant::now();
+                                let active = this
+                                    .update(cx, |this, cx| {
+                                        let Some(preview) =
+                                            this.ui.sheets.versions.preview.as_mut()
+                                        else {
+                                            return false;
+                                        };
+                                        if !Arc::ptr_eq(&preview.checked, &checked) {
+                                            return false;
+                                        }
+                                        preview.completed = Some(finished);
+                                        if let Some(serial) = used_serial {
+                                            preview.index = Some(serial);
+                                        }
+                                        cx.notify();
+                                        true
+                                    })
+                                    .unwrap_or(false);
+                                if !active {
+                                    return;
+                                }
+                                cx.background_executor().timer(delay).await;
+                                let _ = this.update(cx, |this, cx| {
+                                    if let Some(preview) = this.ui.sheets.versions.preview.as_mut()
+                                    {
+                                        if Arc::ptr_eq(&preview.checked, &checked) {
+                                            preview.due = true;
+                                            cx.notify();
+                                        }
+                                    }
+                                });
                             })
                             .detach();
                         }
@@ -1203,6 +1270,131 @@ mod tests {
             ))
             .len(),
             2
+        );
+    }
+
+    #[test]
+    fn fit_preview_refreshes_on_new_index_serial_exact_age_and_due_timer() {
+        let home = PathBuf::from("/tmp/profile");
+        let completed = Instant::now();
+        let checked = Arc::new(OnceLock::new());
+        let _ = checked.set(Some(Vec::new()));
+        let mut preview = FitPreview {
+            home: home.clone(),
+            tag: "nightly-2026-11-20-aaaaaaa".into(),
+            inventory: 1,
+            index: Some(10),
+            completed: Some(completed),
+            due: false,
+            checked,
+        };
+        assert!(!preview.needs_refresh(
+            &home,
+            "nightly-2026-11-20-aaaaaaa",
+            1,
+            Some(10),
+            completed,
+        ));
+        assert!(
+            preview.needs_refresh(&home, "nightly-2026-11-20-aaaaaaa", 1, Some(11), completed,),
+            "a newer signed index serial must invalidate the picker preview"
+        );
+        assert!(!preview.needs_refresh(
+            &home,
+            "nightly-2026-11-20-aaaaaaa",
+            1,
+            Some(10),
+            completed + PREVIEW_RECHECK - std::time::Duration::from_millis(1),
+        ));
+        assert!(preview.needs_refresh(
+            &home,
+            "nightly-2026-11-20-aaaaaaa",
+            1,
+            Some(10),
+            completed + PREVIEW_RECHECK,
+        ));
+        preview.due = true;
+        assert!(preview.needs_refresh(&home, "nightly-2026-11-20-aaaaaaa", 1, Some(10), completed,));
+    }
+
+    #[test]
+    fn fit_preview_timer_wakes_and_retries_a_failed_check_without_extra_input() {
+        const CHILD: &str = "SUNRISE_PREVIEW_RETRY_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let scratch = tempfile::tempdir().unwrap();
+            let root = scratch.path();
+            let nowhere = "http://127.0.0.1:9";
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sheets::versions::tests::fit_preview_timer_wakes_and_retries_a_failed_check_without_extra_input",
+                ])
+                .env(CHILD, "1")
+                .env("RUST_MIN_STACK", (16 * 1024 * 1024).to_string())
+                .env("SUNRISE_LAUNCHER_HOME", root.join("launcher"))
+                .env("SUNRISE_HOME", root.join("game"))
+                .env("SUNRISE_LAUNCHER_LOCATION_FILE", root.join("location.json"))
+                .env("SUNRISE_MOD_INDEX_V2", root.join("missing-index.signed"))
+                .env("SUNRISE_NO_KEYCHAIN", "1")
+                .env("SUNRISE_TELEMETRY_URL", "off")
+                .env("SUNRISE_LAUNCHER_NO_SELF_UPDATE", "1")
+                .env("XDG_DATA_HOME", root.join("data"))
+                .env("XDG_CONFIG_HOME", root.join("config"))
+                .env("HTTPS_PROXY", nowhere)
+                .env("HTTP_PROXY", nowhere)
+                .env("ALL_PROXY", nowhere)
+                .env_remove("NO_PROXY")
+                .env_remove("SUNRISE_GITHUB_MIRROR")
+                .env_remove("SUNRISE_LAUNCHER_BENCH")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        crate::wake::UNDER_TEST_SCHEDULER.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut app = gpui::TestAppContext::single();
+        let (shell, cx) = app.add_window_view(crate::window_root::Shell::new_for_test);
+        let launcher = shell.read_with(cx, |shell, _| shell.launcher());
+        cx.run_until_parked();
+        const CURRENT: &str = "nightly-2026-11-22-bbbbbbb";
+        const PICK: &str = "nightly-2026-11-20-aaaaaaa";
+        launcher.update(cx, |l, cx| {
+            l.releases = Load::Ready(vec![
+                release(CURRENT, "2026-11-22", true),
+                release(PICK, "2026-11-20", true),
+            ]);
+            l.open_versions();
+            l.ui.sheets.versions.pick = Some(PICK.into());
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let first = launcher
+            .read_with(cx, |l, _| {
+                l.ui.sheets
+                    .versions
+                    .preview
+                    .as_ref()
+                    .map(|p| p.checked.clone())
+            })
+            .expect("first preview check started");
+        assert!(
+            matches!(first.get(), Some(None)),
+            "offline preview check should finish with None"
+        );
+        cx.executor().advance_clock(PREVIEW_RETRY);
+        cx.run_until_parked();
+        let second = launcher
+            .read_with(cx, |l, _| {
+                l.ui.sheets
+                    .versions
+                    .preview
+                    .as_ref()
+                    .map(|p| p.checked.clone())
+            })
+            .expect("retry preview check started");
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "scheduled retry timer must start a fresh preview check"
         );
     }
 }
