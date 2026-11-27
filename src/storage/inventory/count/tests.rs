@@ -25,7 +25,7 @@ fn a_count_discovers_once_walks_each_unit_once_and_classifies_nothing() {
         "each unit is walked once, not again for its notes"
     );
     assert_eq!(access_calls(), before.2, "counting never classifies a unit");
-    assert_eq!(handed_over, [1, 2, 3, 4, 5]);
+    assert_eq!(handed_over, (1..=Category::ALL.len()).collect::<Vec<_>>());
     assert!(report.is_complete());
     assert!(report.rows.iter().all(|row| row.freed_bytes == 0));
     assert!(report.total_bytes > 0);
@@ -76,7 +76,10 @@ fn a_count_cancelled_before_it_starts_discovers_and_walks_nothing() {
     let cancel = Cancel::default();
     cancel.cancel();
     let before = (walks(), entries_calls());
-    assert!(storage.count(&cancel, |_| panic!("no row")).unwrap().is_none());
+    assert!(storage
+        .count(&cancel, |_| panic!("no row"))
+        .unwrap()
+        .is_none());
     assert_eq!((walks(), entries_calls()), before);
 }
 
@@ -101,7 +104,11 @@ fn clear_asks_for_no_count_and_survives_a_cancelled_one() {
     cancel.cancel();
     assert!(storage.count(&cancel, |_| {}).unwrap().is_none());
     let report = storage.report(Some(Category::RustCompiler), false).unwrap();
-    let row = &report.rows[3];
+    let row = report
+        .rows
+        .iter()
+        .find(|row| row.category == Category::RustCompiler)
+        .unwrap();
     assert_eq!(row.category, Category::RustCompiler);
     assert!(row.freed_bytes > 0, "Clear measures what it frees itself");
     assert!(!payload.exists());
@@ -120,9 +127,164 @@ fn a_count_reports_a_refused_unit_on_its_row_without_holding_up_the_rest() {
     }
     let storage = Storage::at(&home.0).unwrap();
     let report = storage.report(None, false).unwrap();
-    assert!(report.rows[3].bytes > 0);
+    assert!(
+        report
+            .rows
+            .iter()
+            .find(|row| row.category == Category::RustCompiler)
+            .unwrap()
+            .bytes
+            > 0
+    );
     #[cfg(unix)]
-    assert_eq!(report.rows[0].kept.len(), 1);
+    assert_eq!(
+        report
+            .rows
+            .iter()
+            .find(|row| row.category == Category::BuildFiles)
+            .unwrap()
+            .kept
+            .len(),
+        1
+    );
     assert!(kept.exists());
     assert!(home.0.join("worlds/keep").exists());
+}
+
+#[test]
+fn explicit_clear_removes_retained_attempts_under_the_build_lease() {
+    let home = Home::new();
+    let old_worker = home.seed("native/.nb-old/compiler/w");
+    let older_launchers = home.seed("native/.native-attempt-older/compiler/work");
+    let storage = Storage::at(&home.0).unwrap();
+    let lease = storage.build_lease().unwrap();
+    let report = storage.report(None, false).unwrap();
+    let built = report
+        .rows
+        .iter()
+        .find(|row| row.category == Category::BuildFiles)
+        .unwrap();
+    let bytes = allocated_bytes(&home.0.join("native/.nb-old")).unwrap()
+        + allocated_bytes(&home.0.join("native/.native-attempt-older")).unwrap();
+    assert!(bytes > 0);
+    assert_eq!(built.clearable_bytes(), bytes);
+    assert!(built.kept.is_empty());
+    assert!(matches!(
+        storage.report(Some(Category::BuildFiles), false),
+        Err(Error::Busy)
+    ));
+    assert!(old_worker.exists() && older_launchers.exists());
+    drop(lease);
+    let manual = storage.report(Some(Category::BuildFiles), false).unwrap();
+    let built = manual
+        .rows
+        .iter()
+        .find(|row| row.category == Category::BuildFiles)
+        .unwrap();
+    assert_eq!(built.freed_bytes, bytes);
+    assert_eq!(built.remaining_bytes, 0);
+    assert!(!home.0.join("native/.nb-old").exists());
+    assert!(!home.0.join("native/.native-attempt-older").exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn clear_retries_a_retained_attempt_after_its_locked_file_closes() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+    let home = Home::new();
+    let path = home.seed("native/.nb-old/locked");
+    let storage = Storage::at(&home.0).unwrap();
+    let kept_open = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(&path)
+        .unwrap();
+    let report = storage.report(Some(Category::BuildFiles), false).unwrap();
+    let row = report
+        .rows
+        .iter()
+        .find(|row| row.category == Category::BuildFiles)
+        .unwrap();
+    assert_eq!(row.kept.len(), 1);
+    assert!(row.remaining_bytes > 0);
+    assert!(path.is_file());
+    drop(kept_open);
+    storage.report(Some(Category::BuildFiles), false).unwrap();
+    assert!(!path.exists());
+}
+
+#[test]
+fn mod_build_cache_counts_slots_and_detached_trash_then_clears_under_the_build_lease() {
+    let home = Home::new();
+    let slot = home.seed("native/work/slot/target/out");
+    let detached = home.seed("native/work/.trash-slot/target/out");
+    let other = home.seed("native/.nb-old/out");
+    let storage = Storage::at(&home.0).unwrap();
+    let work = home.0.join(BuildCache::ModBuildCache.relative());
+    let expected = allocated_bytes(&work.join("slot")).unwrap()
+        + allocated_bytes(&work.join(".trash-slot")).unwrap();
+    assert!(expected > 0);
+    let lease = storage.build_lease().unwrap();
+    let report = storage.report(None, false).unwrap();
+    let row = report
+        .rows
+        .iter()
+        .find(|row| row.category == Category::ModBuildCache)
+        .unwrap();
+    assert_eq!(row.clearable_bytes(), expected);
+    assert!(matches!(
+        storage.report(Some(Category::ModBuildCache), false),
+        Err(Error::Busy)
+    ));
+    assert!(slot.exists() && detached.exists());
+    drop(lease);
+    let report = storage
+        .report(Some(Category::ModBuildCache), false)
+        .unwrap();
+    let row = report
+        .rows
+        .iter()
+        .find(|row| row.category == Category::ModBuildCache)
+        .unwrap();
+    assert_eq!(row.freed_bytes, expected);
+    assert_eq!(row.remaining_bytes, 0);
+    assert!(!work.join("slot").exists());
+    assert!(!work.join(".trash-slot").exists());
+    assert!(other.exists());
+    assert!(home.0.join("native/.build.lock").exists());
+}
+
+/// #649: without the build lease, a folder can be detached between its parent's listing and
+/// its own, which skips it instead of failing the report.
+#[test]
+fn a_cross_target_directory_that_vanishes_does_not_fail_a_read_only_report() {
+    let home = Home::new();
+    let triple = home.0.join("native/target/x86_64-unknown-test");
+    home.seed("native/target/x86_64-unknown-test/debug/out");
+    home.seed("native/target/debug/kept");
+    let storage = Storage::at(&home.0).unwrap();
+    let vanishing = triple.clone();
+    LISTED.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |folder| {
+            if folder.ends_with("native/target") {
+                let _ = fs::remove_dir_all(&vanishing);
+            }
+        }));
+    });
+    let report = storage.report(None, false);
+    LISTED.with(|hook| hook.borrow_mut().take());
+    let report = report.unwrap();
+    assert!(!triple.exists());
+    assert!(
+        report
+            .rows
+            .iter()
+            .find(|row| row.category == Category::BuildFiles)
+            .unwrap()
+            .bytes
+            > 0,
+        "the unit that stayed is counted"
+    );
+    assert!(children(&home.0.join("gone")).unwrap().is_empty());
 }

@@ -17,6 +17,14 @@ fn storage_command_and_legacy_cache_limit_setting() {
             clear: Some(ClearStorage::All)
         })
     ));
+    assert!(matches!(
+        Cli::try_parse_from(["sunrise-launcher", "storage", "--clear", "mod-build-cache"])
+            .unwrap()
+            .command,
+        Some(Cmd::Storage {
+            clear: Some(ClearStorage::Row(Category::ModBuildCache))
+        })
+    ));
     assert!(Cli::try_parse_from(["sunrise-launcher", "storage", "--clear", "worlds"]).is_err());
     assert!(Cli::try_parse_from(["sunrise-launcher", "native-cache"]).is_err());
     assert!(

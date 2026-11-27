@@ -991,11 +991,11 @@ impl Launcher {
                 trf(
                     "{category} · {size}",
                     &[
-                        ("category", tr(glass_storage::category_label(category))),
+                        ("category", glass_storage::category_label(category)),
                         ("size", &size),
                     ],
                 ),
-                tr(glass_storage::category_about(category)),
+                glass_storage::category_about(category),
                 div().child(
                     if offered && found.is_none_or(|r| r.clearable_bytes() > 0) {
                         clear.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {

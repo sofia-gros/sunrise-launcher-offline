@@ -67,13 +67,13 @@ pub(crate) fn clear_question(asked: Option<Category>, bytes: Option<u64>) -> Str
         (Some(category), Some(size)) => trf(
             "Clear {category}? Up to {size} is freed. Close the game first. Files a game or build is using stay.",
             &[
-                ("category", tr(category_label(category))),
+                ("category", category_label(category)),
                 ("size", &size),
             ],
         ),
         (Some(category), None) => trf(
             "Clear {category}? Close the game first. Files a game or build is using stay.",
-            &[("category", tr(category_label(category)))],
+            &[("category", category_label(category))],
         ),
     }
 }
@@ -180,27 +180,29 @@ impl Launcher {
 
 pub(crate) fn category_label(category: Category) -> &'static str {
     match category {
-        Category::BuildFiles => "Build files",
-        Category::PrebuiltGames => "Prebuilt games",
-        Category::SpareGameBuilds => "Spare game builds",
-        Category::RustCompiler => "Rust compiler",
-        Category::OtherCaches => "Other caches",
+        Category::BuildFiles => tr("Build files"),
+        Category::ModBuildCache => tr("Mod build cache"),
+        Category::PrebuiltGames => tr("Prebuilt games"),
+        Category::SpareGameBuilds => tr("Spare game builds"),
+        Category::RustCompiler => tr("Rust compiler"),
+        Category::OtherCaches => tr("Other caches"),
     }
 }
 
 /// What a row holds, and that clearing it costs only a download or a rebuild.
 pub(crate) fn category_about(category: Category) -> &'static str {
     match category {
-        Category::BuildFiles => "What building native mods leaves behind: made again when needed.",
+        Category::BuildFiles => tr("What building native mods leaves behind: made again when needed."),
+        Category::ModBuildCache => tr("Compiled parts kept between mod builds so changes finish faster: built again when needed."),
         Category::PrebuiltGames => {
-            "The game packages native mods are built against: downloaded again when needed."
+            tr("The game packages native mods are built against: downloaded again when needed.")
         }
         Category::SpareGameBuilds => {
-            "Game builds kept for running servers: downloaded again when needed."
+            tr("Game builds kept for running servers: downloaded again when needed.")
         }
         Category::RustCompiler => {
-            "The compiler that builds native mods: downloaded again the next time one is built."
+            tr("The compiler that builds native mods: downloaded again the next time one is built.")
         }
-        Category::OtherCaches => "Other downloads kept to make the launcher faster.",
+        Category::OtherCaches => tr("Other downloads kept to make the launcher faster."),
     }
 }

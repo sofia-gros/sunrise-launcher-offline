@@ -42,7 +42,7 @@ pub fn format_bytes(n: u64) -> String {
     }
 }
 
-/// The five rows on the Storage page.
+/// The rows on the Storage page.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum Category {
@@ -50,6 +50,7 @@ pub enum Category {
     PrebuiltGames,
     SpareGameBuilds,
     RustCompiler,
+    ModBuildCache,
     OtherCaches,
 }
 
@@ -64,6 +65,7 @@ pub enum BuildCache {
     ServerBuilds,
     /// Mod libraries kept between native builds (`native_mods::kept`).
     KeptMods,
+    ModBuildCache,
     Rust,
     Cargo,
     Scratch,
@@ -79,6 +81,7 @@ impl BuildCache {
             Self::Prebuilt => "native/prebuilt",
             Self::ServerBuilds => "native/server-builds",
             Self::KeptMods => "native/kept-mods",
+            Self::ModBuildCache => "native/work",
             Self::Rust => "rust",
             Self::Cargo => "cargo",
             Self::Scratch => "tmp",
@@ -88,13 +91,16 @@ impl BuildCache {
     fn access(self, path: &Path) -> Result<Access, Error> {
         match self {
             // No game runs from kept mod libraries: a build copies them into its workspace.
-            Self::KeptMods | Self::Rust | Self::Cargo | Self::Scratch => Ok(Access::BuildTools),
+            Self::KeptMods | Self::ModBuildCache | Self::Rust | Self::Cargo | Self::Scratch => {
+                Ok(Access::BuildTools)
+            }
             _ => Access::for_unit(path),
         }
     }
 
     pub fn category(self) -> Category {
         match self {
+            Self::ModBuildCache => Category::ModBuildCache,
             Self::Prebuilt => Category::PrebuiltGames,
             Self::ServerBuilds => Category::SpareGameBuilds,
             Self::Rust | Self::Cargo | Self::Scratch => Category::RustCompiler,
@@ -146,11 +152,29 @@ impl Storage {
     }
 
     pub fn bytes(&self, cache: BuildCache) -> Result<u64, Error> {
+        if matches!(cache, BuildCache::ModBuildCache) {
+            return Ok(self
+                .report(None, false)?
+                .rows
+                .into_iter()
+                .find(|row| row.category == cache.category())
+                .expect("complete report")
+                .bytes);
+        }
         allocated_bytes(&self.path(cache)?)
     }
 
     /// Detach on the same volume before removal. Failed removals remain for the next manual clear.
     pub fn clear(&self, cache: BuildCache) -> Result<u64, Error> {
+        if matches!(cache, BuildCache::ModBuildCache) {
+            return Ok(self
+                .report(Some(cache.category()), false)?
+                .rows
+                .into_iter()
+                .find(|row| row.category == cache.category())
+                .expect("complete report")
+                .freed_bytes);
+        }
         let _lease = self.build_lease()?;
         let path = self.path(cache)?;
         self.trash(&path, cache.access(&path)?)
@@ -251,22 +275,27 @@ struct Node {
 
 impl Tree {
     pub(crate) fn build(path: &Path) -> Result<Self, Error> {
-        Self::walk(path, None)
+        Self::walk(path, None, false)
     }
 
     /// Stops descending once `cancel` is set. What it returns then is partial, so a caller that
     /// sees the token set afterwards must discard the tree.
     pub(crate) fn build_until(path: &Path, cancel: &Cancel) -> Result<Self, Error> {
-        Self::walk(path, Some(cancel))
+        Self::walk(path, Some(cancel), false)
     }
 
-    fn walk(path: &Path, cancel: Option<&Cancel>) -> Result<Self, Error> {
+    /// Mod work owns its link entries, not the directories or files they point to.
+    fn mod_work(path: &Path, cancel: &Cancel) -> Result<Self, Error> {
+        Self::walk(path, Some(cancel), true)
+    }
+
+    fn walk(path: &Path, cancel: Option<&Cancel>, skip_links: bool) -> Result<Self, Error> {
         #[cfg(test)]
         WALKS.with(|walks| walks.set(walks.get() + 1));
-        Self::node(path, cancel).map(Self)
+        Self::node(path, cancel, skip_links).map(Self)
     }
 
-    fn node(path: &Path, cancel: Option<&Cancel>) -> Result<Option<Node>, Error> {
+    fn node(path: &Path, cancel: Option<&Cancel>, skip_links: bool) -> Result<Option<Node>, Error> {
         if cancel.is_some_and(Cancel::is_cancelled) {
             return Ok(None);
         }
@@ -276,6 +305,9 @@ impl Tree {
             Err(error) => return Err(error.into()),
         };
         if linked(&meta) {
+            if skip_links {
+                return Ok(None);
+            }
             // A known link holds nothing of its own, and what it points at is not this cache's.
             return match fs::read_link(path) {
                 Ok(target) if known_link(&target) => Ok(None),
@@ -305,7 +337,7 @@ impl Tree {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(error) => return Err(error.into()),
                 };
-                children.extend(Self::node(&entry.path(), cancel)?);
+                children.extend(Self::node(&entry.path(), cancel, skip_links)?);
             }
         }
         Ok(Some(Node {

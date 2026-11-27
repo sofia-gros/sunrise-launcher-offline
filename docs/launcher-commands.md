@@ -137,7 +137,9 @@ Show disposable storage by category as JSON, or clear a category by hand with `-
 
     sunrise-launcher storage
 
-- `--clear`: Request cleanup of build-files, prebuilt-games, spare-game-builds, rust-compiler, other-caches or all rows; game-accessible caches refuse cleanup without enforceable lifetime exclusion
+- `--clear`: Request cleanup of build-files, prebuilt-games, spare-game-builds, rust-compiler, mod-build-cache, other-caches or all rows; game-accessible caches refuse cleanup without enforceable lifetime exclusion
+
+Close the game before clearing. Use `storage --clear mod-build-cache` to remove compiled parts kept between native mod builds. Sunrise builds them again when needed.
 
 MCP: `storage`.
 

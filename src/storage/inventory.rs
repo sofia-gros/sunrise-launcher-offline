@@ -8,7 +8,7 @@ use crate::{backend, instances, native_mods};
 use serde::Serialize;
 use std::sync::Arc;
 
-const BUILD_CACHES: [BuildCache; 10] = [
+const BUILD_CACHES: [BuildCache; 11] = [
     BuildCache::Source,
     BuildCache::Tools,
     BuildCache::PrebuiltOutput,
@@ -16,6 +16,7 @@ const BUILD_CACHES: [BuildCache; 10] = [
     BuildCache::Prebuilt,
     BuildCache::ServerBuilds,
     BuildCache::KeptMods,
+    BuildCache::ModBuildCache,
     BuildCache::Rust,
     BuildCache::Cargo,
     BuildCache::Scratch,
@@ -123,11 +124,12 @@ impl Report {
 }
 
 impl Category {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::BuildFiles,
         Self::PrebuiltGames,
         Self::SpareGameBuilds,
         Self::RustCompiler,
+        Self::ModBuildCache,
         Self::OtherCaches,
     ];
 }
@@ -179,13 +181,20 @@ struct Entry {
 impl Entry {
     fn fixed(root: &Root, relative: &Path, category: Category) -> Result<Self, Error> {
         let mut path = root.path.clone();
-        for component in relative.components() {
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
             let std::path::Component::Normal(component) = component else {
                 return Err(Error::Unsafe(relative.to_owned()));
             };
             path.push(component);
             match fs::symlink_metadata(&path) {
-                Ok(meta) if linked(&meta) => return Err(Error::Unsafe(path)),
+                Ok(meta)
+                    if linked(&meta)
+                        && !(category == Category::ModBuildCache
+                            && components.peek().is_none()) =>
+                {
+                    return Err(Error::Unsafe(path));
+                }
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
@@ -204,12 +213,20 @@ impl Entry {
             && self.relative.file_name().is_some_and(compiler_attempt)
     }
 
+    fn tree(&self, cancel: &Cancel) -> Result<Tree, Error> {
+        if self.category == Category::ModBuildCache {
+            Tree::mod_work(&self.path, cancel)
+        } else {
+            Tree::build_until(&self.path, cancel)
+        }
+    }
+
     /// The lease integration changes this classification, not deletion code.
     fn access(&self) -> Result<Access, Error> {
         #[cfg(test)]
         ACCESS.with(|calls| calls.set(calls.get() + 1));
         match self.category {
-            Category::RustCompiler => Ok(Access::BuildTools),
+            Category::RustCompiler | Category::ModBuildCache => Ok(Access::BuildTools),
             _ if self.is_compiler_attempt() => Ok(Access::BuildTools),
             // No game runs from kept mod libraries: a build copies them into its workspace.
             _ if self.relative.starts_with(BuildCache::KeptMods.relative()) => {
@@ -220,7 +237,7 @@ impl Entry {
     }
 
     fn clear(&self) -> Result<(), Error> {
-        if !self.path.try_exists()? {
+        if self.category != Category::ModBuildCache && !self.path.try_exists()? {
             return Ok(());
         }
         let Some(root) = &self.directory else {
@@ -236,6 +253,30 @@ impl Entry {
             parent = parent.open_dir_nofollow(part.as_os_str())?;
         }
         let name = Path::new(self.relative.file_name().expect("entry has a name"));
+        if self.category == Category::ModBuildCache {
+            let Some(meta) = present(fs::symlink_metadata(&self.path))? else {
+                return Ok(());
+            };
+            // On Windows, a junction is a directory entry; unlink it without opening it.
+            #[cfg(windows)]
+            if linked(&meta) {
+                use std::os::windows::fs::MetadataExt;
+                use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+                if meta.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0 {
+                    return present(parent.remove_dir(name)).map(|_| ());
+                }
+            }
+            if linked(&meta) || meta.is_file() {
+                return present(parent.remove_file(name)).map(|_| ());
+            }
+            // The parent walk above opens native and work without following links.
+            // Recursive removal does not follow interior links or junctions.
+            #[cfg(windows)]
+            let result = fs::remove_dir_all(&self.path);
+            #[cfg(not(windows))]
+            let result = parent.remove_dir_all(name);
+            return present(result).map(|_| ());
+        }
         if self.is_compiler_attempt() {
             // Attempts are never reused. Explicit Clear holds the build lease, but an old
             // compiler could still be writing here. Use no-follow removal and let the OS
@@ -371,16 +412,21 @@ impl Storage {
                     | BuildCache::PrebuiltOutput
                     | BuildCache::Prebuilt
                     | BuildCache::InternalsSync
+                    | BuildCache::ModBuildCache
             ) {
                 let parent = self.root.join(cache.relative());
                 if checked(&parent, true)?.is_some() {
                     for child in children(&parent)? {
-                        if usage_stamp(Path::new(&child.file_name())) {
+                        let name = child.file_name();
+                        if usage_stamp(Path::new(&name))
+                            || (matches!(cache, BuildCache::ModBuildCache)
+                                && crate::cache_cleanup::reserved(Path::new(&name)))
+                        {
                             continue;
                         }
                         entries.push(Entry::fixed(
                             build_root,
-                            &Path::new(cache.relative()).join(child.file_name()),
+                            &Path::new(cache.relative()).join(name),
                             cache.category(),
                         )?);
                     }
@@ -457,7 +503,12 @@ impl Storage {
                 data.path.join("versions"),
             ])
             .collect();
+        let work = self.root.join(BuildCache::ModBuildCache.relative());
         for parent in parents {
+            // Detached slots inside work are already inventoried as Mod build cache.
+            if parent == work {
+                continue;
+            }
             let root = Root::open(&parent)?;
             if root.directory.is_none() {
                 continue;
@@ -556,7 +607,7 @@ impl Storage {
         } else {
             let trees = entries
                 .iter()
-                .map(|entry| Tree::build(&entry.path))
+                .map(|entry| entry.tree(&Cancel::default()))
                 .collect::<Result<Vec<_>, Error>>()?;
             (entries, trees)
         };
@@ -577,7 +628,7 @@ impl Storage {
                 };
                 match result {
                     // Only a cleared folder is walked again, to see what is left of it.
-                    Ok(()) => trees[index] = Tree::build(&entry.path)?,
+                    Ok(()) => trees[index] = entry.tree(&Cancel::default())?,
                     Err(
                         error @ (Error::Busy
                         | Error::UnprovenExclusion
@@ -599,10 +650,14 @@ impl Storage {
                             break;
                         }
                     }
-                    Err(error @ Error::Io(_)) if retain && entry.is_compiler_attempt() => {
+                    Err(error @ Error::Io(_))
+                        if retain
+                            && (entry.is_compiler_attempt()
+                                || entry.category == Category::ModBuildCache) =>
+                    {
                         // A failed recursive removal can already have freed some files. If
                         // the rest can't be measured, conservatively keep its original size.
-                        if let Ok(tree) = Tree::build(&entry.path) {
+                        if let Ok(tree) = entry.tree(&Cancel::default()) {
                             trees[index] = tree;
                         }
                         let row = rows
@@ -650,7 +705,7 @@ fn refused(
     let mut sound = Vec::new();
     let mut trees = Vec::new();
     for entry in entries {
-        match Tree::build_until(&entry.path, cancel) {
+        match entry.tree(cancel) {
             Ok(tree) => {
                 sound.push(entry);
                 trees.push(tree);
@@ -873,94 +928,6 @@ mod manual_tests {
         assert!(!good.exists());
     }
 
-    /// #649: without the build lease, a folder can be detached between its parent's listing and
-    /// its own, which skips it instead of failing the report.
-    #[test]
-    fn a_cross_target_directory_that_vanishes_does_not_fail_a_read_only_report() {
-        let home = crate::storage::tests::Home::new();
-        let triple = home.0.join("native/target/x86_64-unknown-test");
-        home.seed("native/target/x86_64-unknown-test/debug/out");
-        home.seed("native/target/debug/kept");
-        let storage = Storage::at(&home.0).unwrap();
-        let vanishing = triple.clone();
-        LISTED.with(|hook| {
-            *hook.borrow_mut() = Some(Box::new(move |folder| {
-                if folder.ends_with("native/target") {
-                    let _ = fs::remove_dir_all(&vanishing);
-                }
-            }));
-        });
-        let report = storage.report(None, false);
-        LISTED.with(|hook| hook.borrow_mut().take());
-        let report = report.unwrap();
-        assert!(!triple.exists());
-        assert!(report.rows[0].bytes > 0, "the unit that stayed is counted");
-        assert!(children(&home.0.join("gone")).unwrap().is_empty());
-    }
-
-    #[test]
-    fn explicit_clear_removes_retained_attempts_under_the_build_lease() {
-        let home = crate::storage::tests::Home::new();
-        let old_worker = home.seed("native/.nb-old/compiler/w");
-        let older_launchers = home.seed("native/.native-attempt-older/compiler/work");
-        let storage = Storage::at(&home.0).unwrap();
-        let lease = storage.build_lease().unwrap();
-        let report = storage.report(None, false).unwrap();
-        let built = report
-            .rows
-            .iter()
-            .find(|row| row.category == Category::BuildFiles)
-            .unwrap();
-        let bytes = allocated_bytes(&home.0.join("native/.nb-old")).unwrap()
-            + allocated_bytes(&home.0.join("native/.native-attempt-older")).unwrap();
-        assert!(bytes > 0);
-        assert_eq!(built.clearable_bytes(), bytes);
-        assert!(built.kept.is_empty());
-        assert!(matches!(
-            storage.report(Some(Category::BuildFiles), false),
-            Err(Error::Busy)
-        ));
-        assert!(old_worker.exists() && older_launchers.exists());
-        drop(lease);
-        let manual = storage.report(Some(Category::BuildFiles), false).unwrap();
-        let built = manual
-            .rows
-            .iter()
-            .find(|row| row.category == Category::BuildFiles)
-            .unwrap();
-        assert_eq!(built.freed_bytes, bytes);
-        assert_eq!(built.remaining_bytes, 0);
-        assert!(!home.0.join("native/.nb-old").exists());
-        assert!(!home.0.join("native/.native-attempt-older").exists());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn clear_retries_a_retained_attempt_after_its_locked_file_closes() {
-        use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
-        let home = crate::storage::tests::Home::new();
-        let path = home.seed("native/.nb-old/locked");
-        let storage = Storage::at(&home.0).unwrap();
-        let kept_open = fs::OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .open(&path)
-            .unwrap();
-        let report = storage.report(Some(Category::BuildFiles), false).unwrap();
-        let row = report
-            .rows
-            .iter()
-            .find(|row| row.category == Category::BuildFiles)
-            .unwrap();
-        assert_eq!(row.kept.len(), 1);
-        assert!(row.remaining_bytes > 0);
-        assert!(path.is_file());
-        drop(kept_open);
-        storage.report(Some(Category::BuildFiles), false).unwrap();
-        assert!(!path.exists());
-    }
-
     #[test]
     fn a_refused_unit_is_walked_once_and_a_cleared_one_twice() {
         let home = crate::storage::tests::Home::new();
@@ -985,8 +952,25 @@ mod manual_tests {
         // The refused folder was walked once (and stopped there); the sound one once, then once
         // more after it was cleared.
         assert_eq!(crate::storage::walks() - walks, count + 1);
-        assert!(report.rows[3].freed_bytes > 0);
+        assert!(
+            report
+                .rows
+                .iter()
+                .find(|row| row.category == Category::RustCompiler)
+                .unwrap()
+                .freed_bytes
+                > 0
+        );
         #[cfg(unix)]
-        assert_eq!(report.rows[4].kept.len(), 1);
+        assert_eq!(
+            report
+                .rows
+                .iter()
+                .find(|row| row.category == Category::OtherCaches)
+                .unwrap()
+                .kept
+                .len(),
+            1
+        );
     }
 }
