@@ -268,6 +268,9 @@ impl Launcher {
                 );
                 let _ = tx.send(Msg::Line(Job::Prepare, line));
             };
+            let diagnostics = |line: String| {
+                let _ = tx.send(Msg::Line(Job::Prepare, line));
+            };
             let result = (|| {
                 let lock = backend::prepare_lock(&tag)?;
                 let (cmd, minecraft) = match &stop {
@@ -277,8 +280,10 @@ impl Launcher {
                     None => backend::preparer(&tag, &minecraft, from, &log, &lock)?,
                 };
                 match &stop {
-                    Some(stop) => backend::sounds_cancellable(&tag, &minecraft, &log, &lock, stop),
-                    None => backend::sounds(&tag, &minecraft, &log, &lock),
+                    Some(stop) => {
+                        backend::sounds_cancellable(&tag, &minecraft, &diagnostics, &lock, stop)
+                    }
+                    None => backend::sounds(&tag, &minecraft, &diagnostics, &lock),
                 }
                 backend::set_prepare_step(backend::PrepareStep::Prepare);
                 backend::spawn_holding_cancellable(

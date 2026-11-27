@@ -466,19 +466,18 @@ pub fn since_in(since: u64, id: u64) -> (u64, Vec<String>) {
     lock(&RING).since_in(since, Some(id))
 }
 
-/// What `launcher.log` and the ring keep of a line the game's preparer wrote, or a line about
-/// its preparation: the line itself, or a fixed note when it names a file or an address. The
-/// preparer writes paths in its progress lines ("Imported client 26.3 from <file>") and its
-/// errors, and no rule can tell where such a path ends (review of #615), so a line with a path
-/// separator or an address is left out whole. The window's Logs panel still shows it.
+/// What `launcher.log` and the ring keep of a launcher-generated line about preparation: the line
+/// itself, or a fixed note when it names a file, an address, or spans multiple lines. Raw child
+/// stdout and stderr stay in the local diagnostics view and do not pass through here.
 pub fn preparer_line(line: &str) -> String {
     format!("Preparing: {}", without_paths(line))
 }
 
-/// `line` as the log keeps a line about preparing or downloading a build's files: as it is, or a
-/// fixed note when it has a path separator or an address in it (see [`preparer_line`]).
+/// `line` as the log keeps a launcher-generated line about preparing or downloading a build's
+/// files: as it is, or a fixed note when it has a path separator, line break, or address in it
+/// (see [`preparer_line`]).
 pub fn without_paths(line: &str) -> &str {
-    if line.contains(['/', '\\']) || line.contains("://") {
+    if line.contains(['/', '\\', '\n', '\r']) || line.contains("://") {
         "(a line that names a file or an address, left out of the log)"
     } else {
         line
@@ -935,6 +934,21 @@ mod tests {
             .collect();
         assert_eq!(found.len(), 1, "{lines:?}");
         assert!(!found[0].contains("Steve_Prepare"), "{found:?}");
+    }
+
+    #[test]
+    fn without_paths_leaves_out_multiline_text() {
+        let multiline = "Public\nPrivate Client Backup\nSuffix";
+        assert!(
+            without_paths(multiline).contains("left out of the log"),
+            "{}",
+            without_paths(multiline)
+        );
+        assert!(
+            without_paths("line1\rline2").contains("left out of the log"),
+            "{}",
+            without_paths("line1\rline2")
+        );
     }
 
     static DETAIL_TEST_LOCK: Mutex<()> = Mutex::new(());

@@ -612,6 +612,14 @@ impl FirstAttempt<'_> {
         Resources::for_play(self.base(), self.handoff(), log).map(drop)
     }
 
+    pub(super) fn prepare_with(
+        &self,
+        log: &dyn Fn(String),
+        diagnostics: &dyn Fn(String),
+    ) -> Result<(), String> {
+        Resources::for_play_with(self.base(), self.handoff(), log, diagnostics).map(drop)
+    }
+
     pub fn exact_image(
         &self,
         mode: native_mods::Profile,

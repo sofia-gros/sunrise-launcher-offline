@@ -67,6 +67,17 @@ impl Resources {
         profile: ProfileHandoff<'_>,
         log: &dyn Fn(String),
     ) -> Result<Self, String> {
+        Self::for_play_with(base, profile, log, log)
+    }
+
+    /// [`Self::for_play`], routing raw preparer child output to `diagnostics` only so arbitrary
+    /// stdout/stderr never reaches `launcher.log`.
+    pub(super) fn for_play_with(
+        base: &str,
+        profile: ProfileHandoff<'_>,
+        log: &dyn Fn(String),
+        diagnostics: &dyn Fn(String),
+    ) -> Result<Self, String> {
         let preparation = backend::prepare_lock(base)?;
         if let Some(resources) = Self::current(&backend::version_dir(base))? {
             return Ok(resources);
@@ -85,9 +96,16 @@ impl Resources {
                     log,
                     &handoff,
                 )?;
-                backend::sounds_staged(base, &minecraft, log, &handoff);
+                backend::sounds_staged(base, &minecraft, diagnostics, &handoff);
                 launcher_log::play_detail(crate::i18n::tr("Preparing the game"));
-                preparer::run_staged(command, &handoff, log)?;
+                let step = launcher_log::step("Preparing game files");
+                match preparer::run_staged(command, &handoff, diagnostics) {
+                    Ok(()) => step.done(""),
+                    Err(error) => {
+                        step.failed(&error);
+                        return Err(error);
+                    }
+                }
             }
         }
         Self::seal_prepared(base, &preparation, &handoff, None, None)

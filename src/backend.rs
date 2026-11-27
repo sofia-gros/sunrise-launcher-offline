@@ -3616,17 +3616,22 @@ pub(crate) fn sounds_staged(
     let tag = tag.as_str();
     let dir = version_dir(tag);
     set_prepare_step(PrepareStep::Sounds);
+    let step = crate::launcher_log::step("Copying game sounds");
     log(tr("Copying the sounds from your Minecraft install").into());
     let result = match crate::preparer::binary(&dir) {
         Some(binary) => crate::preparer::sounds(&binary, &dir, minecraft, log, Some(handoff))
             .and_then(|done| done.ok_or_else(|| crate::preparer::too_old(tag))),
         None => Err(crate::preparer::too_old(tag)),
     };
-    if let Err(why) = result {
-        log(trf(
-            "No sound (the game will be silent): {why}",
-            &[("why", &why)],
-        ));
+    match result {
+        Ok(()) => step.done(""),
+        Err(why) => {
+            step.failed(&why);
+            log(trf(
+                "No sound (the game will be silent): {why}",
+                &[("why", &why)],
+            ));
+        }
     }
 }
 
@@ -5455,6 +5460,8 @@ fn monitor(
     if group {
         crate::process::owned::CHILDREN.track_group(pid);
     }
+    let prepare_step =
+        (job == Job::Prepare).then(|| crate::launcher_log::step("Preparing game files"));
     let tracked = stop
         .as_ref()
         .map(|stop| stop.track_process(pid))
@@ -5475,17 +5482,14 @@ fn monitor(
         let tx = tx.clone();
         let forwarding = Arc::clone(&forwarding);
         let reader_live = reader_live.clone();
-        // The preparer's own lines belong to the operation (a switch) that started it.
-        let op = crate::launcher_log::current();
+        // Raw child stdout/stderr stays in the local diagnostics view (`Msg::Line`): Unix paths
+        // can contain newlines whose middle fragments have no separator, so arbitrary child lines
+        // never enter `launcher.log` or the switch operation log.
         readers.push(std::thread::spawn(move || {
-            let _in = crate::launcher_log::enter(&op);
             for line in BufReader::new(stream).lines().map_while(Result::ok) {
                 let live = forwarding.lock().unwrap();
                 if !*live {
                     break;
-                }
-                if job == Job::Prepare {
-                    crate::launcher_log::line(crate::launcher_log::preparer_line(&line));
                 }
                 if tx.send(Msg::Line(job, line)).is_err() {
                     break;
@@ -5497,7 +5501,7 @@ fn monitor(
     drop(reader_live);
     let child = Arc::new(Mutex::new(child));
     let waited = child.clone();
-    // The monitor's lines (how the preparer ended) belong to the same operation as its output.
+    // The monitor's lines (how the preparer ended) belong to the same operation as its step.
     let op = crate::launcher_log::current();
     std::thread::spawn(move || {
         let _in = crate::launcher_log::enter(&op);
@@ -5537,6 +5541,9 @@ fn monitor(
         }
         if relayed {
             if let Err(error) = status {
+                if let Some(step) = prepare_step {
+                    step.failed(error.to_string());
+                }
                 let _ = tx.send(Msg::ClientObservationLost(
                     crate::process::child::unconfirmed_exit(error),
                 ));
@@ -5564,6 +5571,16 @@ fn monitor(
                 result
             })
         };
+        if let Some(step) = prepare_step {
+            if cancelled {
+                step.cancelled();
+            } else {
+                match &result {
+                    Ok(()) => step.done(""),
+                    Err(error) => step.failed(error),
+                }
+            }
+        }
         let _ = tx.send(Msg::Exit(job, result));
     });
     Running { child, stdin }
@@ -10126,6 +10143,158 @@ esac"#
                 mine.iter()
                     .any(|line| line.contains(expected.0) && line.contains(expected.1)),
                 "switch log missing {expected:?}: {mine:?}"
+            );
+        }
+        for word in SECRET_WORDS {
+            assert!(
+                mine.iter().all(|line| !line.contains(word)),
+                "{word} leaked to switch log: {mine:?}"
+            );
+        }
+    }
+
+    /// Multiline preparer stdout and stderr (such as a Unix directory name containing line
+    /// breaks) stay in the local diagnostics view and never reach `launcher.log` or the switch
+    /// operation log; both sinks receive launcher-generated stage lines instead.
+    #[cfg(unix)]
+    #[test]
+    fn multiline_preparer_child_output_stays_out_of_disk_and_switch_logs() {
+        use std::os::unix::fs::PermissionsExt;
+        const SECRET_WORDS: &[&str] = &[
+            "Public",
+            "Private Client Backup",
+            "Suffix",
+            "Secret Err Folder",
+            "Secret Sounds Dir",
+            "Secret Sounds Err",
+            "/home/ada",
+        ];
+        let Some(root) = std::env::var_os("PREPARER_MULTILINE_LOG_ROOT") else {
+            let root = tempfile::tempdir().unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "backend::tests::multiline_preparer_child_output_stays_out_of_disk_and_switch_logs",
+                    "--nocapture",
+                ])
+                .env("PREPARER_MULTILINE_LOG_ROOT", root.path())
+                .env("SUNRISE_LAUNCHER_HOME", root.path())
+                .env("SUNRISE_HOME", root.path().join("home"))
+                .env("XDG_DATA_HOME", root.path().join("xdg-data"))
+                .env("XDG_CONFIG_HOME", root.path().join("xdg-config"))
+                .env("SUNRISE_LAUNCHER_NO_SELF_UPDATE", "1")
+                .env("SUNRISE_NO_AUDIO", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            let disk_log = fs::read_to_string(root.path().join("logs/launcher.log")).unwrap();
+            for expected in [
+                "Preparing game files: started",
+                "Preparing game files: done in",
+                "Copying game sounds: started",
+                "Copying game sounds: failed after",
+            ] {
+                assert!(
+                    disk_log.contains(expected),
+                    "launcher.log missing {expected}: {disk_log}"
+                );
+            }
+            for word in SECRET_WORDS {
+                assert!(
+                    !disk_log.contains(word),
+                    "{word} leaked to launcher.log: {disk_log}"
+                );
+            }
+            return;
+        };
+        let root = PathBuf::from(root);
+        crate::launcher_log::init(&root.join("logs"));
+        let op = crate::launcher_log::Operation::new(|_| {});
+        let _guard = op.enter();
+        let before = crate::launcher_log::since(0).0;
+
+        let script = root.join("fake-prepare.sh");
+        fs::write(
+            &script,
+            concat!(
+                "#!/bin/sh\n",
+                "printf 'Imported client 26.3 from /home/ada/Public\\nPrivate Client Backup\\nSuffix/versions/26.3/26.3.jar\\n'\n",
+                "printf 'error: /home/ada/Public\\nSecret Err Folder\\nSuffix/bad.jar\\n' >&2\n",
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _running =
+            spawn_holding_cancellable(Job::Prepare, Command::new(&script), tx, None, None).unwrap();
+        let mut local_lines = Vec::new();
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap() {
+                Msg::Line(Job::Prepare, line) => local_lines.push(line),
+                Msg::Exit(Job::Prepare, result) => {
+                    assert_eq!(result, Ok(()));
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            local_lines.iter().any(|l| l == "Private Client Backup"),
+            "local diagnostics must keep raw stdout: {local_lines:?}"
+        );
+        assert!(
+            local_lines.iter().any(|l| l == "Secret Err Folder"),
+            "local diagnostics must keep raw stderr: {local_lines:?}"
+        );
+
+        let version = root.join("versions/v-sounds");
+        fs::create_dir_all(&version).unwrap();
+        let preparer = version.join("sunrise-prepare");
+        fs::write(
+            &preparer,
+            concat!(
+                "#!/bin/sh\n",
+                "printf 'Copied from /home/ada/Public\\nSecret Sounds Dir\\nSuffix/index.json\\n'\n",
+                "printf 'error: /home/ada/Public\\nSecret Sounds Err\\nSuffix/missing (os error 2)\\n' >&2\n",
+                "exit 1\n",
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&preparer, fs::Permissions::from_mode(0o700)).unwrap();
+        let lock = prepare_lock("v-sounds").unwrap();
+        let sound_lines = std::cell::RefCell::new(Vec::new());
+        sounds_staged(
+            "v-sounds",
+            &root.join("minecraft"),
+            &|line| sound_lines.borrow_mut().push(line),
+            &lock.handoff(None),
+        );
+        let sound_lines = sound_lines.into_inner();
+        assert!(
+            sound_lines.iter().any(|l| l == "Secret Sounds Dir"),
+            "local diagnostics must keep sounds stdout: {sound_lines:?}"
+        );
+        assert!(
+            sound_lines.iter().any(|l| l.contains("Secret Sounds Err")),
+            "local diagnostics must keep sounds stderr: {sound_lines:?}"
+        );
+
+        let (_, mine) = crate::launcher_log::since_in(before, op.id());
+        for expected in [
+            "Preparing game files: started",
+            "Preparing game files: done in",
+            "Copying game sounds: started",
+            "Copying game sounds: failed after",
+        ] {
+            assert!(
+                mine.iter().any(|line| line.contains(expected)),
+                "switch log missing {expected}: {mine:?}"
             );
         }
         for word in SECRET_WORDS {

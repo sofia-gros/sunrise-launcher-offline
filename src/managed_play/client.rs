@@ -321,10 +321,11 @@ impl Client<'_> {
                     // The preparer is part of the saved image. Verify it before starting it.
                     old.verify_artifacts()?;
                     progress(Progress::Prepare);
-                    Some(super::Resources::for_play(
+                    Some(super::Resources::for_play_with(
                         old.base(),
                         profile.handoff(),
                         &|line| emit_prepare_line(&progress, line),
+                        &|line| progress(Progress::Line(line)),
                     )?)
                 }
                 Err(issue) => return Err(issue.message(|| unsettled!()).into()),
@@ -355,7 +356,9 @@ impl Client<'_> {
             })?;
             check_build(first.base(), first.variant().as_ref())?;
             progress(Progress::Prepare);
-            first.prepare(&|line| emit_prepare_line(&progress, line))?;
+            first.prepare_with(&|line| emit_prepare_line(&progress, line), &|line| {
+                progress(Progress::Line(line))
+            })?;
             let (image, notices) = {
                 let _manifest = game_lock(&home)?;
                 crate::browser::installed::recover_game_install(&home)
