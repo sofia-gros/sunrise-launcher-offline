@@ -446,10 +446,15 @@ pub(super) fn installable(
     match slot(version, contents, image) {
         Some(Slot::Proved(version, evidence)) => Ok((version, Some(*evidence))),
         Some(Slot::Vacant(version)) => Ok((version, None)),
-        None => Err(Failed::Other(trf(
-            "Every installed build named for these mods ({version}) holds other mods or was changed after it was installed. Remove them, then build again.",
-            &[("version", version)],
-        ))),
+        None => {
+            crate::launcher_log::line(
+                "Native build refused: no vacant or proved installed image slot",
+            );
+            Err(Failed::Other(trf(
+                "Every installed build named for these mods ({version}) holds other mods or was changed after it was installed. Remove them, then build again.",
+                &[("version", version)],
+            )))
+        }
     }
 }
 

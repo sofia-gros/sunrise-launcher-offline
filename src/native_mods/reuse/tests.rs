@@ -973,4 +973,47 @@ fn a_missing_developer_manifest_does_not_expose_its_path() {
     }
 }
 
+#[test]
+fn occupied_unproved_slots_refuse_with_a_fixed_build_reason() {
+    if !in_child(
+        "native_mods::reuse::tests::occupied_unproved_slots_refuse_with_a_fixed_build_reason",
+        "SUNRISE_REUSE_EXHAUSTED_CHILD",
+    ) {
+        return;
+    }
+    let set = Set::new("reuse-exhausted");
+    let options = BuildOptions::default();
+    let plan = derive(&set.request(&options), &set.copies()).unwrap();
+    let digests = scan_bundles(&set.folder)
+        .unwrap()
+        .iter()
+        .map(|bundle| (bundle.manifest.id.clone(), source_digest(bundle)))
+        .collect();
+    let contents = Contents {
+        revision: &plan.revision,
+        origin: &plan.origin,
+        mixins: &plan.mixins,
+        profile: Profile::Optimized,
+        kept: &plan.mods,
+        digests: &digests,
+        left_out: &plan.left_out,
+    };
+    let paths: Vec<_> = versions(&plan.version)
+        .map(|version| Target::Client.directory(&version))
+        .collect();
+    assert_eq!(paths.len(), 8);
+    for folder in &paths {
+        fs::create_dir_all(folder).unwrap();
+    }
+    crate::launcher_log::init(&set.root);
+    let (before, _) = crate::launcher_log::since(0);
+    assert!(installable(&plan.version, &contents, &plan.image).is_err());
+    let (_, lines) = crate::launcher_log::since(before);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].ends_with("Native build refused: no vacant or proved installed image slot"));
+    for folder in paths {
+        assert!(fs::read_dir(folder).unwrap().next().is_none());
+    }
+}
+
 mod unsealed;
