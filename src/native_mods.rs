@@ -373,10 +373,9 @@ pub fn cache_error(error: crate::storage::Error) -> String {
         crate::native_cache::Error::UnsupportedFilesystem => {
             tr("Game cache leases require a supported local filesystem.").into()
         }
-        crate::native_cache::Error::Unsafe(path) => trf(
-            "Refusing native cache cleanup at an unexpected file or link: {path}",
-            &[("path", &path.display().to_string())],
-        ),
+        crate::native_cache::Error::Unsafe(_) => {
+            tr("The native build cache contains an unexpected file or link.").into()
+        }
         crate::native_cache::Error::Io(error) => trf(
             "Could not access the native build cache: {error}",
             &[("error", &error.to_string())],
@@ -2149,7 +2148,6 @@ fn build_stages(
             } else {
                 "Native build folder not kept: its paths would be too deep for Windows".to_owned()
             };
-            let _ = append_log(&note);
             crate::launcher_log::line(note);
         }
         let game = workspace.package(game).map_err(|e| e.to_string())?;
@@ -2980,6 +2978,18 @@ mod tests {
     use std::process::{Command, Stdio};
 
     mod build_completion;
+
+    #[test]
+    fn unsafe_native_cache_errors_never_include_the_cache_path() {
+        for path in [
+            "/home/private-account/launcher/native/w",
+            r"C:\Users\private-account\launcher\native\w",
+        ] {
+            let error = cache_error(crate::storage::Error::Unsafe(PathBuf::from(path)));
+            assert!(error.contains("unexpected file or link"), "{error}");
+            assert!(!error.contains("private-account"), "{error}");
+        }
+    }
 
     #[test]
     fn an_unreadable_mod_file_does_not_fail_the_build_of_the_others() {
