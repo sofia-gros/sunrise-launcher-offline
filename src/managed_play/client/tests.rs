@@ -1058,6 +1058,15 @@ fn play_hashes_the_prepared_files_once_and_still_refuses_damage() {
     fs::write(&blob, BLOB).unwrap();
     assert_eq!(intact(&mut profile), advanced);
 
+    // A client snapshot cannot authorize its own replacement by claiming to be server-only.
+    let manifest_file = advanced.resource_path().join("sunrise-resources.json");
+    fs::write(&manifest_file, br#"{"profile":"server"}"#).unwrap();
+    let error = ready(&mut profile).unwrap_err();
+    snapshot_error(&advanced, String::from(error));
+    assert_eq!(profile.active().unwrap(), Some(advanced.clone()));
+    assert_eq!(FULL_VERIFICATIONS.take(), 1);
+    fs::write(&manifest_file, b"{}").unwrap();
+
     // A deleted manifest leaves the output incomplete: that branch hashes the files before it
     // would prepare anything, and refuses.
     let manifest_file = advanced.resource_path().join("sunrise-resources.json");
