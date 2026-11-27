@@ -79,6 +79,8 @@ impl Resources {
         diagnostics: &dyn Fn(String),
     ) -> Result<Self, String> {
         let preparation = backend::prepare_lock(base)?;
+        // A prepared profile uses its receipt here, without sealing or hashing again.
+        // The admitted Play handoff checks the saved snapshot digest.
         if let Some(resources) = Self::current(&backend::version_dir(base))? {
             return Ok(resources);
         }
@@ -244,8 +246,8 @@ impl Resources {
         })
     }
 
-    // When the source is prepared, flush a private primary tree and publish it without
-    // replacing anything. Build the optional cache against the final path: the game caches
+    // Flush a private primary tree before publishing it or replacing a damaged snapshot.
+    // Build the optional cache against the final path: the game caches
     // the canonical resource root inside it. A kill after exposure but before its evidence
     // write leaves a usable primary tree and an untrusted accelerator, never the reverse.
     fn seal(
@@ -307,7 +309,15 @@ impl Resources {
         if exists {
             require_dir(&snapshot)?;
         }
-        let accelerator = if resources.is_dir() {
+        // Only preparation may repair a snapshot. Check reuse here, not on Play
+        // for a profile with a prepared snapshot.
+        let reusable = exists
+            && artifact::tree_with_workers(&resources, true, workers, stop)
+                .is_ok_and(|tree| tree.is_some_and(|(digest, _)| digest == primary));
+        if let Some(stop) = stop {
+            stop.check()?;
+        }
+        let accelerator = if reusable {
             optional_bytes(&evidence)?.and_then(|bytes| serde_json::from_slice(&bytes).ok())
         } else {
             // A move from .local flushes both directories, including the new store's entry.
@@ -343,12 +353,24 @@ impl Resources {
                 flush_copied(&copied, workers, stop, Some(&on_flush))?;
                 Ok(((), copied_files))
             })?;
-            let (from, to) = if exists {
-                (candidate.as_path(), &resources)
+            if let Some(stop) = stop {
+                stop.check()?;
+            }
+            // Move the entire damaged snapshot aside, including stale accelerator evidence.
+            // Publish only the already-flushed replacement while the preparation lock is held.
+            let _retired = if exists {
+                let retired = tempfile::Builder::new()
+                    .prefix(".prepared-damaged-")
+                    .tempdir_in(root.join(".local"))
+                    .map_err(|error| at(root, error))?;
+                durable::move_new_directory(&snapshot, &retired.path().join("snapshot"))
+                    .map_err(|error| at(&snapshot, error))?;
+                Some(retired)
             } else {
-                (stage.path(), &snapshot)
+                None
             };
-            durable::move_new_directory(from, to).map_err(|e| at(to, e))?;
+            durable::move_new_directory(stage.path(), &snapshot)
+                .map_err(|error| at(&snapshot, error))?;
             let digest = accelerator(&resources)?;
             if let Some(digest) = digest {
                 write_receipt(&evidence, &digest)?;
@@ -659,6 +681,35 @@ mod tests {
             );
             assert_eq!(Resources::current(root).unwrap().as_ref(), Some(&prepared));
         }
+    }
+
+    #[test]
+    fn sealing_replaces_a_damaged_snapshot_and_its_accelerator() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let source = nested_source(root);
+        let prepared = Resources::seal(root, &source, None, |dir| {
+            let data = dir.join(preparer::DATA_FILE);
+            fs::write(&data, b"old cache").unwrap();
+            digest_file(&data)
+        })
+        .unwrap();
+        let snapshot = prepared.path_at(root);
+        fs::write(snapshot.join("assets/deep/er/blob.bin"), b"damage").unwrap();
+        let repaired = Resources::seal(root, &source, None, |dir| {
+            let data = dir.join(preparer::DATA_FILE);
+            assert!(!data.exists());
+            fs::write(&data, b"rebuilt cache").unwrap();
+            digest_file(&data)
+        })
+        .unwrap();
+        assert_eq!(repaired.primary, prepared.primary);
+        assert_eq!(
+            artifact::tree(&snapshot, true).unwrap(),
+            Some(prepared.primary)
+        );
+        assert_ne!(repaired.accelerator, prepared.accelerator);
+        assert_eq!(Resources::current(root).unwrap(), Some(repaired));
     }
 
     #[test]
