@@ -2567,25 +2567,10 @@ fn reuse_prepared_for_cancellable(
     stop: Option<&crate::native_mods::Cancellation>,
     progress: impl Fn(InstallPhase),
 ) {
-    progress(InstallPhase::Preparing);
-    reuse_prepared_within(tag, stop, DATA_FILE_DEADLINE);
-}
-
-/// How long an install that has no Cancel of its own (Play's install, a local build's import)
-/// waits for the optional data-file writer before it stops it. A switch's Cancel stops it at
-/// any time instead.
-const DATA_FILE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
-
-/// [`reuse_prepared_for_cancellable`], waiting at most `deadline` for the data-file writer when
-/// there is no `stop` to end it.
-fn reuse_prepared_within(
-    tag: &str,
-    stop: Option<&crate::native_mods::Cancellation>,
-    deadline: std::time::Duration,
-) {
     if stop.is_some_and(crate::native_mods::Cancellation::is_stopped) {
         return;
     }
+    progress(InstallPhase::Preparing);
     let about = crate::native_mods::about(tag);
     let tag = about.as_ref().map_or(tag, |about| about.base.as_str());
     let Ok(preparation) = prepare_lock(tag) else {
@@ -2614,55 +2599,27 @@ fn reuse_prepared_within(
     if stop.is_some_and(crate::native_mods::Cancellation::is_stopped) {
         return;
     }
-    // Written before the install returns, not on a thread of its own: a switch or Play that
-    // follows at once takes the same preparation lock, which is never waited for, so a writer
-    // still holding it made them fail with "already being prepared". It can take a while under
-    // a virus scanner (#1961), so it says so.
+    // Only an install with a Cancel writes the optional data file (a switch's): one with none
+    // (Play's install, a local build's import) skips it. The game reads its files one by one
+    // without it, and a preparer that never answers, or ignores the stop, can't hang such an
+    // install after its build is in place (review of #615). Before, it ran on a thread of its
+    // own and nothing waited for it, but that thread could still hold the preparation lock when
+    // a switch or Play that followed took it, and they failed with "already being prepared".
+    let Some(stop) = stop else {
+        crate::launcher_log::line(format!(
+            "{tag}: the optional data file is not written, as nothing could cancel it"
+        ));
+        return;
+    };
+    // Written before the install returns, not on a thread of its own, so the lock is free for
+    // what follows. It can take a while under a virus scanner (#1961), so it says so.
     crate::launcher_log::play_detail(crate::i18n::tr("Writing the game's data file"));
     let writing = crate::launcher_log::step(format!("Writing {tag}'s data file"));
-    let (result, gave_up) =
-        write_data_file_within(&version_dir(tag), &resources(tag), stop, deadline);
-    match result {
+    match write_data_file(&version_dir(tag), &resources(tag), Some(stop)) {
         Ok(()) => writing.done(""),
-        Err(_) if gave_up => {
-            writing.note(format!(
-                "stopped after {} s: nothing could cancel it, and the data file is optional",
-                deadline.as_secs()
-            ));
-            writing.cancelled();
-        }
+        Err(_) if stop.is_stopped() => writing.cancelled(),
         Err(e) => writing.failed(e),
     }
-}
-
-/// [`write_data_file`] that never waits past `deadline` when there is no `stop`: the writer
-/// gets a cancellation of its own, stopped at the deadline, so a preparer that never answers
-/// can't hang an install after its build is in place (review of #615). The lock is still
-/// held only while it runs. The flag says whether the deadline stopped it.
-fn write_data_file_within(
-    root: &Path,
-    resources: &Path,
-    stop: Option<&crate::native_mods::Cancellation>,
-    deadline: std::time::Duration,
-) -> (Result<(), String>, bool) {
-    if let Some(stop) = stop {
-        return (write_data_file(root, resources, Some(stop)), false);
-    }
-    let own = crate::native_mods::Cancellation::default();
-    let (finished, wait) = std::sync::mpsc::channel::<()>();
-    let watchdog = {
-        let own = own.clone();
-        std::thread::spawn(move || {
-            if wait.recv_timeout(deadline) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
-                own.stop();
-            }
-        })
-    };
-    let result = write_data_file(root, resources, Some(&own));
-    drop(finished);
-    let _ = watchdog.join();
-    let gave_up = result.is_err() && own.is_stopped();
-    (result, gave_up)
 }
 
 /// Writes a prepared version's `sunrise-data.bin` so its first start already reads one file, not
@@ -3008,10 +2965,8 @@ fn complete_assets_with(
         ));
     }
     let kinds: Vec<String> = lacking.iter().map(|(kind, _)| kind.clone()).collect();
-    let fetching = crate::launcher_log::step(format!(
-        "Fetching missing game files ({})",
-        kinds.join(", ")
-    ));
+    let fetching =
+        crate::launcher_log::step(format!("Fetching missing game files ({})", kinds.len()));
     let result = crate::preparer::add_extras(
         &binary,
         &root,
@@ -3032,15 +2987,11 @@ fn complete_assets_with(
     match result {
         Ok(Some(added)) => {
             for (kind, error) in added.failed {
-                let what = lacking
-                    .iter()
-                    .find(|(k, _)| *k == kind)
-                    .map_or(kind.as_str(), |(_, what)| what.as_str());
                 log(crate::i18n::trf(
                     "{version}: {what} not added: {error}",
                     &[
                         ("version", tag),
-                        ("what", what),
+                        ("what", extra_kind_label(&kind)),
                         ("error", &crate::launcher_log::safe_error(&error)),
                     ],
                 ));
@@ -3048,6 +2999,19 @@ fn complete_assets_with(
         }
         Ok(None) => {}
         Err(e) => log(format!("{tag}: {}", crate::launcher_log::safe_error(&e))),
+    }
+}
+
+/// Launcher-owned label for a `sunrise-prepare` extra kind so arbitrary child protocol strings
+/// never reach `launcher.log` or the switch operation log.
+fn extra_kind_label(kind: &str) -> &'static str {
+    match kind {
+        "sounds" => "The sounds",
+        "packs" => "The built-in packs",
+        "languages" => "The languages",
+        "fonts" => "The fonts",
+        "panorama" => "The panorama",
+        _ => "Extra game files",
     }
 }
 
@@ -3410,7 +3374,27 @@ pub fn preparer(
     log: &dyn Fn(String),
     preparation: &crate::preparer::Preparation,
 ) -> Result<(Command, PathBuf), String> {
-    preparer_staged(tag, minecraft, from, log, &preparation.handoff(None))
+    preparer_staged(tag, minecraft, from, log, log, &preparation.handoff(None))
+}
+
+/// [`preparer`], routing raw preparer child output to `diagnostics` only so arbitrary
+/// stdout/stderr never reaches `launcher.log` or a switch log.
+pub fn preparer_with(
+    tag: &str,
+    minecraft: &Path,
+    from: MinecraftFrom,
+    log: &dyn Fn(String),
+    diagnostics: &dyn Fn(String),
+    preparation: &crate::preparer::Preparation,
+) -> Result<(Command, PathBuf), String> {
+    preparer_staged(
+        tag,
+        minecraft,
+        from,
+        log,
+        diagnostics,
+        &preparation.handoff(None),
+    )
 }
 
 pub fn preparer_cancellable(
@@ -3418,6 +3402,7 @@ pub fn preparer_cancellable(
     minecraft: &Path,
     from: MinecraftFrom,
     log: &dyn Fn(String),
+    diagnostics: &dyn Fn(String),
     preparation: &crate::preparer::Preparation,
     stop: &crate::native_mods::Cancellation,
 ) -> Result<(Command, PathBuf), String> {
@@ -3426,6 +3411,7 @@ pub fn preparer_cancellable(
         minecraft,
         from,
         log,
+        diagnostics,
         &preparation.handoff_cancellable(None, stop),
     )
 }
@@ -3435,6 +3421,7 @@ pub(crate) fn preparer_staged(
     minecraft: &Path,
     from: MinecraftFrom,
     log: &dyn Fn(String),
+    diagnostics: &dyn Fn(String),
     handoff: &crate::preparer::Handoff<'_>,
 ) -> Result<(Command, PathBuf), String> {
     let stop = handoff.stop();
@@ -3455,7 +3442,7 @@ pub(crate) fn preparer_staged(
     output_version_at(&dir).map_err(|error| preparer_source_error(&error))?;
     let binary = crate::preparer::binary(&dir).ok_or_else(|| crate::preparer::too_old(tag))?;
     // The version's own answer: a sibling's verified import is linked in when found, and whether its exporters ship.
-    let needs = crate::preparer::needs(&binary, &dir, log, Some(handoff))?
+    let needs = crate::preparer::needs(&binary, &dir, diagnostics, Some(handoff))?
         .ok_or_else(|| crate::preparer::too_old(tag))?;
     if let Some(stop) = stop {
         stop.check()?;
@@ -8365,11 +8352,16 @@ pub fn {f}("
         )
         .unwrap();
         fs::set_permissions(&preparer, fs::Permissions::from_mode(0o700)).unwrap();
+        // A switch's install, which has a Cancel and so writes the optional data file.
         let phases = std::cell::RefCell::new(Vec::new());
-        reuse_prepared_for_cancellable(TAG, None, |phase| {
-            assert!(!version.join("data-file-done").exists());
-            phases.borrow_mut().push(phase);
-        });
+        reuse_prepared_for_cancellable(
+            TAG,
+            Some(&crate::native_mods::Cancellation::default()),
+            |phase| {
+                assert!(!version.join("data-file-done").exists());
+                phases.borrow_mut().push(phase);
+            },
+        );
         assert_eq!(phases.into_inner(), [InstallPhase::Preparing]);
         assert!(
             version.join("data-file-done").exists(),
@@ -8458,32 +8450,31 @@ pub fn {f}("
         .unwrap();
         fs::write(version.join(COMPLETE), "").unwrap();
         fs::write(resources.join(RESOURCES_MANIFEST), "{}").unwrap();
-        // A writer that would take half a minute for the install's data file, and no Cancel to
-        // stop it. A seal's cache, packed in its snapshot under `launcher-prepared` first, is
-        // answered at once: this is about the install's own writer.
+        // A writer for the install's data file that ignores the stop and would take half a
+        // minute, and no Cancel. A seal's cache, packed in its snapshot under
+        // `launcher-prepared` first, is answered at once: this is about the install's own
+        // writer, which the stand-in marks when it is asked for it.
         let preparer = version.join("sunrise-prepare");
         fs::write(
             &preparer,
-            "#!/bin/sh\ncase \"$*\" in\n  data-file*launcher-prepared*) echo '{\"format\":1,\"written\":false}';;\n  data-file*) sleep 30; echo '{\"format\":1,\"written\":true}';;\n  *) exit 2;;\nesac\n",
+            "#!/bin/sh\ntrap '' TERM\ncase \"$*\" in\n  data-file*launcher-prepared*) echo '{\"format\":1,\"written\":false}';;\n  data-file*) touch \"$(dirname \"$0\")/install-writer-asked\"; sleep 30; echo '{\"format\":1,\"written\":true}';;\n  *) exit 2;;\nesac\n",
         )
         .unwrap();
         fs::set_permissions(&preparer, fs::Permissions::from_mode(0o700)).unwrap();
-        let before = crate::launcher_log::since(0).0;
         let started = std::time::Instant::now();
-        reuse_prepared_within(TAG, None, std::time::Duration::from_secs(1));
+        reuse_prepared_for_cancellable(TAG, None, |_| {});
         let took = started.elapsed();
         assert!(
             took < std::time::Duration::from_secs(10),
-            "the install waited {took:?} for a writer that never answered"
+            "the install waited {took:?} for a writer that ignores the stop"
+        );
+        assert!(
+            !version.join("install-writer-asked").exists(),
+            "an install with no Cancel doesn't start the optional writer"
         );
         assert!(
             prepare_lock(TAG).is_ok(),
-            "the stopped writer let go of the lock"
-        );
-        let (_, lines) = crate::launcher_log::since(before);
-        assert!(
-            lines.iter().any(|line| line.contains("stopped after 1 s")),
-            "{lines:?}"
+            "nothing holds the preparation lock"
         );
     }
 
@@ -10068,6 +10059,9 @@ esac"#
             "sounds.json",
             "extras.err",
             "extras.out",
+            "Secret Kind",
+            "Secret What",
+            "Secret Unmatched",
         ];
         let Some(root) = std::env::var_os("PREPARER_ERROR_LOG_ROOT") else {
             let root = tempfile::tempdir().unwrap();
@@ -10115,7 +10109,9 @@ esac"#
                 "(os error 13)",
                 "v-extras-partial: The sounds not added:",
                 "(os error 5)",
-                "Fetching missing game files (sounds): failed after",
+                "v-extras-partial: Extra game files not added:",
+                "(os error 6)",
+                "Fetching missing game files (1): failed after",
                 "(os error 28)",
                 "v-invalidate:",
             ] {
@@ -10169,6 +10165,7 @@ esac"#
         assert!(probe_missing_extras(&root.join("versions"), "v-startup-probe").is_none());
         let lacking =
             r#"{"format":1,"prepared":true,"missing":[{"kind":"sounds","what":"The sounds"}]}"#;
+        let partial_lacking = r#"{"format":1,"prepared":true,"missing":[{"kind":"sounds","what":"Public\nSecret What\nSuffix"},{"kind":"Public\nSecret Kind\nSuffix","what":"Secret What"}]}"#;
         make_version(
             "v-missing",
             concat!(
@@ -10184,17 +10181,17 @@ esac"#
             &format!(
                 concat!(
                     "case \"$1\" in\n",
-                    "  missing-extras) printf '%s\\n' '{lacking}';;\n",
+                    "  missing-extras) printf '%s\\n' '{partial_lacking}';;\n",
                     "  extras)\n",
                     "    printf '%s\\n' '{{\"message\":\"could not inspect /home/ada/Private Client Backup/drafts/msg.txt (os error 1)\"}}'\n",
                     "    printf '%s\\n' 'failed reading /home/ada/Private Client Backup/drafts/stderr.log (os error 22)' >&2\n",
-                    "    printf '%s\\n' '{{\"format\":1,\"added\":[],\"failed\":[{{\"kind\":\"sounds\",\"error\":\"could not read /home/ada/Private Client Backup/drafts/sounds.json (os error 5)\"}}],\"missing\":[{{\"kind\":\"sounds\",\"what\":\"The sounds\"}}]}}'\n",
+                    "    printf '%s\\n' '{{\"format\":1,\"added\":[],\"failed\":[{{\"kind\":\"sounds\",\"error\":\"could not read /home/ada/Private Client Backup/drafts/sounds.json (os error 5)\"}},{{\"kind\":\"Public\\nSecret Unmatched\\nSuffix\",\"error\":\"could not read /home/ada/Private Client Backup/drafts/sounds.json (os error 6)\"}}],\"missing\":[{{\"kind\":\"sounds\",\"what\":\"Public\\nSecret What\\nSuffix\"}}]}}'\n",
                     "    exit 1;;\n",
                     "  data-file) printf '%s\\n' '{{\"format\":1,\"written\":false}}';;\n",
                     "  *) exit 2;;\n",
                     "esac",
                 ),
-                lacking = lacking,
+                partial_lacking = partial_lacking,
             ),
         );
         make_version(
@@ -10245,7 +10242,11 @@ esac"#
             ("Packing game data cache: failed after", "(os error 13)"),
             ("v-extras-partial: The sounds not added:", "(os error 5)"),
             (
-                "Fetching missing game files (sounds): failed after",
+                "v-extras-partial: Extra game files not added:",
+                "(os error 6)",
+            ),
+            (
+                "Fetching missing game files (1): failed after",
                 "(os error 28)",
             ),
             ("v-extras-err:", "(os error 28)"),
@@ -10279,6 +10280,8 @@ esac"#
             "Secret Err Folder",
             "Secret Sounds Dir",
             "Secret Sounds Err",
+            "Secret Needs Msg",
+            "Secret Needs Err",
             "/home/ada",
         ];
         let Some(root) = std::env::var_os("PREPARER_MULTILINE_LOG_ROOT") else {
@@ -10395,6 +10398,43 @@ esac"#
         assert!(
             sound_lines.iter().any(|l| l.contains("Secret Sounds Err")),
             "local diagnostics must keep sounds stderr: {sound_lines:?}"
+        );
+
+        let needs_version = root.join("versions/v-needs");
+        fs::create_dir_all(&needs_version).unwrap();
+        let needs_preparer = needs_version.join("sunrise-prepare");
+        fs::write(
+            &needs_preparer,
+            concat!(
+                "#!/bin/sh\n",
+                "printf '{\"message\":\"Reusing /home/ada/Public\\\\nSecret Needs Msg\\\\nSuffix/26.3.jar\"}\\n'\n",
+                "printf 'Reusing /home/ada/Public\\nSecret Needs Err\\nSuffix/26.3.jar\\n' >&2\n",
+                "printf '{\"format\":1,\"server_jar\":false,\"jdk\":false}\\n'\n",
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&needs_preparer, fs::Permissions::from_mode(0o700)).unwrap();
+        let needs_lock = prepare_lock("v-needs").unwrap();
+        let needs_lines = std::cell::RefCell::new(Vec::new());
+        let needs_result = preparer_staged(
+            "v-needs",
+            &root.join("minecraft"),
+            MinecraftFrom::Install,
+            &|line| {
+                crate::launcher_log::line(crate::launcher_log::preparer_line(&line));
+            },
+            &|line| needs_lines.borrow_mut().push(line),
+            &needs_lock.handoff(None),
+        );
+        assert!(needs_result.is_err(), "no research-lock.json in fixture");
+        let needs_lines = needs_lines.into_inner();
+        assert!(
+            needs_lines.iter().any(|l| l.contains("Secret Needs Msg")),
+            "local diagnostics must keep needs message: {needs_lines:?}"
+        );
+        assert!(
+            needs_lines.iter().any(|l| l == "Secret Needs Err"),
+            "local diagnostics must keep needs stderr: {needs_lines:?}"
         );
 
         let (_, mine) = crate::launcher_log::since_in(before, op.id());
