@@ -69,13 +69,23 @@ pub fn at_start() -> Result<(), String> {
         return Ok(());
     };
     if let Err(error) = carry_over(&data, &config) {
-        crate::elog!("Could not copy the earlier launcher's data: {error}");
+        log_startup_failure(&error);
         *STARTUP_ERROR
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error.clone());
         return Err(error);
     }
     Ok(())
+}
+
+/// Reports a startup carry-over failure locally on stderr and records only a path-free summary
+/// in the launcher log (carry-over runs before `launcher_log::init` registers private roots).
+fn log_startup_failure(error: &str) {
+    eprintln!("Could not copy the earlier launcher's data: {error}");
+    crate::launcher_log::line(format!(
+        "Could not copy the earlier launcher's data: {}",
+        crate::launcher_log::safe_error(error)
+    ));
 }
 
 /// Copies the data of the first earlier launcher that has any into this launcher's folders under
@@ -253,14 +263,29 @@ fn remove_leftover(leftover: &Path) {
     match launcher_in_use(leftover) {
         Ok(false) => {
             if let Err(error) = fs::remove_dir_all(leftover) {
-                crate::elog!("Could not remove {}: {error}", leftover.display());
+                eprintln!("Could not remove {}: {error}", leftover.display());
+                crate::launcher_log::line(format!(
+                    "Could not remove leftover carry-over folder: {}",
+                    crate::launcher_log::safe_error(&error.to_string())
+                ));
             }
         }
-        Ok(true) => crate::elog!(
-            "Kept {}: something besides caches was written to it.",
-            leftover.display()
-        ),
-        Err(error) => crate::elog!("{error}"),
+        Ok(true) => {
+            eprintln!(
+                "Kept {}: something besides caches was written to it.",
+                leftover.display()
+            );
+            crate::launcher_log::line(
+                "Kept leftover carry-over folder: something besides caches was written to it.",
+            );
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            crate::launcher_log::line(format!(
+                "Could not inspect leftover carry-over folder: {}",
+                crate::launcher_log::safe_error(&error)
+            ));
+        }
     }
 }
 
@@ -321,19 +346,31 @@ fn settle(stage: &Path) {
         chrono::Utc::now().format("%Y%m%d-%H%M%S")
     ));
     match fs::rename(stage, &kept) {
-        Ok(()) => crate::elog!(
-            "Kept {} ({}): the data folder it was copied for already existed, so it was not replaced.",
-            kept.display(),
-            left.join(", ")
-        ),
-        Err(error) => crate::elog!("Could not keep {}: {error}", stage.display()),
+        Ok(()) => {
+            eprintln!(
+                "Kept {} ({}): the data folder it was copied for already existed, so it was not replaced.",
+                kept.display(),
+                left.join(", ")
+            );
+            crate::launcher_log::line(format!(
+                "Kept carry-over stage ({}): the data folder it was copied for already existed, so it was not replaced.",
+                left.join(", ")
+            ));
+        }
+        Err(error) => {
+            eprintln!("Could not keep {}: {error}", stage.display());
+            crate::launcher_log::line(format!(
+                "Could not keep carry-over stage: {}",
+                crate::launcher_log::safe_error(&error.to_string())
+            ));
+        }
     }
 }
 
 /// Removes the stage of a finished copy. A failure is reported and leaves it for the next start.
 fn discard(stage: &Path) {
     if let Err(error) = fs::remove_dir_all(stage) {
-        crate::elog!(
+        eprintln!(
             "{}",
             crate::i18n::trf(
                 "Could not remove {path}, left from copying the earlier launcher's data; the next start tries again: {error}",
@@ -343,6 +380,10 @@ fn discard(stage: &Path) {
                 ],
             )
         );
+        crate::launcher_log::line(format!(
+            "Could not remove carry-over stage; the next start tries again: {}",
+            crate::launcher_log::safe_error(&error.to_string())
+        ));
     }
 }
 
@@ -1265,6 +1306,56 @@ mod tests {
         );
         assert_eq!(files(&game), expected_game);
         assert!(!launcher.with_file_name(".carry-over").exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn startup_failure_and_stage_cleanup_logs_omit_private_paths() {
+        let base = std::env::temp_dir().join(format!(
+            "hz-private-carry-over-secret-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let stage = base.join(".carry-over");
+        let leftover = base.join(".carry-over-leftover");
+        fs::create_dir_all(stage.join("launcher")).unwrap();
+        fs::create_dir_all(&leftover).unwrap();
+        fs::write(leftover.join("player-note.txt"), "keep").unwrap();
+
+        let (before, _) = crate::launcher_log::since(u64::MAX);
+        log_startup_failure(
+            "/mnt/private-nas/SecretClient/earlier: No such file or directory (os error 2)",
+        );
+        settle(&stage);
+        remove_leftover(&leftover);
+
+        let (_, lines) = crate::launcher_log::since(before);
+        let expected_error = format!(
+            "Could not copy the earlier launcher's data: {} (os error 2)",
+            std::io::Error::from_raw_os_error(2).kind()
+        );
+        assert!(
+            lines.iter().any(|line| line.contains(&expected_error)),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Kept carry-over stage (launcher):")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Kept leftover carry-over folder:")),
+            "{lines:?}"
+        );
+        for secret in ["private-nas", "SecretClient", "private-carry-over-secret"] {
+            assert!(
+                lines.iter().all(|line| !line.contains(secret)),
+                "{secret} leaked into launcher log: {lines:?}"
+            );
+        }
         let _ = fs::remove_dir_all(&base);
     }
 }

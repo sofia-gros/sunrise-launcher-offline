@@ -1122,6 +1122,13 @@ fn json(value: serde_json::Value) {
     println!("{}", serde_json::to_string_pretty(&value).unwrap());
 }
 
+/// Reads a profile's `logs/latest.log` for `share-log` without embedding its root path or folder
+/// slug in the error returned to CLI logging.
+fn read_share_log(home: &std::path::Path) -> Result<String, String> {
+    std::fs::read_to_string(home.join("logs/latest.log"))
+        .map_err(|e| format!("Could not read latest.log: {e}"))
+}
+
 /// Runs the fixture process in this terminal and reports how it ended.
 #[cfg(test)]
 fn attached(cmd: Command) -> Result<i32, String> {
@@ -1676,9 +1683,7 @@ fn execute(command: Cmd, as_json: bool) -> Result<i32, String> {
                 Some(name) => instances::find(&name)?,
                 None => instances::selection()?,
             };
-            let path = i.home.join("logs/latest.log");
-            let text =
-                std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let text = read_share_log(&i.home)?;
             let names = game_log::names(&[&i.home, &backend::game_home()]);
             let text = game_log::private(&text, dirs::home_dir().as_deref(), &names);
             let shared = game_log::share(&text)?;
@@ -3897,6 +3902,21 @@ mod tests {
             );
         }
         assert_eq!(native_mods::base_for(None, &[], false), None);
+    }
+
+    #[test]
+    fn share_log_open_failure_omits_profile_path_and_folder_slug() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root
+            .path()
+            .join("private-share-root/instances/secret-profile-slug");
+        let error = read_share_log(&home).unwrap_err();
+        assert!(error.starts_with("Could not read latest.log: "), "{error}");
+        assert!(!error.contains("private-share-root"), "{error}");
+        assert!(!error.contains("secret-profile-slug"), "{error}");
+        std::fs::create_dir_all(home.join("logs")).unwrap();
+        std::fs::write(home.join("logs/latest.log"), "hello log").unwrap();
+        assert_eq!(read_share_log(&home).unwrap(), "hello log");
     }
 }
 
