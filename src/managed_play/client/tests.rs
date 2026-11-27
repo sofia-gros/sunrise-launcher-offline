@@ -1407,3 +1407,157 @@ fi
     assert!(log.contains("Verifying game files: done"));
     assert!(!log.contains(&*fixture.to_string_lossy()));
 }
+
+#[test]
+fn pre_launch_hook_runs_outside_the_manifest_lock_and_reacquires_before_spawn() {
+    use super::super::FULL_VERIFICATIONS;
+    const TEST: &str = "managed_play::client::tests::pre_launch_hook_runs_outside_the_manifest_lock_and_reacquires_before_spawn";
+    const ACTOR: &str = "PLAY_HOOK_LOCK_ACTOR";
+    const BUILD: &str = "v0.1.9";
+    const SENTINEL: &str = "stop-before-spawn";
+    let Ok(role) = std::env::var(ACTOR) else {
+        let root = tempfile::Builder::new()
+            .prefix("play-hook-lock-")
+            .tempdir()
+            .unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(ACTOR, "scenario")
+            .env("SUNRISE_HOME", root.path().join("game"))
+            .env("SUNRISE_LAUNCHER_HOME", root.path().join("launcher"))
+            .env(
+                "SUNRISE_LAUNCHER_LOCATION_FILE",
+                root.path().join("location"),
+            )
+            .env("SUNRISE_NO_KEYCHAIN", "1")
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("SUNRISE_MOD_INDEX_V2", root.path().join("no-index.signed"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success()
+                && stdout
+                    .lines()
+                    .any(|line| line.starts_with("test result: ok. 1 passed;")),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    };
+    let home = backend::game_home();
+    match role.as_str() {
+        "lock-home" => {
+            let guard = sunrise_launcher_smod::install_lock::try_lock_home(&home)
+                .expect("manifest lock was still held while the pre-launch hook ran");
+            fs::write(home.join("hook-acquired-manifest-lock"), b"ok").unwrap();
+            drop(guard);
+            return;
+        }
+        "expect-locked" => {
+            assert!(
+                sunrise_launcher_smod::install_lock::try_lock_home(&home).is_none(),
+                "manifest lock was not reacquired before spawn"
+            );
+            return;
+        }
+        "scenario" => {}
+        other => panic!("unknown hook-lock actor: {other}"),
+    }
+    let build = backend::version_dir(BUILD);
+    let prepared = backend::resources(BUILD);
+    fs::create_dir_all(&prepared).unwrap();
+    fs::write(prepared.join("sunrise-resources.json"), b"{}").unwrap();
+    fs::write(prepared.join("fixture-blob.bin"), b"hook bytes").unwrap();
+    fs::write(build.join(".installed"), []).unwrap();
+    fs::write(build.join(backend::CLIENT), b"hook client").unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let instance = instances::selection().unwrap();
+    let client = Client {
+        instance: &instance,
+        accepted_account: None,
+        explicit_account: false,
+        piped: false,
+    };
+    let cancellation = native_mods::Cancellation::default();
+    let mut profile = Profile::open(&home, None).unwrap();
+    let exe = std::env::current_exe()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let mut launch = crate::launch::Launch {
+        pre_launch: if cfg!(windows) {
+            format!("\"%HOOK_EXE%\" --exact {TEST} --nocapture")
+        } else {
+            format!("\"$HOOK_EXE\" --exact {TEST} --nocapture")
+        },
+        ..Default::default()
+    };
+    launch.env.insert("HOOK_EXE".into(), exe.clone());
+    launch.env.insert(ACTOR.into(), "lock-home".into());
+    let marker = home.join("hook-acquired-manifest-lock");
+    let command = |active: &Active| {
+        let mut command = Command::new(build.join(backend::CLIENT));
+        command
+            .current_dir(&home)
+            .env("SUNRISE_HOME", &home)
+            .arg("--game-dir")
+            .arg(&home)
+            .arg("--resources")
+            .arg(active.resource_path());
+        command
+    };
+    let verify_locked_at_spawn = || {
+        let output = Command::new(&exe)
+            .args(["--exact", TEST, "--nocapture"])
+            .env(ACTOR, "expect-locked")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success()
+                && stdout
+                    .lines()
+                    .any(|line| line.starts_with("test result: ok. 1 passed;")),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    // Exercise both First Play (which carries an owned `VerifiedSnapshot` holding its own
+    // `HomeLockGuard`) and repeat Play (`proof == None`).
+    for expected_verifies in [0_u32, 1_u32] {
+        if marker.exists() {
+            fs::remove_file(&marker).unwrap();
+        }
+        FULL_VERIFICATIONS.take();
+        let (active, _, proof) = client
+            .ready(
+                &mut profile,
+                || FirstBuild::installed(BUILD),
+                |_, _| Ok(()),
+                &cancellation,
+                |_| {},
+                || None,
+            )
+            .unwrap();
+        assert_eq!(proof.is_some(), expected_verifies == 0);
+        let result = profile.spawn_checked_account(
+            &active,
+            &cancellation,
+            command(&active),
+            (&launch, true, &|_| {}, proof),
+            |_| Ok(()),
+            |_| {
+                verify_locked_at_spawn();
+                Err(StartError::Other(SENTINEL.into()))
+            },
+        );
+        assert!(
+            matches!(result, Err(StartError::Other(ref detail)) if detail == SENTINEL),
+            "{result:?}"
+        );
+        assert!(marker.is_file(), "hook did not acquire the manifest lock");
+        assert_eq!(FULL_VERIFICATIONS.take(), expected_verifies);
+    }
+}

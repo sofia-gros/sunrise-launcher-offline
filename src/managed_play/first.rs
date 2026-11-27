@@ -474,9 +474,19 @@ impl Profile {
         cancellation: &native_mods::Cancellation,
         spawn: impl FnOnce(ProfileHandoff<'_>) -> Result<T, E>,
     ) -> Result<T, E> {
+        let _manifest = self.verify_handoff(active, proof, cancellation)?;
+        spawn(self.handoff())
+    }
+
+    pub(super) fn verify_handoff(
+        &self,
+        active: &Active,
+        proof: Option<VerifiedSnapshot>,
+        cancellation: &native_mods::Cancellation,
+    ) -> Result<HomeLockGuard, String> {
         let home = self.home();
         let checking = crate::launcher_log::step("Verifying the game and its prepared files");
-        let _manifest = game_lock(home)?;
+        let manifest = game_lock(home)?;
         checking.note("the profile's lock is held");
         let verified = (|| {
             crate::browser::installed::recover_game_install(home).map_err(String::from)?;
@@ -498,13 +508,39 @@ impl Profile {
                 .map_err(|issue| issue.message(|| unsettled!()))?;
             super::verify_included(active.base(), active.executable(), home)
         })();
+        // Drop `proof` while `manifest` holds the re-entrant lock so `manifest` is the sole
+        // remaining guard on this thread; dropping `manifest` before a hook frees the OS lock.
+        drop(proof);
         match &verified {
             Ok(()) => checking.done(""),
             Err(why) => checking.failed(why),
         }
         verified?;
         cancellation.check()?;
-        spawn(self.handoff())
+        Ok(manifest)
+    }
+
+    /// Reacquire the game-manifest lock after an unlocked pre-launch hook and confirm
+    /// the admitted generation, inputs, binaries, output, and native mods still match.
+    pub(super) fn recheck_after_hook(
+        &self,
+        active: &Active,
+        cancellation: &native_mods::Cancellation,
+    ) -> Result<HomeLockGuard, String> {
+        let home = self.home();
+        let manifest = game_lock(home)?;
+        cancellation.check()?;
+        crate::browser::installed::recover_game_install(home).map_err(String::from)?;
+        if self.active()?.as_ref() != Some(active) || inputs(home)? != active.inputs {
+            return Err(unsettled!());
+        }
+        active.verify_binaries()?;
+        active
+            .resources
+            .check_play_output(active.base())
+            .map_err(|issue| issue.message(|| unsettled!()))?;
+        super::verify_included(active.base(), active.executable(), home)?;
+        Ok(manifest)
     }
 
     pub(super) fn release_failed_first_play(&self) -> Result<(), String> {

@@ -29,7 +29,7 @@ impl Profile {
             command,
             &[],
             piped,
-            (None, |_| Ok(()), |_| Ok(())),
+            (None, |_| Ok(()), None, |_| Ok(())),
         )
         .map_err(String::from)
     }
@@ -75,26 +75,7 @@ impl Profile {
             command,
             &wrapper,
             piped,
-            (
-                proof,
-                |command| {
-                    prepare_jars(command)?;
-                    crate::launch::managed_pre_launch(command, launch, piped, hook_log)
-                        .map_err(StartError::Hook)?;
-                    // The hook is a separate process; it can change files without taking
-                    // the launcher's manifest lock. Do not start with different inputs.
-                    if !launch.pre_launch.trim().is_empty() {
-                        if self.active()?.as_ref() != Some(active)
-                            || super::inputs(self.home())? != active.inputs
-                        {
-                            return Err(unsettled!().into());
-                        }
-                        active.verify_binaries()?;
-                    }
-                    Ok(())
-                },
-                before_spawn,
-            ),
+            (proof, prepare_jars, Some((launch, hook_log)), before_spawn),
         )
     }
 
@@ -105,91 +86,104 @@ impl Profile {
         command: Command,
         wrapper: &[std::ffi::OsString],
         piped: bool,
-        (proof, pre_launch, before_spawn): (
+        (proof, prepare_jars, hook, before_spawn): (
             Option<VerifiedSnapshot>,
-            impl FnOnce(&Command) -> Result<(), StartError>,
+            impl FnOnce(&Command) -> Result<(), String>,
+            Option<(&crate::launch::Launch, &dyn Fn(String))>,
             impl FnOnce(&mut Command) -> Result<(), StartError>,
         ),
     ) -> Result<(Child, RuntimeGuard), StartError> {
-        self.verified_handoff_for(active, proof, cancellation, |profile| {
-            let selection = validate_selection(self.home(), &active.resource_path(), &command)?;
-            pre_launch(&command)?;
-            cancellation.check()?;
-            let (mut command, runtime) = prepare(self.home(), active, command)?;
-            let data = backend::data_dir();
-            let data = data
-                .canonicalize()
+        let manifest = self.verify_handoff(active, proof, cancellation)?;
+        let selection = validate_selection(self.home(), &active.resource_path(), &command)?;
+        prepare_jars(&command)?;
+        let _manifest = if let Some((launch, hook_log)) =
+            hook.filter(|(launch, _)| !launch.pre_launch.trim().is_empty())
+        {
+            // Release the manifest lock while the synchronous hook runs so any helper or
+            // subcommand acquiring `.mod-browser.lock` cannot deadlock, then reacquire
+            // and recheck committed inputs and binaries before spawn.
+            drop(manifest);
+            crate::launch::managed_pre_launch(&command, launch, piped, hook_log)
+                .map_err(StartError::Hook)?;
+            self.recheck_after_hook(active, cancellation)?
+        } else {
+            manifest
+        };
+        cancellation.check()?;
+        let (mut command, runtime) = prepare(self.home(), active, command)?;
+        let data = backend::data_dir();
+        let data = data
+            .canonicalize()
+            .map_err(|error| super::at(&data, error))?;
+        let cwd = command
+            .get_current_dir()
+            .expect("verified client working directory");
+        let image = Path::new(command.get_program());
+        let mut trees = holder::managed_lease_paths(image, &selection, &data, cwd)
+            .map_err(|error| super::at(image, error))?;
+        // The runtime copy runs from its own folder; also retain the original install.
+        let source = backend::version_dir(active.executable());
+        let source = source
+            .canonicalize()
+            .map_err(|error| super::at(&source, error))?;
+        for parent in source
+            .ancestors()
+            .take_while(|parent| parent.starts_with(&data) && *parent != data)
+        {
+            if !trees.iter().any(|(path, _)| path == parent) {
+                trees.push((parent.to_owned(), parent == source));
+            }
+        }
+        // A capable game still receives the recording/capture protocol of legacy Play.
+        let record = if holder::capable(image).map_err(|error| super::at(image, error))? {
+            let record = holder::RunRecord::new(data.clone(), trees.clone(), &selection.context)
                 .map_err(|error| super::at(&data, error))?;
-            let cwd = command
-                .get_current_dir()
-                .expect("verified client working directory");
-            let image = Path::new(command.get_program());
-            let mut trees = holder::managed_lease_paths(image, &selection, &data, cwd)
-                .map_err(|error| super::at(image, error))?;
-            // The runtime copy runs from its own folder; also retain the original install.
-            let source = backend::version_dir(active.executable());
-            let source = source
-                .canonicalize()
-                .map_err(|error| super::at(&source, error))?;
-            for parent in source
-                .ancestors()
-                .take_while(|parent| parent.starts_with(&data) && *parent != data)
-            {
-                if !trees.iter().any(|(path, _)| path == parent) {
-                    trees.push((parent.to_owned(), parent == source));
-                }
-            }
-            // A capable game still receives the recording/capture protocol of legacy Play.
-            let record = if holder::capable(image).map_err(|error| super::at(image, error))? {
-                let record =
-                    holder::RunRecord::new(data.clone(), trees.clone(), &selection.context)
-                        .map_err(|error| super::at(&data, error))?;
-                let directory = record
-                    .direct_entry(&mut command)
-                    .map_err(|error| super::at(&data, error))?;
-                trees.push((directory.to_owned(), false));
-                Some(record)
-            } else {
-                None
-            };
-            let dirs = trees
-                .into_iter()
-                .map(|(path, _)| Dir::open_ambient_dir(path, ambient_authority()))
-                .collect::<io::Result<Vec<_>>>()
+            let directory = record
+                .direct_entry(&mut command)
+                .map_err(|error| super::at(&data, error))?;
+            trees.push((directory.to_owned(), false));
+            Some(record)
+        } else {
+            None
+        };
+        let dirs = trees
+            .into_iter()
+            .map(|(path, _)| Dir::open_ambient_dir(path, ambient_authority()))
+            .collect::<io::Result<Vec<_>>>()
+            .map_err(|error| error.to_string())?;
+        let leases = ChildLeases::acquire(&data, &dirs).map_err(|error| error.to_string())?;
+        #[cfg(windows)]
+        let leases = {
+            let mut leases = leases;
+            leases
+                .retain(runtime.windows()?.files())
                 .map_err(|error| error.to_string())?;
-            let leases = ChildLeases::acquire(&data, &dirs).map_err(|error| error.to_string())?;
-            #[cfg(windows)]
-            let leases = {
-                let mut leases = leases;
-                leases
-                    .retain(runtime.windows()?.files())
-                    .map_err(|error| error.to_string())?;
-                leases
-            };
-            #[cfg(unix)]
-            if piped {
-                use std::os::unix::process::CommandExt;
-                command.process_group(0);
-            }
-            // Last, so the game's session file is as young as it can be: the checks above can
-            // take longer than the game keeps one.
-            before_spawn(&mut command)?;
-            let child = if wrapper.is_empty() {
-                let program = command.get_program().to_string_lossy().into_owned();
-                leases
-                    .spawn_game(command, profile, piped)
-                    .map_err(|error| {
-                        crate::i18n::trf(
-                            "Could not run {program}: {error}",
-                            &[("program", &program), ("error", &error.to_string())],
-                        )
-                    })?
-            } else {
-                crate::process::relay::start(&command, wrapper, &leases, profile, piped)?
-            };
-            drop(record);
-            Ok((child, runtime))
-        })
+            leases
+        };
+        #[cfg(unix)]
+        if piped {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        // Last, so the game's session file is as young as it can be: the checks above can
+        // take longer than the game keeps one.
+        before_spawn(&mut command)?;
+        let profile = self.handoff();
+        let child = if wrapper.is_empty() {
+            let program = command.get_program().to_string_lossy().into_owned();
+            leases
+                .spawn_game(command, profile, piped)
+                .map_err(|error| {
+                    crate::i18n::trf(
+                        "Could not run {program}: {error}",
+                        &[("program", &program), ("error", &error.to_string())],
+                    )
+                })?
+        } else {
+            crate::process::relay::start(&command, wrapper, &leases, profile, piped)?
+        };
+        drop(record);
+        Ok((child, runtime))
     }
 }
 
