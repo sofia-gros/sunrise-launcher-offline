@@ -573,6 +573,12 @@ impl Launcher {
                 self.servers.reset_public_lookup();
             }
             self.storage_builds.confirm = None;
+            self.storage_confirm = None;
+            if self.ui.page == Page::Settings
+                && self.ui.settings.section == settings::Section::Storage
+            {
+                self.refresh_storage(None, false);
+            }
             self.refresh_open_storage_builds();
         }
     }

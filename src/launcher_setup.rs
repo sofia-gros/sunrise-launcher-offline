@@ -108,7 +108,6 @@ impl Launcher {
             removing: Vec::new(),
             storage_builds: Default::default(),
             storage_report: None,
-            storage_pending: false,
             storage_confirm: None,
             storage_error: None,
             install_error: None,

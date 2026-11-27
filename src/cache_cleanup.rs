@@ -373,7 +373,12 @@ pub(crate) fn delete_game_unit_observed(
     path: &Path,
     after_classification: impl FnOnce(),
 ) -> Result<(), Error> {
-    delete_unit(path, false, after_classification, || Ok(()))
+    delete_unit(path, false, false, after_classification, || Ok(()))
+}
+
+/// Explicit Storage Clear relies on the exclusive claim, not an executable marker.
+pub(crate) fn clear_claimed_unit(path: &Path) -> Result<(), Error> {
+    delete_unit(path, true, true, || {}, || Ok(()))
 }
 
 /// Remove an installed version after the caller's selection checks under the publication fence.
@@ -382,26 +387,35 @@ pub(crate) fn delete_version_checked(
     path: &Path,
     check: impl FnOnce() -> Result<(), Error>,
 ) -> Result<(), Error> {
-    delete_unit(path, true, || {}, check)
+    delete_unit(path, true, false, || {}, check)
 }
 
 /// Remove an installed version whose running processes have already been checked.
 pub(crate) fn delete_version(path: &Path, idle: bool) -> Result<(), Error> {
-    delete_unit(path, idle, || {}, || Ok(()))
+    delete_unit(path, idle, false, || {}, || Ok(()))
 }
 
 fn delete_unit(
     path: &Path,
     idle: bool,
+    explicit_storage_clear: bool,
     after_classification: impl FnOnce(),
     check: impl FnOnce() -> Result<(), Error>,
 ) -> Result<(), Error> {
     use sunrise_launcher_smod::{locks::Release, runtime_leases::Registry};
     let registry = Registry::with_release(&crate::backend::data_dir(), Release::Close)?;
     registry.remove_unit(path, |directory, is_directory| {
-        match Access::for_unit(path)? {
-            Access::UninstrumentedGame if idle => {}
-            access => access.check()?,
+        if !explicit_storage_clear {
+            match Access::for_unit(path)? {
+                Access::UninstrumentedGame if idle => (),
+                access => access.check()?,
+            }
+        } else if path.parent() == Some(crate::backend::versions_dir().as_path())
+            && path
+                .file_name()
+                .is_some_and(crate::backend::installation::private_stage)
+        {
+            return Err(Error::UnpublishedGame);
         }
         // remove_unit holds the same exclusive fence as journal publication and
         // roster changes. Candidate selection alone can never authorize detaching.

@@ -95,6 +95,14 @@ pub(super) struct SettingsView {
     pub(crate) appearance: appearance::State,
     /// The Storage page's count or Clear in flight (`glass_storage`).
     pub(super) storage_work: Option<glass_storage::Work>,
+    /// Feedback from the last explicit Clear, independent of the next count.
+    pub(super) storage_clear: Option<Result<Box<storage::Report>, String>>,
+}
+
+impl SettingsView {
+    pub(super) fn storage_busy(&self) -> bool {
+        self.storage_work.is_some()
+    }
 }
 
 /// A card of rows with a rule between them.
@@ -402,7 +410,8 @@ impl Launcher {
         // Another section starts at its top, with its list of sections back in place: the old
         // section's scroll would cut the new one's title off, and the list would hold on to
         // where the old one had pushed it.
-        if self.ui.settings.section != section {
+        let changed = self.ui.settings.section != section;
+        if changed {
             crate::frame::scrolls("settings").set_offset(gpui::point(px(0.), px(0.)));
             self.settings_sticky.reset();
         }
@@ -416,8 +425,10 @@ impl Launcher {
         self.storage_builds.confirm = None;
         self.collection.confirm_delete = false;
         if section == Section::Storage {
-            self.refresh_open_storage_builds();
-            self.refresh_storage(None, false);
+            if changed {
+                self.refresh_storage(None, false);
+                self.refresh_open_storage_builds();
+            }
         } else {
             self.stop_storage_work();
         }
@@ -875,7 +886,7 @@ impl Launcher {
             }),
         );
 
-        let busy = self.storage_pending;
+        let busy = self.ui.settings.storage_busy();
         // The total waits for every row; a row shows its own size as soon as it is counted.
         let complete = self.storage_report.as_ref().filter(|r| r.is_complete());
         let total =
@@ -902,41 +913,33 @@ impl Launcher {
         let mut cache = vec![row(
             tr("Downloads kept for reuse"),
             detail,
-            div()
-                .child(
-                    button("alt-storage-recount", tr("Recount")).on_click(cx.listener(
-                        |this, _: &ClickEvent, _, cx| {
-                            this.refresh_storage(None, false);
-                            cx.notify();
-                        },
-                    )),
-                )
-                .child(
-                    if offered
-                        && complete
-                            .is_none_or(|r| r.rows.iter().any(|row| row.clearable_bytes() > 0))
-                    {
-                        clear_all.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.storage_confirm = Some(None);
-                            cx.notify();
-                        }))
-                    } else {
-                        off(clear_all)
-                    },
-                ),
+            div().child(
+                if offered
+                    && complete.is_none_or(|r| {
+                        r.rows
+                            .iter()
+                            .any(|row| glass_storage::row_clearable(Some(row)))
+                    })
+                {
+                    clear_all.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.storage_confirm = Some(None);
+                        cx.notify();
+                    }))
+                } else {
+                    off(clear_all)
+                },
+            ),
         )];
-        // A problem no row owns is said once, quietly, under the total.
-        if let Some(error) = self.storage_error.clone() {
-            let total = cache.remove(0);
-            cache.push(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.))
-                    .child(total)
-                    .child(hint(error)),
-            );
-        }
+        // Neither starting nor finishing an automatic count replaces Clear feedback.
+        cache.extend(self.storage_error.as_ref().map(|error| hint(error.clone())));
+        let cleared = match &self.ui.settings.storage_clear {
+            Some(Ok(report)) => Some(report),
+            Some(Err(error)) => {
+                cache.push(hint(error.clone()));
+                None
+            }
+            None => None,
+        };
         if let Some(asked) = self.storage_confirm {
             // The size to free is offered only for rows that are counted.
             let counted: Vec<_> = self
@@ -950,8 +953,10 @@ impl Launcher {
             } else {
                 1
             };
-            let bytes = (counted.len() == wanted)
-                .then(|| counted.iter().map(|r| r.clearable_bytes()).sum());
+            let bytes = (counted.len() == wanted
+                && counted.iter().all(|r| r.measured_bytes().is_some()))
+            .then(|| counted.iter().map(|r| r.clearable_bytes()).sum())
+            .filter(|&bytes| bytes > 0);
             let question = glass_storage::clear_question(asked, bytes);
             cache.push(
                 div()
@@ -982,40 +987,35 @@ impl Launcher {
                 .storage_report
                 .as_ref()
                 .and_then(|report| report.rows.iter().find(|r| r.category == category));
-            let size = found.map_or_else(
-                || uncounted.to_string(),
-                |r| storage::format_bytes(r.remaining_bytes),
-            );
+            let size = found
+                .and_then(storage::Row::measured_bytes)
+                .map_or_else(|| uncounted.to_string(), storage::format_bytes);
             let clear = button(ElementId::named_usize("alt-storage-clear", n), tr("Clear…"));
             let mut line = row(
                 trf(
                     "{category} · {size}",
-                    &[
-                        ("category", glass_storage::category_label(category)),
-                        ("size", &size),
-                    ],
+                    &[("category", category.label()), ("size", &size)],
                 ),
                 glass_storage::category_about(category),
-                div().child(
-                    if offered && found.is_none_or(|r| r.clearable_bytes() > 0) {
-                        clear.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.storage_confirm = Some(Some(category));
-                            cx.notify();
-                        }))
-                    } else {
-                        off(clear)
-                    },
-                ),
+                div().child(if offered && glass_storage::row_clearable(found) {
+                    clear.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.storage_confirm = Some(Some(category));
+                        cx.notify();
+                    }))
+                } else {
+                    off(clear)
+                }),
             );
-            if let Some(kept) = found.and_then(|r| {
-                glass_storage::kept_line(
-                    r.remaining_bytes,
-                    r.clearable_bytes(),
-                    r.after_clear,
-                    !r.kept.is_empty(),
-                    r.older_build_kept,
-                )
-            }) {
+            let feedback = cleared.and_then(|report| {
+                report
+                    .rows
+                    .iter()
+                    .find(|r| r.category == category && r.after_clear)
+            });
+            if let Some(kept) = feedback
+                .and_then(glass_storage::kept_line)
+                .or_else(|| found.and_then(glass_storage::kept_line))
+            {
                 line = div()
                     .flex()
                     .flex_col()

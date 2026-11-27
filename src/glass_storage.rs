@@ -2,7 +2,7 @@
 //! filesystem work never runs on the render thread.
 use super::*;
 
-use storage::Category;
+use storage::{Category, Eligibility, KeptKind, Row};
 
 #[cfg(test)]
 mod tests;
@@ -19,36 +19,44 @@ pub(crate) fn clear_offered(work: Option<&Work>) -> bool {
     !work.is_some_and(|work| work.clearing)
 }
 
+/// Unknown rows can be cleared without waiting for counting; a link-only candidate can
+/// be cleared even though it owns no allocated bytes.
+pub(super) fn row_clearable(row: Option<&Row>) -> bool {
+    row.is_none_or(|row| {
+        matches!(
+            row.eligibility(),
+            Eligibility::NotMeasured | Eligibility::Candidate
+        )
+    })
+}
+
 /// A row says nothing about partial protection until a Clear has tried it.
-pub(super) fn kept_line(
-    remaining: u64,
-    clearable: u64,
-    after_clear: bool,
-    has_refusals: bool,
-    older_build_kept: bool,
-) -> Option<String> {
-    if remaining == 0 {
-        return (after_clear && has_refusals).then(|| {
-            tr("Some files couldn't be cleared. See the launcher log for details.").into()
+pub(super) fn kept_line(row: &Row) -> Option<String> {
+    let first = row.kept.first()?;
+    if !row.after_clear {
+        if row.eligibility() != Eligibility::WhollyRefused {
+            return None;
+        }
+        return Some(if row.only_kept_kind(first.kind) {
+            first.reason.clone()
+        } else {
+            tr("These files can't be cleared. See the launcher log for details.").into()
         });
     }
-    if !after_clear && clearable > 0 {
-        return None;
+    if row.remaining_bytes == 0 {
+        return Some(
+            tr("Some files couldn't be cleared. See the launcher log for details.").into(),
+        );
     }
-    let size = storage::format_bytes(remaining);
-    Some(if !after_clear {
-        trf(
-            "{size} is protected and can't be cleared. See the launcher log for details.",
-            &[("size", &size)],
-        )
-    } else if older_build_kept {
-        trf(
-            "{size} stayed. Remove older game builds if you no longer use them, then try again.",
-            &[("size", &size)],
-        )
+    let size = storage::format_bytes(row.remaining_bytes);
+    let text = if row.only_kept_kind(KeptKind::OlderBuild) {
+        "{size} stayed. Remove older game builds if you no longer use them, then try again."
+    } else if row.only_kept_kind(KeptKind::Busy) {
+        "{size} stayed. Close the game, wait for any builds to finish, then try again. See the launcher log if files still remain."
     } else {
-        trf("{size} stayed. Close the game, wait for any builds to finish, then try again. See the launcher log if files still remain.", &[("size", &size)])
-    })
+        "{size} stayed. See the launcher log for details."
+    };
+    Some(trf(text, &[("size", &size)]))
 }
 
 /// What the confirmation asks: with the size to free when the rows asked about are counted, and
@@ -67,14 +75,33 @@ pub(crate) fn clear_question(asked: Option<Category>, bytes: Option<u64>) -> Str
         (Some(category), Some(size)) => trf(
             "Clear {category}? Up to {size} is freed. Close the game first. Files a game or build is using stay.",
             &[
-                ("category", category_label(category)),
+                ("category", category.label()),
                 ("size", &size),
             ],
         ),
         (Some(category), None) => trf(
             "Clear {category}? Close the game first. Files a game or build is using stay.",
-            &[("category", category_label(category))],
+            &[("category", category.label())],
         ),
+    }
+}
+
+impl settings::SettingsView {
+    /// Reject queued outcomes from a cancelled or superseded worker before changing the view.
+    fn accept_storage(
+        &mut self,
+        token: &storage::Cancel,
+        result: &Result<Box<storage::Report>, String>,
+    ) -> Option<bool> {
+        let work = self
+            .storage_work
+            .as_ref()
+            .filter(|work| work.cancel.is(token))?;
+        let clearing = work.clearing;
+        if result.as_ref().map_or(true, |report| report.is_complete()) {
+            self.storage_work = None;
+        }
+        Some(clearing)
     }
 }
 
@@ -97,21 +124,19 @@ impl Launcher {
             cancel: cancel.clone(),
             clearing,
         });
-        self.storage_pending = true;
         self.storage_error = None;
-        if !clearing {
-            self.storage_report = None;
+        self.storage_report = None;
+        if clearing {
+            self.ui.settings.storage_clear = None;
         }
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             let send = |result: Result<Box<storage::Report>, String>| {
-                let _ = tx.send(Msg::Storage(result));
+                let _ = tx.send(Msg::Storage(cancel.clone(), result));
             };
             let result = storage::Storage::open().and_then(|storage| {
                 if clearing {
-                    storage
-                        .report(clear, all)
-                        .map(|report| Some(report.tagged(&cancel)))
+                    storage.report(clear, all).map(Some)
                 } else {
                     // The last row arrives as the whole report, below.
                     storage.count(&cancel, |rows| {
@@ -126,43 +151,38 @@ impl Launcher {
                 // Cancelled: the window has moved on and wants nothing from this worker.
                 Ok(None) => {}
                 Err(_) if cancel.is_cancelled() => {}
-                Err(error) => send(Err(native_mods::cache_error(error))),
+                Err(error) => send(Err(storage::error_message(error))),
             }
         });
     }
 
     /// Rows counted so far, or the finished count or Clear, from the worker.
-    pub(super) fn storage_arrived(&mut self, result: Result<Box<storage::Report>, String>) {
-        let work = self.ui.settings.storage_work.as_ref();
+    pub(super) fn storage_arrived(
+        &mut self,
+        token: storage::Cancel,
+        result: Result<Box<storage::Report>, String>,
+    ) {
+        let Some(clearing) = self.ui.settings.accept_storage(&token, &result) else {
+            return;
+        };
+        if clearing {
+            self.ui.settings.storage_clear = Some(result);
+            if self.ui.page == frame::Page::Settings
+                && self.ui.settings.section == settings::Section::Storage
+            {
+                self.refresh_storage(None, false);
+            }
+            return;
+        }
         match result {
-            Ok(report) => {
-                // What a count that was cancelled or overtaken sent before it noticed is dropped.
-                if !work.is_some_and(|work| report.is_from(&work.cancel)) {
-                    return;
-                }
-                if report.is_complete() {
-                    self.ui.settings.storage_work = None;
-                    self.storage_pending = false;
-                }
-                self.storage_report = Some(*report);
-                self.storage_error = None;
-            }
-            Err(error) => {
-                self.ui.settings.storage_work = None;
-                self.storage_pending = false;
-                self.storage_error = Some(error);
-            }
+            Ok(report) => self.storage_report = Some(*report),
+            Err(error) => self.storage_error = Some(error),
         }
     }
 
-    /// Counts the rows again when the page is shown with some of them missing: an earlier
-    /// count was stopped by leaving it. A failed count waits for an explicit Recount.
+    /// Starts the initial count if no entry or background refresh has started one yet.
     pub(super) fn resume_storage_count(&mut self) {
-        let incomplete = self
-            .storage_report
-            .as_ref()
-            .is_none_or(|report| !report.is_complete());
-        if incomplete && !self.storage_pending && self.storage_error.is_none() {
+        if self.storage_report.is_none() && self.storage_error.is_none() {
             self.refresh_storage(None, false);
         }
     }
@@ -172,20 +192,8 @@ impl Launcher {
     pub(super) fn stop_storage_work(&mut self) {
         if let Some(count) = self.ui.settings.storage_work.take_if(|work| !work.clearing) {
             count.cancel.cancel();
-            self.storage_pending = false;
         }
         self.stop_storage_builds_count();
-    }
-}
-
-pub(crate) fn category_label(category: Category) -> &'static str {
-    match category {
-        Category::BuildFiles => tr("Build files"),
-        Category::ModBuildCache => tr("Mod build cache"),
-        Category::PrebuiltGames => tr("Prebuilt games"),
-        Category::SpareGameBuilds => tr("Spare game builds"),
-        Category::RustCompiler => tr("Rust compiler"),
-        Category::OtherCaches => tr("Other caches"),
     }
 }
 
@@ -204,5 +212,22 @@ pub(crate) fn category_about(category: Category) -> &'static str {
             tr("The compiler that builds native mods: downloaded again the next time one is built.")
         }
         Category::OtherCaches => tr("Other downloads kept to make the launcher faster."),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn storage_busy_follows_the_active_worker_slot() {
+    let mut view = settings::SettingsView::default();
+    assert!(!view.storage_busy());
+    for clearing in [false, true] {
+        view.storage_work = Some(Work {
+            cancel: storage::Cancel::default(),
+            clearing,
+        });
+        assert!(view.storage_busy());
+        assert_eq!(clear_offered(view.storage_work.as_ref()), !clearing);
+        view.storage_work.take();
+        assert!(!view.storage_busy());
     }
 }

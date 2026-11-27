@@ -501,7 +501,7 @@ impl Launcher {
                 Msg::BuildInventory(generation, rows) => {
                     self.storage_builds_arrived(generation, rows)
                 }
-                Msg::Storage(result) => self.storage_arrived(result),
+                Msg::Storage(token, result) => self.storage_arrived(token, result),
                 Msg::Imported(result) => self.storage_build_imported(result),
                 Msg::Pruned(errors) => self.storage_builds_pruned(errors),
                 Msg::Updates(updates) => {

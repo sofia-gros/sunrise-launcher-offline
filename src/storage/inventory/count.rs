@@ -21,8 +21,11 @@ impl Storage {
         if cancel.is_cancelled() {
             return Ok(None);
         }
-        note_lease_registry()?;
-        let mut remaining = self.entries()?;
+        let discovery = self.entries_until(cancel, None);
+        if cancel.is_cancelled() {
+            return Ok(None);
+        }
+        let mut remaining = discovery.map_err(redact_error)?;
         let mut report = Report::new(Vec::new()).tagged(cancel);
         for category in Category::ALL {
             let (units, rest): (Vec<_>, Vec<_>) = remaining
@@ -30,12 +33,25 @@ impl Storage {
                 .partition(|entry| entry.category == category);
             remaining = rest;
             let mut row = Row::new(category);
-            let (units, trees) = refused(units, std::slice::from_mut(&mut row), cancel, |_| false)?;
-            row.bytes = allocated(&units, &trees, category);
-            row.remaining_bytes = row.bytes;
+            let mut seen = HashSet::new();
+            for entry in units {
+                if cancel.is_cancelled() {
+                    return Ok(None);
+                }
+                let measured = measure_entry(&entry, &mut row, cancel, false);
+                if cancel.is_cancelled() {
+                    return Ok(None);
+                }
+                if let Some(tree) = measured.map_err(redact_error)? {
+                    row.has_candidates |= entry.is_candidate(&tree);
+                    row.bytes = row.bytes.saturating_add(tree.size(&mut seen));
+                }
+            }
             if cancel.is_cancelled() {
                 return Ok(None);
             }
+            row.measured = true;
+            row.remaining_bytes = row.bytes;
             report.push(row);
             counted(&report);
         }

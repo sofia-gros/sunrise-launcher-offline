@@ -4,7 +4,7 @@ use crate::mods::switch;
 use crate::settings::{danger, group, hint, off, row, warning};
 use std::sync::Arc;
 use sunrise_launcher::backend::{
-    version_storage::{self, Build, InUse},
+    version_storage::{self, Build, InUse, SizeUnavailable},
     NightlyReceiptWarning,
 };
 
@@ -32,33 +32,67 @@ pub(super) enum Confirm {
     Old(Vec<String>),
 }
 
+impl View {
+    fn stop_count(&mut self) {
+        self.generation += 1;
+        if let Some(cancel) = self.cancel.take() {
+            cancel.cancel();
+        }
+    }
+
+    fn start_count(&mut self, location_unavailable: bool) -> Option<(u64, storage::Cancel)> {
+        self.stop_count();
+        self.rows = None;
+        if location_unavailable {
+            return None;
+        }
+        let cancel = storage::Cancel::default();
+        self.cancel = Some(cancel.clone());
+        Some((self.generation, cancel))
+    }
+
+    fn accept_rows(&mut self, generation: u64, mut rows: Vec<Build>) {
+        if self.generation == generation {
+            rows.retain(|row| row.size_unavailable != Some(SizeUnavailable::Vanished));
+            self.rows = Some(rows);
+        }
+    }
+}
+
+fn count_builds(releases: &[Release], cancel: &storage::Cancel, mut publish: impl FnMut(&[Build])) {
+    let Some(mut rows) = version_storage::inventory_until(releases, cancel) else {
+        return;
+    };
+    publish(&rows);
+    version_storage::measure(&mut rows, cancel, publish);
+}
+
+fn build_size(build: &Build) -> String {
+    match (build.bytes, build.size_unavailable) {
+        (Some(bytes), _) => storage::format_bytes(bytes),
+        (None, Some(_)) => tr("Not counted").into(),
+        (None, None) => tr("Counting…").into(),
+    }
+}
+
 impl Launcher {
     pub(super) fn refresh_storage_builds(&mut self) {
-        if self.location_unavailable {
+        let Some((generation, cancel)) = self.storage_builds.start_count(self.location_unavailable)
+        else {
             return;
-        }
-        self.storage_builds.generation += 1;
-        let generation = self.storage_builds.generation;
-        let cancel = storage::Cancel::default();
-        if let Some(previous) = self.storage_builds.cancel.replace(cancel.clone()) {
-            previous.cancel();
-        }
+        };
         let releases = self.game_releases().to_vec();
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             // The builds show at once, each still counting, and take their sizes one by one.
-            let mut rows = version_storage::inventory(&releases);
-            let _ = tx.send(Msg::BuildInventory(generation, rows.clone()));
-            version_storage::measure(&mut rows, &cancel, |rows| {
+            count_builds(&releases, &cancel, |rows| {
                 let _ = tx.send(Msg::BuildInventory(generation, rows.to_vec()));
             });
         });
     }
 
     pub(super) fn stop_storage_builds_count(&mut self) {
-        if let Some(cancel) = self.storage_builds.cancel.take() {
-            cancel.cancel();
-        }
+        self.storage_builds.stop_count();
     }
 
     /// Shown on Storage: count the builds' sizes and the rows. Anywhere else: stop counting.
@@ -74,9 +108,7 @@ impl Launcher {
     }
 
     pub(super) fn storage_builds_arrived(&mut self, generation: u64, rows: Vec<Build>) {
-        if self.storage_builds.generation == generation {
-            self.storage_builds.rows = Some(rows);
-        }
+        self.storage_builds.accept_rows(generation, rows);
     }
 
     fn can_change_builds(&self) -> bool {
@@ -111,7 +143,11 @@ impl Launcher {
     pub(super) fn storage_builds_removed(&mut self, errors: Vec<(String, String)>) {
         self.removing.clear();
         self.storage_builds_pruned(errors);
-        self.refresh_storage(None, false);
+        if self.ui.page == frame::Page::Settings
+            && self.ui.settings.section == settings::Section::Storage
+        {
+            self.refresh_storage(None, false);
+        }
     }
 
     pub(super) fn storage_builds_pruned(&mut self, errors: Vec<(String, String)>) {
@@ -339,11 +375,10 @@ impl Launcher {
             .to_string()
         } else if rows.is_empty() {
             tr("No game builds installed").to_string()
-        } else if rows.iter().all(|b| b.bytes.is_some()) {
-            trf(
-                "{size} on disk",
-                &[("size", &size(rows.iter().filter_map(|b| b.bytes).sum()))],
-            )
+        } else if let Some(bytes) = rows.iter().map(|b| b.bytes).sum::<Option<u64>>() {
+            trf("{size} on disk", &[("size", &size(bytes))])
+        } else if rows.iter().any(|b| b.size_unavailable.is_some()) {
+            tr("Not counted").to_string()
         } else {
             tr("Counting…").to_string()
         };
@@ -422,9 +457,7 @@ impl Launcher {
                 None if backend::dev_date(&build.tag).is_some() => tr("Dev").into(),
                 None => String::new(),
             };
-            let counted = build
-                .bytes
-                .map_or_else(|| tr("Counting…").to_string(), size);
+            let counted = build_size(build);
             let subtitle = if detail.is_empty() {
                 counted
             } else {
@@ -520,5 +553,66 @@ impl Launcher {
             ),
         ));
         group(rows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closing_build_inventory_rejects_queued_rows() {
+        let mut view = View::default();
+        let (generation, cancel) = view.start_count(false).unwrap();
+        view.stop_count();
+        assert!(cancel.is_cancelled());
+        view.accept_rows(generation, Vec::new());
+        assert!(view.rows.is_none());
+    }
+
+    #[test]
+    fn reopening_unavailable_build_inventory_discards_previous_rows() {
+        let mut view = View::default();
+        let (generation, _) = view.start_count(false).unwrap();
+        view.accept_rows(generation, Vec::new());
+        assert!(view.rows.is_some());
+        assert!(view.start_count(true).is_none());
+        assert!(view.rows.is_none());
+        view.accept_rows(generation, Vec::new());
+        assert!(view.rows.is_none());
+    }
+
+    #[test]
+    fn cancelled_build_discovery_publishes_nothing() {
+        let cancel = storage::Cancel::default();
+        cancel.cancel();
+        count_builds(&[], &cancel, |_| {
+            panic!("cancelled discovery published rows")
+        });
+    }
+
+    #[test]
+    fn unavailable_build_sizes_are_not_zero_and_vanished_builds_disappear() {
+        let mut view = View::default();
+        let (generation, _) = view.start_count(false).unwrap();
+        let mut build = Build {
+            tag: "unreadable".into(),
+            bytes: None,
+            size_unavailable: None,
+            in_use: None,
+            old_download: false,
+        };
+        assert_eq!(build_size(&build), "Counting…");
+        build.size_unavailable = Some(SizeUnavailable::Unreadable);
+        let vanished = Build {
+            tag: "vanished".into(),
+            size_unavailable: Some(SizeUnavailable::Vanished),
+            ..build.clone()
+        };
+        view.accept_rows(generation, vec![build, vanished]);
+        let rows = view.rows.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tag, "unreadable");
+        assert_eq!(build_size(&rows[0]), "Not counted");
     }
 }

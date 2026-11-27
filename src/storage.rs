@@ -4,14 +4,51 @@ pub use crate::native_cache::Error;
 use crate::native_cache::{checked, known_link, linked, Cache};
 use cap_fs_ext::DirExt;
 use cap_std::fs::Dir;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 mod inventory;
-pub use inventory::{Report, Row};
+pub use inventory::{Eligibility, Kept, KeptKind, Report, Row};
+
+/// Path-free presentation for Storage surfaces, including fatal errors and kept units.
+pub fn error_message(error: Error) -> String {
+    use crate::i18n::{tr, trf};
+    match error {
+        Error::Unsafe(_) => tr("Storage found an unexpected file or link.").into(),
+        Error::ResourceDependent(_) => {
+            tr("Another build needs these resources, so they were kept.").into()
+        }
+        Error::Io(error) => trf(
+            "Storage could not access a file or folder ({kind}, OS error {code}).",
+            &[
+                ("kind", &format!("{:?}", error.kind())),
+                (
+                    "code",
+                    &error
+                        .raw_os_error()
+                        .map_or_else(|| "—".into(), |code| code.to_string()),
+                ),
+            ],
+        ),
+        error => crate::native_mods::cache_error(error),
+    }
+}
+
+// Do not let a caller accidentally disclose raw path data with a general cache formatter.
+fn redact_error(error: Error) -> Error {
+    match error {
+        Error::Unsafe(_) => Error::Unsafe(PathBuf::new()),
+        Error::ResourceDependent(_) => Error::ResourceDependent(String::new()),
+        Error::Io(error) => Error::Io(error.raw_os_error().map_or_else(
+            || std::io::Error::from(error.kind()),
+            std::io::Error::from_raw_os_error,
+        )),
+        error => error,
+    }
+}
 
 /// Stops a count running on a worker: whoever started it keeps a clone and sets it when the
 /// count is no longer wanted. It is never reset, so each count gets its own.
@@ -52,6 +89,20 @@ pub enum Category {
     RustCompiler,
     ModBuildCache,
     OtherCaches,
+}
+
+impl Category {
+    pub fn label(self) -> &'static str {
+        use crate::i18n::tr;
+        match self {
+            Self::BuildFiles => tr("Build files"),
+            Self::PrebuiltGames => tr("Prebuilt games"),
+            Self::SpareGameBuilds => tr("Spare game builds"),
+            Self::RustCompiler => tr("Rust compiler"),
+            Self::ModBuildCache => tr("Mod build cache"),
+            Self::OtherCaches => tr("Other caches"),
+        }
+    }
 }
 
 /// Fixed build-home caches. Instance and version inventory adds its protected entries separately.
@@ -118,7 +169,7 @@ pub struct Storage {
 
 impl Storage {
     pub fn open() -> Result<Self, Error> {
-        Self::at(&crate::backend::build_dir())
+        Self::at(&crate::backend::build_dir()).map_err(redact_error)
     }
 
     fn at(root: &Path) -> Result<Self, Error> {
@@ -262,15 +313,18 @@ pub(crate) fn entries_calls() -> usize {
     ENTRIES.with(|calls| calls.get())
 }
 
-/// One validated walk of a folder: every file and directory's allocated size and identity,
-/// refusing any link or file the launcher does not expect. Sizes are read from it afterwards,
-/// each with its own set of already-counted blocks, without touching the disk again.
-pub(crate) struct Tree(Option<Node>);
+/// Allocation identities from one validated walk, independent of directory shape.
+pub(crate) struct Tree {
+    allocations: HashMap<(u64, u64), u64>,
+    present: bool,
+    has_payload: bool,
+}
 
-struct Node {
-    id: (u64, u64),
-    bytes: u64,
-    children: Vec<Node>,
+#[cfg(test)]
+type WalkHook = Box<dyn Fn(&Path)>;
+#[cfg(test)]
+thread_local! {
+    static STATTED: std::cell::RefCell<Option<WalkHook>> = const { std::cell::RefCell::new(None) };
 }
 
 impl Tree {
@@ -292,25 +346,46 @@ impl Tree {
     fn walk(path: &Path, cancel: Option<&Cancel>, skip_links: bool) -> Result<Self, Error> {
         #[cfg(test)]
         WALKS.with(|walks| walks.set(walks.get() + 1));
-        Self::node(path, cancel, skip_links).map(Self)
+        let mut tree = Self {
+            allocations: HashMap::new(),
+            present: false,
+            has_payload: false,
+        };
+        tree.present = tree.visit(path, cancel, skip_links)?;
+        Ok(tree)
     }
 
-    fn node(path: &Path, cancel: Option<&Cancel>, skip_links: bool) -> Result<Option<Node>, Error> {
+    fn visit(
+        &mut self,
+        path: &Path,
+        cancel: Option<&Cancel>,
+        skip_links: bool,
+    ) -> Result<bool, Error> {
         if cancel.is_some_and(Cancel::is_cancelled) {
-            return Ok(None);
+            return Ok(false);
         }
         let meta = match fs::symlink_metadata(path) {
             Ok(meta) => meta,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error.into()),
         };
+        #[cfg(test)]
+        STATTED.with(|hook| {
+            if let Some(hook) = &*hook.borrow() {
+                hook(path);
+            }
+        });
         if linked(&meta) {
             if skip_links {
-                return Ok(None);
+                self.has_payload = true;
+                return Ok(true);
             }
-            // A known link holds nothing of its own, and what it points at is not this cache's.
             return match fs::read_link(path) {
-                Ok(target) if known_link(&target) => Ok(None),
+                Ok(target) if known_link(&target) => {
+                    self.has_payload = true;
+                    Ok(true)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
                 _ => Err(Error::Unsafe(path.to_owned())),
             };
         }
@@ -320,46 +395,46 @@ impl Tree {
         let (id, bytes) = match allocation(path, &meta) {
             Ok(allocated) => allocated,
             Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(None);
+                return Ok(false)
             }
             Err(error) => return Err(error),
         };
-        let mut children = Vec::new();
         if meta.is_dir() {
             let entries = match fs::read_dir(path) {
                 Ok(entries) => entries,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
                 Err(error) => return Err(error.into()),
             };
             for entry in entries {
+                if cancel.is_some_and(Cancel::is_cancelled) {
+                    break;
+                }
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(error) => return Err(error.into()),
                 };
-                children.extend(Self::node(&entry.path(), cancel, skip_links)?);
+                self.visit(&entry.path(), cancel, skip_links)?;
             }
+        } else if path
+            .file_name()
+            .is_some_and(|name| !crate::cache_cleanup::reserved(Path::new(name)))
+        {
+            self.has_payload = true;
         }
-        Ok(Some(Node {
-            id,
-            bytes,
-            children,
-        }))
+        self.allocations.entry(id).or_insert(bytes);
+        Ok(true)
     }
 
-    /// The allocated bytes not already in `seen`: a block reached twice (a hard link, or a file
-    /// shared with an earlier folder using the same set) counts once, and a directory already
-    /// counted is not entered again.
+    /// The allocated bytes not already in `seen`, including links shared across units.
     pub(crate) fn size(&self, seen: &mut HashSet<(u64, u64)>) -> u64 {
-        fn count(node: &Node, seen: &mut HashSet<(u64, u64)>) -> u64 {
-            if !seen.insert(node.id) {
-                return 0;
+        self.allocations.iter().fold(0u64, |total, (&id, &bytes)| {
+            if seen.insert(id) {
+                total.saturating_add(bytes)
+            } else {
+                total
             }
-            node.children.iter().fold(node.bytes, |total, child| {
-                total.saturating_add(count(child, seen))
-            })
-        }
-        self.0.as_ref().map_or(0, |node| count(node, seen))
+        })
     }
 }
 
