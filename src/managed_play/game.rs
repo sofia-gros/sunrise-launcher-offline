@@ -38,9 +38,9 @@ impl Profile {
             piped,
             SpawnHooks {
                 proof: None,
-                prepare_jars: |_| Ok(()),
+                prepare_jars: |_: &Command| Ok(()),
                 hook: None,
-                before_spawn: |_| Ok(()),
+                before_spawn: |_: &mut Command| Ok(()),
             },
         )
         .map_err(String::from)
