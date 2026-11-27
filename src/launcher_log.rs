@@ -172,6 +172,8 @@ static RING: Mutex<Ring> = Mutex::new(Ring::new());
 static FILE: Mutex<Option<LogFile>> = Mutex::new(None);
 /// The scrubber, built on the first line after `init`.
 static SCRUBBER: Mutex<Option<Arc<Scrubber>>> = Mutex::new(None);
+/// Registered filesystem roots, kept for a scrubber that isn't built yet.
+static HIDDEN_PATHS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// What `hide` was told, kept for a scrubber that isn't built yet.
 static HIDDEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// Whole-word private terms (1–2 byte profile names), kept for a scrubber that isn't built yet.
@@ -567,21 +569,64 @@ fn http_status(text: &str) -> Option<u16> {
     })
 }
 
-fn hide_path(path: &Path) {
-    if !path.is_absolute()
-        || !path
-            .components()
-            .any(|part| matches!(part, std::path::Component::Normal(_)))
+fn hide_path_root(root: &str) {
+    let mut scrubber = lock(&SCRUBBER);
+    let mut hidden = lock(&HIDDEN_PATHS);
+    if hidden
+        .iter()
+        .any(|existing| existing.to_lowercase() == root.to_lowercase())
     {
         return;
     }
-    let text = path.to_string_lossy();
-    let text = text.trim_end_matches(std::path::is_separator);
-    hide(text);
-    #[cfg(windows)]
+    if let Some(built) = scrubber.as_mut() {
+        *built = Arc::new((**built).clone().path_term(root));
+    }
+    hidden.push(root.to_owned());
+}
+
+fn register_path_spelling(candidate: &Path) {
+    if !candidate
+        .components()
+        .any(|part| matches!(part, std::path::Component::Normal(_)))
     {
-        hide(text.replace('\\', "/"));
-        hide(text.replace('\\', "\\\\"));
+        return;
+    }
+    let raw = candidate.to_string_lossy();
+    if candidate.is_absolute() {
+        hide_path_root(&raw);
+        return;
+    }
+    // Strip leading `./` or `.\` segments to distinguish multi-segment relative roots (handled
+    // by `path_term` across separators) from single-segment relative directory names (handled by
+    // `hide` after `connecting_host`).
+    let mut clean = raw.as_ref();
+    while let Some(rest) = clean
+        .strip_prefix("./")
+        .or_else(|| clean.strip_prefix(r".\"))
+    {
+        clean = rest;
+    }
+    let clean = clean.trim_end_matches(['/', '\\']);
+    if clean.contains(['/', '\\']) {
+        hide_path_root(clean);
+    } else if clean.len() >= 3 {
+        hide(clean);
+    }
+}
+
+fn hide_path(path: &Path) {
+    if !path
+        .components()
+        .any(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        return;
+    }
+    register_path_spelling(path);
+    if let Ok(abs) = std::path::absolute(path) {
+        register_path_spelling(&abs);
+    }
+    if let Ok(canon) = fs::canonicalize(path) {
+        register_path_spelling(&canon);
     }
 }
 
@@ -652,6 +697,9 @@ fn scrubber() -> Arc<Scrubber> {
     let mut base = crate::telemetry::scrubber();
     BUILDING.set(false);
     let mut slot = lock(&SCRUBBER);
+    for path in lock(&HIDDEN_PATHS).iter() {
+        base = base.path_term(path);
+    }
     for term in lock(&HIDDEN).iter() {
         base = base.term(term);
     }
@@ -851,6 +899,53 @@ mod tests {
                         "Could not open <private>/saves/example"
                     );
                 }
+            },
+        );
+    }
+
+    #[test]
+    fn hide_path_covers_relative_ip_bearing_and_alias_roots() {
+        isolated(
+            "hide_path_covers_relative_ip_bearing_and_alias_roots",
+            |_, _, _| {
+                let ip_root = Path::new("/mnt/10.0.0.5/private-vault/sunrise");
+                hide_path(ip_root);
+                assert_eq!(
+                    scrub("Could not open /mnt/10.0.0.5/private-vault/sunrise/saves/World from 10.0.0.5"),
+                    "Could not open <private>/saves/World from <ip>"
+                );
+
+                let relative_multi = Path::new("./rel-private-dir/10.0.0.5/sunrise-game");
+                hide_path(relative_multi);
+                assert_eq!(
+                    scrub("open ./rel-private-dir/10.0.0.5/sunrise-game/saves and rel-private-dir\\10.0.0.5\\sunrise-game\\logs"),
+                    "open <private>/saves and <private>\\logs"
+                );
+                let abs_relative = std::path::absolute(relative_multi).unwrap();
+                assert_eq!(
+                    scrub(&format!("open {}/saves", abs_relative.display())),
+                    "open <private>/saves"
+                );
+
+                let relative_single = Path::new("./rel-single-vault");
+                hide_path(relative_single);
+                assert_eq!(scrub("open rel-single-vault/logs"), "open <private>/logs");
+                let abs_single = std::path::absolute(relative_single).unwrap();
+                assert_eq!(
+                    scrub(&format!("open {}/logs", abs_single.display())),
+                    "open <private>/logs"
+                );
+
+                // Windows-style verbatim, drive-case, and mixed-separator aliases.
+                hide_path_root(r"D:\10.0.0.5\PrivateVault\Sunrise");
+                assert_eq!(
+                    scrub(r"\\?\d:\10.0.0.5\privatevault/sunrise\logs"),
+                    r"<private>\logs"
+                );
+                assert_eq!(
+                    scrub(r"d:/10.0.0.5\PrivateVault/Sunrise/logs"),
+                    "<private>/logs"
+                );
             },
         );
     }
