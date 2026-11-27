@@ -357,24 +357,24 @@ pub fn sync_internals(folder: &Path) -> Result<serde_json::Value, Failed> {
 }
 
 /// Inputs shared across `native-lock` and `native-build` for one prebuilt compile attempt.
-pub(super) struct CompileAttempt<'a, 's> {
-    pub(super) rust: &'a rust_toolchain::Toolchain,
-    pub(super) program: &'a Path,
-    pub(super) lease: &'a crate::native_cache::Cache,
-    pub(super) work_root: &'a Path,
-    pub(super) package: &'a sdk_cache::Package,
-    pub(super) compiled: &'a Path,
-    pub(super) mod_ids: &'a [&'a str],
-    pub(super) target: Target,
-    pub(super) mixins_from_source: bool,
-    pub(super) cancellation: &'a Cancellation,
-    pub(super) staging: Option<&'a crate::profile_txn::Staging<'s>>,
+struct CompileAttempt<'a, 's> {
+    rust: &'a rust_toolchain::Toolchain,
+    program: &'a Path,
+    lease: &'a crate::native_cache::Cache,
+    work_root: &'a Path,
+    package: &'a sdk_cache::Package,
+    compiled: &'a Path,
+    mod_ids: &'a [&'a str],
+    target: Target,
+    mixins_from_source: bool,
+    cancellation: &'a Cancellation,
+    staging: Option<&'a crate::profile_txn::Staging<'s>>,
 }
 
 /// Generates a registry lock in each staged mod copy that does not carry one yet, using the
 /// attempt's workspace Cargo home and temp isolation so `native-lock` never touches an unproved
 /// or shared Cargo home outside the attempt's policy.
-pub(super) fn lock_missing_manifests(
+fn lock_missing_manifests(
     attempt: &CompileAttempt<'_, '_>,
     workspace: &workspace::Workspace,
 ) -> Result<(), String> {
@@ -407,7 +407,7 @@ pub(super) fn lock_missing_manifests(
 /// that held something before and fails with a plain tool failure or outputs that don't verify,
 /// once the compiler tree is proved gone, is emptied and built cold one more time
 /// (`retry_cold` allows it once).
-pub(super) fn run_compile_attempt(
+fn run_compile_attempt(
     attempt: &CompileAttempt<'_, '_>,
     workspace: &mut workspace::Workspace,
     mut before_build: impl FnMut(&Path) -> Result<(), Failed>,

@@ -10804,10 +10804,8 @@ esac"#
             }
         });
         let secret_url = format!("http://alice:s3cr3t@{addr}/sdk/file?token=tok123#frag");
-        let err_404 = get(&secret_url).err().expect("404 must fail");
-        let err_403 = get_unless_missing(&secret_url)
-            .err()
-            .expect("403 must fail");
+        let err_404 = get(&secret_url).expect_err("404 must fail");
+        let err_403 = get_unless_missing(&secret_url).expect_err("403 must fail");
         server.join().unwrap();
         let err_transport = match ureq::AgentBuilder::new().build().get(&secret_url).call() {
             Err(ureq::Error::Transport(t)) => {
