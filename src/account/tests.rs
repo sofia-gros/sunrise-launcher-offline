@@ -800,7 +800,13 @@ fn the_game_plays_only_as_an_account_that_owns_it() {
     let store = MemoryStore::default();
     let (_, ep) = mock(|_| {});
     // No account: no game.
-    let refused = launch_for_game(&ep, Some("test-client"), &store, &mut Accounts::default(), false);
+    let refused = launch_for_game(
+        &ep,
+        Some("test-client"),
+        &store,
+        &mut Accounts::default(),
+        false,
+    );
     assert_eq!(refused.unwrap_err(), NoOwner::default());
     // An owner, none selected: it plays, with its session.
     let mut accounts = signed_in(&store, &secrets("mc-token", true));
@@ -816,7 +822,8 @@ fn the_game_plays_only_as_an_account_that_owns_it() {
         cape: None,
     });
     accounts.play_as("other").unwrap();
-    let refused = launch_for_game(&ep, Some("test-client"), &store, &mut accounts, false).unwrap_err();
+    let refused =
+        launch_for_game(&ep, Some("test-client"), &store, &mut accounts, false).unwrap_err();
     assert!(refused
         .to_string()
         .starts_with("Alex is no longer signed in"));
@@ -876,7 +883,8 @@ fn a_failed_refresh_of_an_expired_token_stops_play() {
         let mut accounts = signed_in(&store, &secrets);
         for refused in [503, 401] {
             let (_, ep) = mock(|m| m.refresh_refused = Some(refused));
-            let outcome = launch_accepted(&ep, Some("test-client"), &store, &mut accounts, UUID, false);
+            let outcome =
+                launch_accepted(&ep, Some("test-client"), &store, &mut accounts, UUID, false);
             // A refusal is no pass, and only a pass is turned into a session file.
             let why = outcome.expect_err("an expired token is no session").keyring;
             assert!(why.is_some_and(|why| !why.is_empty()));
@@ -884,7 +892,13 @@ fn a_failed_refresh_of_an_expired_token_stops_play() {
     }
     // Offline too: the answer is the one the check produced.
     let mut accounts = signed_in(&store, &expiring_in(0));
-    let refused = launch_for_game(&offline(), Some("test-client"), &store, &mut accounts, false);
+    let refused = launch_for_game(
+        &offline(),
+        Some("test-client"),
+        &store,
+        &mut accounts,
+        false,
+    );
     assert!(refused
         .unwrap_err()
         .keyring
@@ -926,7 +940,14 @@ fn an_entitlements_timeout_with_a_valid_token_plays_with_the_stored_token() {
     assert_eq!(pass.session.unwrap().1.minecraft_token, "mc-token");
     assert!(pass.offline.is_none());
     // The services unreachable altogether: the same.
-    let pass = launch_for_game(&offline(), Some("test-client"), &store, &mut accounts, false).unwrap();
+    let pass = launch_for_game(
+        &offline(),
+        Some("test-client"),
+        &store,
+        &mut accounts,
+        false,
+    )
+    .unwrap();
     assert!(pass.session.is_some() && pass.offline.is_none());
 }
 
@@ -2728,17 +2749,38 @@ fn play_starts_as_the_account_it_was_pressed_for_whoever_is_selected_since() {
     // Reading whoever is selected at sign-in, as Play did, answers for Alex.
     let mut as_selected = accounts.clone();
     assert!(
-        launch_for_game(&offline(), Some("test-client"), &store, &mut as_selected, false).is_err(),
+        launch_for_game(
+            &offline(),
+            Some("test-client"),
+            &store,
+            &mut as_selected,
+            false
+        )
+        .is_err(),
         "the selected account is Alex, who can't play"
     );
     // The accepted account plays, and the switcher's choice stays.
-    let pass =
-        launch_accepted(&offline(), Some("test-client"), &store, &mut accounts, UUID, false).unwrap();
+    let pass = launch_accepted(
+        &offline(),
+        Some("test-client"),
+        &store,
+        &mut accounts,
+        UUID,
+        false,
+    )
+    .unwrap();
     assert!(pass.session.is_some() && pass.offline.is_none());
     assert_eq!(accounts.selected.as_deref(), Some(alex));
     // Signed out before the game started: nobody plays in its place.
     accounts.remove(&store, UUID).unwrap();
-    let gone = launch_accepted(&offline(), Some("test-client"), &store, &mut accounts, UUID, false);
+    let gone = launch_accepted(
+        &offline(),
+        Some("test-client"),
+        &store,
+        &mut accounts,
+        UUID,
+        false,
+    );
     assert!(gone.unwrap_err().keyring.unwrap().contains("signed out"));
     assert_eq!(accounts.selected.as_deref(), Some(alex));
 }
