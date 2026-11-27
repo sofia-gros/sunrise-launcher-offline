@@ -1940,8 +1940,11 @@ fn resources_owner_in(versions: &Path, tag: &str) -> String {
 }
 
 /// Native builds never own prepared resources, even when their build record is unreadable.
-fn owns_prepared_resources_in(versions: &Path, tag: &str) -> bool {
-    !crate::native_mods::is_native(tag) && resources_owner_in(versions, tag) == tag
+/// A linked version root can alias a native build under any name.
+fn owns_prepared_resources_at(tag: &str, root: &Path) -> bool {
+    !crate::native_mods::is_native(tag)
+        && fs::symlink_metadata(root)
+            .is_ok_and(|metadata| metadata.is_dir() && !crate::native_cache::linked(&metadata))
 }
 
 pub fn resources(tag: &str) -> PathBuf {
@@ -2462,10 +2465,10 @@ fn reuse_prepared_cancellable(
     stop: Option<&crate::native_mods::Cancellation>,
 ) -> Option<String> {
     let stopped = || stop.is_some_and(crate::native_mods::Cancellation::is_stopped);
-    if !owns_prepared_resources_in(versions, tag) {
+    let target = versions.join(tag);
+    if !owns_prepared_resources_at(tag, &target) {
         return None;
     }
-    let target = versions.join(tag);
     let to = resources_at(&target);
     if to.join(RESOURCES_MANIFEST).exists() {
         return None;
@@ -2473,7 +2476,7 @@ fn reuse_prepared_cancellable(
     let version = game_version_at(&target);
     for other in installed_in(versions)
         .into_iter()
-        .filter(|t| t != tag && owns_prepared_resources_in(versions, t))
+        .filter(|t| t != tag && owns_prepared_resources_at(t, &versions.join(t)))
     {
         if stopped() {
             return None;
@@ -2666,7 +2669,7 @@ pub fn reuse_prepared_everywhere() -> Vec<(String, String)> {
     forget_prepared();
     for tag in installed_in(&versions)
         .into_iter()
-        .filter(|tag| owns_prepared_resources_in(&versions, tag))
+        .filter(|tag| owns_prepared_resources_at(tag, &versions.join(tag)))
     {
         let was_reused = reused.iter().any(|(prepared, _)| prepared == &tag);
         // Probe unlocked once; lock only when this base was reused or actually lacks extras.
@@ -2696,7 +2699,7 @@ fn reuse_prepared_in(versions: &Path) -> Vec<(String, String)> {
     let mut tags = installed_in(versions);
     tags.reverse();
     tags.into_iter()
-        .filter(|tag| owns_prepared_resources_in(versions, tag))
+        .filter(|tag| owns_prepared_resources_at(tag, &versions.join(tag)))
         .filter_map(|tag| {
             let target = versions.join(&tag);
             let to = resources_at(&target);
@@ -2734,7 +2737,7 @@ fn complete_reports(versions: &Path, tag: &str) -> bool {
 
 /// Complete the reports in the already resolved hosting resource folder.
 pub(crate) fn complete_reports_at(versions: &Path, tag: &str, target: &Path, to: &Path) -> bool {
-    if !owns_prepared_resources_in(versions, tag) || !to.join(RESOURCES_MANIFEST).exists() {
+    if !owns_prepared_resources_at(tag, target) || !to.join(RESOURCES_MANIFEST).exists() {
         return false;
     }
     let missing: Vec<_> = RUNTIME_REPORTS
@@ -2758,7 +2761,7 @@ pub(crate) fn complete_reports_at(versions: &Path, tag: &str, target: &Path, to:
     let mut source_claims = Vec::new();
     for other in installed_in(versions)
         .into_iter()
-        .filter(|t| t != tag && owns_prepared_resources_in(versions, t))
+        .filter(|t| t != tag && owns_prepared_resources_at(t, &versions.join(t)))
     {
         let dir = versions.join(&other);
         if server(&dir).as_ref() == Some(&pins) {
@@ -9704,6 +9707,19 @@ esac"#
             assert_eq!(reuse_prepared(&versions, tag), None, "{tag}");
         }
 
+        #[cfg(unix)]
+        let link = |target: &Path, alias: &Path| std::os::unix::fs::symlink(target, alias);
+        #[cfg(windows)]
+        let link = crate::sources::junction;
+        #[cfg(any(unix, windows))]
+        {
+            let alias = "dev-2026-11-27-alias";
+            let alias_root = versions.join(alias);
+            link(&versions.join(invalid), &alias_root).unwrap();
+            assert!(installed_in(&versions).iter().any(|tag| tag == alias));
+            assert_eq!(reuse_prepared(&versions, alias), None);
+        }
+
         let before = (crate::storage::walks(), crate::storage::entries_calls());
         let reused = reuse_prepared_everywhere();
         assert!(reused.is_empty(), "{reused:?}");
@@ -9769,6 +9785,21 @@ esac"#
                 r#"{"output_version":1}"#,
             );
         }
+        #[cfg(any(unix, windows))]
+        let donor_alias = {
+            let alias = "dev-2026-11-26-alias";
+            let alias_root = donor_versions.join(alias);
+            link(&donor_versions.join(invalid), &alias_root).unwrap();
+            let target = donor_versions.join("dev-2026-11-27-target");
+            assert!(installed_in(donor_versions).iter().any(|tag| tag == alias));
+            assert!(resources_compatible(
+                &alias_root,
+                &target,
+                &resources_at(&alias_root),
+                &[],
+            ));
+            alias
+        };
         assert_eq!(
             reuse_prepared(donor_versions, "dev-2026-11-27-target"),
             None
@@ -9810,6 +9841,20 @@ esac"#
                 .exists(),
             "complete_reports must not read reports from a native build, even without a valid record"
         );
+        #[cfg(any(unix, windows))]
+        {
+            let alias_root = donor_versions.join(donor_alias);
+            let alias_resources = resources_at(&alias_root);
+            write_at(invalid, ".local/datagen/out/reports/registries.json", "{}");
+            assert!(!complete_reports(donor_versions, donor_alias));
+            assert!(!complete_reports_at(
+                donor_versions,
+                report_target,
+                &alias_root,
+                &alias_resources,
+            ));
+            assert!(!alias_resources.join("registries.json").exists());
+        }
         for tag in native_tags {
             write_at(tag, ".local/datagen/out/reports/registries.json", "{}");
             assert!(!complete_reports(donor_versions, tag), "{tag}");
