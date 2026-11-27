@@ -2922,10 +2922,8 @@ fn complete_assets_with(
         ));
     }
     let kinds: Vec<String> = lacking.iter().map(|(kind, _)| kind.clone()).collect();
-    let fetching = crate::launcher_log::step(format!(
-        "Fetching missing game files ({})",
-        kinds.join(", ")
-    ));
+    let fetching =
+        crate::launcher_log::step(format!("Fetching missing game files ({})", kinds.len()));
     let result = crate::preparer::add_extras(
         &binary,
         &root,
@@ -2946,15 +2944,11 @@ fn complete_assets_with(
     match result {
         Ok(Some(added)) => {
             for (kind, error) in added.failed {
-                let what = lacking
-                    .iter()
-                    .find(|(k, _)| *k == kind)
-                    .map_or(kind.as_str(), |(_, what)| what.as_str());
                 log(crate::i18n::trf(
                     "{version}: {what} not added: {error}",
                     &[
                         ("version", tag),
-                        ("what", what),
+                        ("what", extra_kind_label(&kind)),
                         ("error", &crate::launcher_log::safe_error(&error)),
                     ],
                 ));
@@ -2962,6 +2956,19 @@ fn complete_assets_with(
         }
         Ok(None) => {}
         Err(e) => log(format!("{tag}: {}", crate::launcher_log::safe_error(&e))),
+    }
+}
+
+/// Launcher-owned label for a `sunrise-prepare` extra kind so arbitrary child protocol strings
+/// never reach `launcher.log` or the switch operation log.
+fn extra_kind_label(kind: &str) -> &'static str {
+    match kind {
+        "sounds" => "The sounds",
+        "packs" => "The built-in packs",
+        "languages" => "The languages",
+        "fonts" => "The fonts",
+        "panorama" => "The panorama",
+        _ => "Extra game files",
     }
 }
 
@@ -3324,7 +3331,27 @@ pub fn preparer(
     log: &dyn Fn(String),
     preparation: &crate::preparer::Preparation,
 ) -> Result<(Command, PathBuf), String> {
-    preparer_staged(tag, minecraft, from, log, &preparation.handoff(None))
+    preparer_staged(tag, minecraft, from, log, log, &preparation.handoff(None))
+}
+
+/// [`preparer`], routing raw preparer child output to `diagnostics` only so arbitrary
+/// stdout/stderr never reaches `launcher.log` or a switch log.
+pub fn preparer_with(
+    tag: &str,
+    minecraft: &Path,
+    from: MinecraftFrom,
+    log: &dyn Fn(String),
+    diagnostics: &dyn Fn(String),
+    preparation: &crate::preparer::Preparation,
+) -> Result<(Command, PathBuf), String> {
+    preparer_staged(
+        tag,
+        minecraft,
+        from,
+        log,
+        diagnostics,
+        &preparation.handoff(None),
+    )
 }
 
 pub fn preparer_cancellable(
@@ -3332,6 +3359,7 @@ pub fn preparer_cancellable(
     minecraft: &Path,
     from: MinecraftFrom,
     log: &dyn Fn(String),
+    diagnostics: &dyn Fn(String),
     preparation: &crate::preparer::Preparation,
     stop: &crate::native_mods::Cancellation,
 ) -> Result<(Command, PathBuf), String> {
@@ -3340,6 +3368,7 @@ pub fn preparer_cancellable(
         minecraft,
         from,
         log,
+        diagnostics,
         &preparation.handoff_cancellable(None, stop),
     )
 }
@@ -3349,6 +3378,7 @@ pub(crate) fn preparer_staged(
     minecraft: &Path,
     from: MinecraftFrom,
     log: &dyn Fn(String),
+    diagnostics: &dyn Fn(String),
     handoff: &crate::preparer::Handoff<'_>,
 ) -> Result<(Command, PathBuf), String> {
     let stop = handoff.stop();
@@ -3369,7 +3399,7 @@ pub(crate) fn preparer_staged(
     output_version_at(&dir).map_err(|error| preparer_source_error(&error))?;
     let binary = crate::preparer::binary(&dir).ok_or_else(|| crate::preparer::too_old(tag))?;
     // The version's own answer: a sibling's verified import is linked in when found, and whether its exporters ship.
-    let needs = crate::preparer::needs(&binary, &dir, log, Some(handoff))?
+    let needs = crate::preparer::needs(&binary, &dir, diagnostics, Some(handoff))?
         .ok_or_else(|| crate::preparer::too_old(tag))?;
     if let Some(stop) = stop {
         stop.check()?;
@@ -9930,6 +9960,9 @@ esac"#
             "sounds.json",
             "extras.err",
             "extras.out",
+            "Secret Kind",
+            "Secret What",
+            "Secret Unmatched",
         ];
         let Some(root) = std::env::var_os("PREPARER_ERROR_LOG_ROOT") else {
             let root = tempfile::tempdir().unwrap();
@@ -9977,7 +10010,9 @@ esac"#
                 "(os error 13)",
                 "v-extras-partial: The sounds not added:",
                 "(os error 5)",
-                "Fetching missing game files (sounds): failed after",
+                "v-extras-partial: Extra game files not added:",
+                "(os error 6)",
+                "Fetching missing game files (1): failed after",
                 "(os error 28)",
                 "v-invalidate:",
             ] {
@@ -10014,6 +10049,7 @@ esac"#
         };
         let lacking =
             r#"{"format":1,"prepared":true,"missing":[{"kind":"sounds","what":"The sounds"}]}"#;
+        let partial_lacking = r#"{"format":1,"prepared":true,"missing":[{"kind":"sounds","what":"Public\nSecret What\nSuffix"},{"kind":"Public\nSecret Kind\nSuffix","what":"Secret What"}]}"#;
         make_version(
             "v-missing",
             concat!(
@@ -10029,17 +10065,17 @@ esac"#
             &format!(
                 concat!(
                     "case \"$1\" in\n",
-                    "  missing-extras) printf '%s\\n' '{lacking}';;\n",
+                    "  missing-extras) printf '%s\\n' '{partial_lacking}';;\n",
                     "  extras)\n",
                     "    printf '%s\\n' '{{\"message\":\"could not inspect /home/ada/Private Client Backup/drafts/msg.txt (os error 1)\"}}'\n",
                     "    printf '%s\\n' 'failed reading /home/ada/Private Client Backup/drafts/stderr.log (os error 22)' >&2\n",
-                    "    printf '%s\\n' '{{\"format\":1,\"added\":[],\"failed\":[{{\"kind\":\"sounds\",\"error\":\"could not read /home/ada/Private Client Backup/drafts/sounds.json (os error 5)\"}}],\"missing\":[{{\"kind\":\"sounds\",\"what\":\"The sounds\"}}]}}'\n",
+                    "    printf '%s\\n' '{{\"format\":1,\"added\":[],\"failed\":[{{\"kind\":\"sounds\",\"error\":\"could not read /home/ada/Private Client Backup/drafts/sounds.json (os error 5)\"}},{{\"kind\":\"Public\\nSecret Unmatched\\nSuffix\",\"error\":\"could not read /home/ada/Private Client Backup/drafts/sounds.json (os error 6)\"}}],\"missing\":[{{\"kind\":\"sounds\",\"what\":\"Public\\nSecret What\\nSuffix\"}}]}}'\n",
                     "    exit 1;;\n",
                     "  data-file) printf '%s\\n' '{{\"format\":1,\"written\":false}}';;\n",
                     "  *) exit 2;;\n",
                     "esac",
                 ),
-                lacking = lacking,
+                partial_lacking = partial_lacking,
             ),
         );
         make_version(
@@ -10090,7 +10126,11 @@ esac"#
             ("Packing game data cache: failed after", "(os error 13)"),
             ("v-extras-partial: The sounds not added:", "(os error 5)"),
             (
-                "Fetching missing game files (sounds): failed after",
+                "v-extras-partial: Extra game files not added:",
+                "(os error 6)",
+            ),
+            (
+                "Fetching missing game files (1): failed after",
                 "(os error 28)",
             ),
             ("v-extras-err:", "(os error 28)"),
@@ -10124,6 +10164,8 @@ esac"#
             "Secret Err Folder",
             "Secret Sounds Dir",
             "Secret Sounds Err",
+            "Secret Needs Msg",
+            "Secret Needs Err",
             "/home/ada",
         ];
         let Some(root) = std::env::var_os("PREPARER_MULTILINE_LOG_ROOT") else {
@@ -10240,6 +10282,43 @@ esac"#
         assert!(
             sound_lines.iter().any(|l| l.contains("Secret Sounds Err")),
             "local diagnostics must keep sounds stderr: {sound_lines:?}"
+        );
+
+        let needs_version = root.join("versions/v-needs");
+        fs::create_dir_all(&needs_version).unwrap();
+        let needs_preparer = needs_version.join("sunrise-prepare");
+        fs::write(
+            &needs_preparer,
+            concat!(
+                "#!/bin/sh\n",
+                "printf '{\"message\":\"Reusing /home/ada/Public\\\\nSecret Needs Msg\\\\nSuffix/26.3.jar\"}\\n'\n",
+                "printf 'Reusing /home/ada/Public\\nSecret Needs Err\\nSuffix/26.3.jar\\n' >&2\n",
+                "printf '{\"format\":1,\"server_jar\":false,\"jdk\":false}\\n'\n",
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&needs_preparer, fs::Permissions::from_mode(0o700)).unwrap();
+        let needs_lock = prepare_lock("v-needs").unwrap();
+        let needs_lines = std::cell::RefCell::new(Vec::new());
+        let needs_result = preparer_staged(
+            "v-needs",
+            &root.join("minecraft"),
+            MinecraftFrom::Install,
+            &|line| {
+                crate::launcher_log::line(crate::launcher_log::preparer_line(&line));
+            },
+            &|line| needs_lines.borrow_mut().push(line),
+            &needs_lock.handoff(None),
+        );
+        assert!(needs_result.is_err(), "no research-lock.json in fixture");
+        let needs_lines = needs_lines.into_inner();
+        assert!(
+            needs_lines.iter().any(|l| l.contains("Secret Needs Msg")),
+            "local diagnostics must keep needs message: {needs_lines:?}"
+        );
+        assert!(
+            needs_lines.iter().any(|l| l == "Secret Needs Err"),
+            "local diagnostics must keep needs stderr: {needs_lines:?}"
         );
 
         let (_, mine) = crate::launcher_log::since_in(before, op.id());

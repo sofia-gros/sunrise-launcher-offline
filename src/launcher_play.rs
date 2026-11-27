@@ -274,10 +274,18 @@ impl Launcher {
             let result = (|| {
                 let lock = backend::prepare_lock(&tag)?;
                 let (cmd, minecraft) = match &stop {
-                    Some(stop) => {
-                        backend::preparer_cancellable(&tag, &minecraft, from, &log, &lock, stop)?
+                    Some(stop) => backend::preparer_cancellable(
+                        &tag,
+                        &minecraft,
+                        from,
+                        &log,
+                        &diagnostics,
+                        &lock,
+                        stop,
+                    )?,
+                    None => {
+                        backend::preparer_with(&tag, &minecraft, from, &log, &diagnostics, &lock)?
                     }
-                    None => backend::preparer(&tag, &minecraft, from, &log, &lock)?,
                 };
                 match &stop {
                     Some(stop) => {
