@@ -1006,6 +1006,7 @@ fi
         )
         .unwrap();
     }
+    super::super::Artifact::record_archive(&build, BUILD, &"a".repeat(64)).unwrap();
     fs::create_dir_all(home.join(mod_list::DIR)).unwrap();
     let write_package = |version: &str| {
         let body = format!("id='lantern'\nname='Lantern'\nversion='{version}'\napi='{}'\ncapabilities=['registries']\n", manifest::API);
@@ -1243,4 +1244,74 @@ fi
     assert!(!spawned.get());
     fs::write(&program, client_bytes).unwrap();
     assert_eq!(intact(&mut profile), advanced);
+
+    // The capsule of saved image evidence includes both the preparer and the archive receipt.
+    let archive = build.join(super::super::Artifact::ARCHIVE_RECEIPT);
+    let receipt = fs::read(&archive).unwrap();
+    let mut wrong_receipt: serde_json::Value = serde_json::from_slice(&receipt).unwrap();
+    wrong_receipt["archive"] = json!("b".repeat(64));
+    fs::write(&archive, serde_json::to_vec(&wrong_receipt).unwrap()).unwrap();
+    let error = ready(&mut profile).unwrap_err();
+    assert!(
+        matches!(error, StartError::Other(detail) if detail.contains("managed_play/artifact.rs:"))
+    );
+    assert_eq!(FULL_VERIFICATIONS.take(), 0);
+    fs::write(&archive, receipt).unwrap();
+    let preparer = build.join(crate::preparer::BINARY);
+    fs::write(&preparer, b"not the saved preparer").unwrap();
+    let error = ready(&mut profile).unwrap_err();
+    assert!(
+        matches!(error, StartError::Other(detail) if detail.contains("managed_play/artifact.rs:"))
+    );
+    assert_eq!(FULL_VERIFICATIONS.take(), 0);
+    fs::remove_file(&preparer).unwrap();
+    assert_eq!(profile.active().unwrap(), Some(advanced.clone()));
+
+    // Seed the legacy pointer to a real server-only tree while leaving a playable client
+    // preparation available. Neither changing a server payload nor claiming the client is a
+    // server should authorize a replacement; the intact legacy tree should upgrade.
+    let legacy = tempfile::tempdir_in(build.join(".local")).unwrap();
+    let legacy_tree = legacy.path().join("resources");
+    fs::create_dir(&legacy_tree).unwrap();
+    fs::write(
+        legacy_tree.join("sunrise-resources.json"),
+        br#"{"profile":"server"}"#,
+    )
+    .unwrap();
+    fs::write(legacy_tree.join("fixture-blob.bin"), BLOB).unwrap();
+    let primary = super::super::artifact::tree(&legacy_tree, true)
+        .unwrap()
+        .unwrap();
+    let resources: super::super::Resources = serde_json::from_value(json!({
+        "primary": primary, "accelerator": null,
+    }))
+    .unwrap();
+    let path = resources.path(BUILD);
+    fs::create_dir(path.parent().unwrap()).unwrap();
+    fs::rename(legacy_tree, &path).unwrap();
+    let server = profile
+        .refresh(
+            instance.native_profile,
+            &cancellation,
+            |_| {},
+            None,
+            Some(resources),
+        )
+        .unwrap()
+        .unwrap();
+    let blob = path.join("fixture-blob.bin");
+    fs::write(&blob, b"damaged server payload").unwrap();
+    let error = ready(&mut profile).unwrap_err();
+    snapshot_error(&server, error.into());
+    assert_eq!(FULL_VERIFICATIONS.take(), 1);
+    assert_eq!(profile.active().unwrap(), Some(server.clone()));
+    fs::write(&blob, BLOB).unwrap();
+    let (upgraded, old_verifications, _) = ready(&mut profile).unwrap();
+    assert_eq!(old_verifications, 1);
+    assert_eq!(upgraded.generation(), server.generation() + 1);
+    assert_eq!(upgraded.resources, advanced.resources);
+    let (result, replacement_verifications) = handoff(&profile, &upgraded, None);
+    result.unwrap();
+    assert!(spawned.get());
+    assert_eq!(replacement_verifications, 1);
 }
