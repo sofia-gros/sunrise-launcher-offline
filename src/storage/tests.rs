@@ -395,8 +395,8 @@ fn clear_mod_build_slots_unlinks_directory_links_without_touching_their_target()
     let home = Home::new();
     let outside = Home::new();
     let canary = outside.seed("sentinel/canary");
-    home.seed("native/work/slot/output");
-    let work = home.0.join("native/work");
+    home.seed("native/w/slot/output");
+    let work = home.0.join("native/w");
     let bytes = allocated_bytes(&work.join("slot")).unwrap();
     let sentinel = outside.0.join("sentinel");
     for link in [work.join("slot/link"), work.join("linked-slot")] {

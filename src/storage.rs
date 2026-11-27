@@ -81,7 +81,7 @@ impl BuildCache {
             Self::Prebuilt => "native/prebuilt",
             Self::ServerBuilds => "native/server-builds",
             Self::KeptMods => "native/kept-mods",
-            Self::ModBuildCache => "native/work",
+            Self::ModBuildCache => "native/w",
             Self::Rust => "rust",
             Self::Cargo => "cargo",
             Self::Scratch => "tmp",

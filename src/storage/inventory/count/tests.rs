@@ -217,8 +217,8 @@ fn clear_retries_a_retained_attempt_after_its_locked_file_closes() {
 #[test]
 fn mod_build_cache_counts_slots_and_detached_trash_then_clears_under_the_build_lease() {
     let home = Home::new();
-    let slot = home.seed("native/work/slot/target/out");
-    let detached = home.seed("native/work/.trash-slot/target/out");
+    let slot = home.seed("native/w/slot/target/out");
+    let detached = home.seed("native/w/.trash-slot/target/out");
     let other = home.seed("native/.nb-old/out");
     let storage = Storage::at(&home.0).unwrap();
     let work = home.0.join(BuildCache::ModBuildCache.relative());

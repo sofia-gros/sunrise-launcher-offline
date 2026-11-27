@@ -269,7 +269,7 @@ impl Entry {
             if linked(&meta) || meta.is_file() {
                 return present(parent.remove_file(name)).map(|_| ());
             }
-            // The parent walk above opens native and work without following links.
+            // The parent walk above opens `native/w` without following links.
             // Recursive removal does not follow interior links or junctions.
             #[cfg(windows)]
             let result = fs::remove_dir_all(&self.path);
@@ -505,7 +505,7 @@ impl Storage {
             .collect();
         let work = self.root.join(BuildCache::ModBuildCache.relative());
         for parent in parents {
-            // Detached slots inside work are already inventoried as Mod build cache.
+            // Detached slots inside `native/w` are already inventoried as Mod build cache.
             if parent == work {
                 continue;
             }
