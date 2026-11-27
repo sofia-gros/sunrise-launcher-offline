@@ -30,7 +30,7 @@ impl Storage {
                 .partition(|entry| entry.category == category);
             remaining = rest;
             let mut row = Row::new(category);
-            let (units, trees) = refused(units, std::slice::from_mut(&mut row), cancel)?;
+            let (units, trees) = refused(units, std::slice::from_mut(&mut row), cancel, |_| false)?;
             row.bytes = allocated(&units, &trees, category);
             row.remaining_bytes = row.bytes;
             if category == Category::BuildFiles {

@@ -14,10 +14,41 @@ pub(crate) struct Work {
     clearing: bool,
 }
 
-/// Clear is offered whatever is known of any size, counted or not: it measures what it frees
-/// itself. Only a Clear already running holds it back.
+/// Whether Clear can start independently of any count in flight.
 pub(crate) fn clear_offered(work: Option<&Work>) -> bool {
     !work.is_some_and(|work| work.clearing)
+}
+
+/// A row says nothing about partial protection until a Clear has tried it.
+pub(super) fn kept_line(
+    remaining: u64,
+    clearable: u64,
+    after_clear: bool,
+    has_refusals: bool,
+    older_build_kept: bool,
+) -> Option<String> {
+    if remaining == 0 {
+        return (after_clear && has_refusals).then(|| {
+            tr("Some files couldn't be cleared. See the launcher log for details.").into()
+        });
+    }
+    if !after_clear && clearable > 0 {
+        return None;
+    }
+    let size = storage::format_bytes(remaining);
+    Some(if !after_clear {
+        trf(
+            "{size} kept because compiler workers may still be using it.",
+            &[("size", &size)],
+        )
+    } else if older_build_kept {
+        trf(
+            "{size} stayed. Remove older game builds if you no longer use them, then try again.",
+            &[("size", &size)],
+        )
+    } else {
+        trf("{size} stayed. Close the game, wait for any builds to finish, then try again. See the launcher log if files still remain.", &[("size", &size)])
+    })
 }
 
 /// What the confirmation asks: with the size to free when the rows asked about are counted, and
@@ -26,22 +57,22 @@ pub(crate) fn clear_question(asked: Option<Category>, bytes: Option<u64>) -> Str
     let size = bytes.map(storage::format_bytes);
     match (asked, size) {
         (None, Some(size)) => trf(
-            "Clear everything kept for reuse? Up to {size} is freed. Files a game or build is using stay.",
+            "Clear everything kept for reuse? Up to {size} is freed. Close the game first. Files a game or build is using stay.",
             &[("size", &size)],
         ),
         (None, None) => tr(
-            "Clear everything kept for reuse? Files a game or build is using stay.",
+            "Clear everything kept for reuse? Close the game first. Files a game or build is using stay.",
         )
         .into(),
         (Some(category), Some(size)) => trf(
-            "Clear {category}? Up to {size} is freed. Files a game or build is using stay.",
+            "Clear {category}? Up to {size} is freed. Close the game first. Files a game or build is using stay.",
             &[
                 ("category", tr(category_label(category))),
                 ("size", &size),
             ],
         ),
         (Some(category), None) => trf(
-            "Clear {category}? Files a game or build is using stay.",
+            "Clear {category}? Close the game first. Files a game or build is using stay.",
             &[("category", tr(category_label(category)))],
         ),
     }
@@ -139,12 +170,7 @@ impl Launcher {
     /// Leaving Storage cancels what is still being counted, the installed builds' sizes too. A
     /// Clear in flight runs to its end.
     pub(super) fn stop_storage_work(&mut self) {
-        if let Some(count) = self
-            .ui
-            .settings
-            .storage_work
-            .take_if(|work| !work.clearing)
-        {
+        if let Some(count) = self.ui.settings.storage_work.take_if(|work| !work.clearing) {
             count.cancel.cancel();
             self.storage_pending = false;
         }

@@ -28,6 +28,10 @@ pub struct Row {
     pub freed_bytes: u64,
     pub remaining_bytes: u64,
     #[serde(skip)]
+    pub after_clear: bool,
+    #[serde(skip)]
+    pub older_build_kept: bool,
+    #[serde(skip)]
     private_compiler_bytes: u64,
     /// Refused or busy units are retained, with their allocated bytes and a visible reason.
     pub kept: Vec<Kept>,
@@ -40,6 +44,8 @@ impl Row {
             bytes: 0,
             freed_bytes: 0,
             remaining_bytes: 0,
+            after_clear: false,
+            older_build_kept: false,
             private_compiler_bytes: 0,
             kept: Vec::new(),
         }
@@ -48,6 +54,28 @@ impl Row {
     pub fn clearable_bytes(&self) -> u64 {
         self.remaining_bytes
             .saturating_sub(self.private_compiler_bytes)
+    }
+
+    fn keep(&mut self, bytes: u64, error: Error, log: bool) {
+        if log {
+            // Log each refusal without printing paths, build names, or OS error text.
+            let reason = match &error {
+                Error::Unsafe(_) => "unexpected file or link".into(),
+                Error::ResourceDependent(_) => "another build needs these resources".into(),
+                Error::Io(error) => {
+                    format!("{:?}, OS error {:?}", error.kind(), error.raw_os_error())
+                }
+                _ => format!("{error:?}"),
+            };
+            crate::launcher_log::line(format!(
+                "Storage Clear kept {:?} unit ({bytes} bytes): {reason}",
+                self.category
+            ));
+        }
+        self.kept.push(Kept {
+            bytes,
+            reason: native_mods::cache_error(error),
+        });
     }
 
     /// Private compiler work counts toward the row but is never offered for clearing.
@@ -370,12 +398,7 @@ impl Storage {
             "build.log",
             "catalog.partial",
         ] {
-            add(
-                entries,
-                build_root,
-                &format!("native/{name}"),
-                build_files,
-            )?;
+            add(entries, build_root, &format!("native/{name}"), build_files)?;
         }
         // The target lock files must remain in place. Their contents are inventoried here but
         // deletion goes through Cache, which also acquires Cargo's locks.
@@ -458,7 +481,8 @@ impl Storage {
                         || name.starts_with(native_mods::OLD_ATTEMPT_PREFIX)
                 }) {
                     // A changing or unreadable tree is still protected; zero means its size is unknown.
-                    let size = Tree::build_until(&entry.path(), cancel).map_or(0, |tree| tree.size(counted));
+                    let size = Tree::build_until(&entry.path(), cancel)
+                        .map_or(0, |tree| tree.size(counted));
                     bytes = Some(bytes.unwrap_or(0u64).saturating_add(size));
                 }
             }
@@ -541,14 +565,13 @@ impl Storage {
         mut before_clear: impl FnMut(&Path),
     ) -> Result<Report, Error> {
         // Validate every descendant before any deletion and deduplicate allocated blocks per row.
-        let mut rows: Vec<_> = Category::ALL
-            .into_iter()
-            .map(Row::new)
-            .collect();
+        let mut rows: Vec<_> = Category::ALL.into_iter().map(Row::new).collect();
         // Each folder is walked once, here: the walk validates every descendant and its sizes
         // serve the rows and the kept lines.
         let (entries, mut trees) = if retain {
-            refused(entries, &mut rows, &Cancel::default())?
+            refused(entries, &mut rows, &Cancel::default(), |category| {
+                all || clear == Some(category)
+            })?
         } else {
             let trees = entries
                 .iter()
@@ -587,10 +610,8 @@ impl Storage {
                             .iter_mut()
                             .find(|row| row.category == entry.category)
                             .unwrap();
-                        row.kept.push(Kept {
-                            bytes: trees[index].size(&mut HashSet::new()),
-                            reason: native_mods::cache_error(error),
-                        });
+                        row.older_build_kept |= matches!(error, Error::UnprovenExclusion);
+                        row.keep(trees[index].size(&mut HashSet::new()), error, true);
                         // A busy build may be using subsequent build-tool units too. Stop
                         // this clear attempt rather than deleting more after contention.
                         if matches!(entry.access()?, Access::BuildTools) {
@@ -603,6 +624,7 @@ impl Storage {
         }
         for row in &mut rows {
             if all || clear == Some(row.category) {
+                row.after_clear = true;
                 let remaining = allocated(&entries, &trees, row.category);
                 row.freed_bytes = row.bytes.saturating_sub(remaining);
                 row.remaining_bytes = remaining;
@@ -630,6 +652,7 @@ fn refused(
     entries: Vec<Entry>,
     rows: &mut [Row],
     cancel: &Cancel,
+    clearing: impl Fn(Category) -> bool,
 ) -> Result<(Vec<Entry>, Vec<Tree>), Error> {
     let mut sound = Vec::new();
     let mut trees = Vec::new();
@@ -643,11 +666,7 @@ fn refused(
                 .iter_mut()
                 .find(|row| row.category == entry.category)
                 .unwrap()
-                .kept
-                .push(Kept {
-                    bytes: 0,
-                    reason: native_mods::cache_error(error),
-                }),
+                .keep(0, error, clearing(entry.category)),
             Err(error) => return Err(error),
         }
     }
