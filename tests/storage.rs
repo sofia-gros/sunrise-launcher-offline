@@ -156,10 +156,16 @@ fn instance_caches_are_preserved_while_running_and_cleared_when_idle() {
     let home = Home::new();
     home.installed_version();
     let game = home.file("launcher/versions/v0.0.1/game", b"running");
-    let cache = home.file(
-        "game/.sunrise-cache/behaviours-v7.bin",
-        b"active instance cache",
-    );
+    let caches = [
+        home.file(
+            "game/.sunrise-cache/behaviours-v8.bin",
+            b"active instance cache",
+        ),
+        home.file(
+            "game/.sunrise-cache/behaviours-v7.bin",
+            b"active instance cache",
+        ),
+    ];
     let mut process = Command::new("sh")
         .args(["-c", "read -r ignored", "storage-instance"])
         .arg(game)
@@ -167,15 +173,19 @@ fn instance_caches_are_preserved_while_running_and_cleared_when_idle() {
         .spawn()
         .unwrap();
     home.clear("other-caches");
-    assert_eq!(
-        fs::read(&cache).unwrap(),
-        b"active instance cache",
-        "running instance cache was selected"
-    );
+    for cache in &caches {
+        assert_eq!(
+            fs::read(cache).unwrap(),
+            b"active instance cache",
+            "running instance cache was selected"
+        );
+    }
     process.kill().unwrap();
     process.wait().unwrap();
     home.clear("other-caches");
-    assert!(!cache.exists());
+    for cache in caches {
+        assert!(!cache.exists());
+    }
 }
 
 #[test]
@@ -418,6 +428,7 @@ fn markerless_profile_clears_only_the_named_game_caches() {
         b"markerless",
     );
     let paths = [
+        "game/.sunrise-cache/behaviours-v8.bin",
         "game/.sunrise-cache/behaviours-v7.bin",
         "game/.sunrise-cache/registry-v1.bin",
         "game/.sunrise-cache/mod-content/overlay",
@@ -426,6 +437,7 @@ fn markerless_profile_clears_only_the_named_game_caches() {
     ]
     .map(|path| home.file(path, b"rebuildable"));
     let canaries = [
+        "game/.sunrise-cache/behaviours-v9.bin",
         "game/.sunrise-cache/precious",
         "game/.sunrise-cache/.trash-123-456/precious",
         "game/cache/precious",
@@ -453,6 +465,7 @@ fn profile_cache_links_never_delete_outside_targets() {
     let canary = home.file("outside/player-data", b"keep");
     let target = canary.parent().unwrap();
     for relative in [
+        "game/.sunrise-cache/behaviours-v8.bin",
         "game/.sunrise-cache/behaviours-v7.bin",
         "game/.sunrise-cache/registry-v1.bin",
         "game/.sunrise-cache/mod-content",
@@ -524,11 +537,16 @@ fn detached_trash_does_not_sweep_a_profile_that_shares_the_launcher_root() {
     let unrelated = home.file("launcher/.trash-123-456/player-data", b"keep");
     let unrelated_file = home.file("launcher/.trash-123-457-1", b"keep");
     let transaction = home.file("launcher/mod-browser/install-txn.json", b"keep");
-    let cache = home.file("launcher/.sunrise-cache/behaviours-v7.bin", b"rebuildable");
+    let caches = [
+        home.file("launcher/.sunrise-cache/behaviours-v8.bin", b"rebuildable"),
+        home.file("launcher/.sunrise-cache/behaviours-v7.bin", b"rebuildable"),
+    ];
     let output = home.run_in("launcher", &["storage", "--clear", "other-caches"]);
     assert!(output.status.success(), "{output:?}");
     for path in [unrelated, unrelated_file, transaction] {
         assert_eq!(fs::read(path).unwrap(), b"keep");
     }
-    assert!(!cache.exists());
+    for cache in caches {
+        assert!(!cache.exists());
+    }
 }

@@ -9,7 +9,10 @@ use serde::Serialize;
 use std::sync::Arc;
 
 // Only files the game can regenerate from authoritative inputs may be offered here.
-const PROFILE_GAME_CACHES: [&str; 5] = [
+// Both behaviours cache versions are named explicitly: v8 is written by live 26.3+
+// builds and v7 by older installed builds. Never replace with a pattern.
+const PROFILE_GAME_CACHES: [&str; 6] = [
+    ".sunrise-cache/behaviours-v8.bin",
     ".sunrise-cache/behaviours-v7.bin",
     ".sunrise-cache/registry-v1.bin",
     ".sunrise-cache/mod-content",
@@ -1182,6 +1185,7 @@ mod manual_tests {
     fn profile_game_cache_inventory_counts_only_the_rebuildable_entries() {
         let home = crate::storage::tests::Home::new();
         let files = [
+            home.seed(".sunrise-cache/behaviours-v8.bin"),
             home.seed(".sunrise-cache/behaviours-v7.bin"),
             home.seed(".sunrise-cache/registry-v1.bin"),
             home.seed(".sunrise-cache/mod-content/out"),
@@ -1189,6 +1193,7 @@ mod manual_tests {
             home.seed("cache/dx12-shaders.bin"),
         ];
         let canaries = [
+            home.seed(".sunrise-cache/behaviours-v9.bin"),
             home.seed(".sunrise-cache/player-data"),
             home.seed("cache/unknown/keep"),
             home.seed("cache/.trash-unrelated/keep"),
@@ -1203,7 +1208,7 @@ mod manual_tests {
         storage
             .detached_trash(&mut entries, &data, &[], &Cancel::default())
             .unwrap();
-        assert_eq!(entries.len(), 5);
+        assert_eq!(entries.len(), 6);
         for file in files {
             assert_eq!(
                 entries
