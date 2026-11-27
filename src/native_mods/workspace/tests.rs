@@ -820,29 +820,45 @@ fn cold_retry_refuses_a_redirected_slot_parent() {
     assert_eq!(fs::read(&canary).unwrap(), b"untouched");
 }
 
+fn in_child(name: &str) -> bool {
+    const CHILD: &str = "SUNRISE_NATIVE_WORKSPACE_TEST_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        return true;
+    }
+    let scratch = tempfile::tempdir().unwrap();
+    let module = module_path!().split_once("::").unwrap().1;
+    let test = format!("{module}::{name}");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &test, "--include-ignored", "--nocapture"])
+        .env(CHILD, "1")
+        .env("SUNRISE_LAUNCHER_HOME", scratch.path().join("launcher"))
+        .env("SUNRISE_HOME", scratch.path().join("game"))
+        .env(
+            "SUNRISE_LAUNCHER_LOCATION_FILE",
+            scratch.path().join("location"),
+        )
+        .env("SUNRISE_NO_KEYCHAIN", "1")
+        .env("SUNRISE_LAUNCHER_NO_SELF_UPDATE", "1")
+        .env("XDG_DATA_HOME", scratch.path().join("data"))
+        .env("XDG_CONFIG_HOME", scratch.path().join("config"))
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("1 passed; 0 failed"),
+        "child test did not run {test}: {stdout}"
+    );
+    false
+}
+
 #[test]
 fn an_unproved_exit_skips_the_slot_in_memory_only_until_the_next_start() {
-    const CHILD: &str = "SUNRISE_NATIVE_UNPROVED_SLOT_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "native_mods::workspace::tests::an_unproved_exit_skips_the_slot_in_memory_only_until_the_next_start",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .output()
-            .unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success(),
-            "{stdout}\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            stdout.contains("1 passed; 0 failed"),
-            "child test did not run: {stdout}"
-        );
+    if !in_child("an_unproved_exit_skips_the_slot_in_memory_only_until_the_next_start") {
         return;
     }
     let (_dir, lease, build) = leased();
@@ -882,13 +898,136 @@ fn an_unproved_exit_skips_the_slot_in_memory_only_until_the_next_start() {
     // The next launcher start reuses the slot as usual, with its files.
     fs::write(stage.work().join("kept"), b"compiled").unwrap();
     unproved.forget_unproved();
-    CARGO_HOME_UNPROVED.store(false, Ordering::Relaxed);
     let reused = unproved.clone().usable(false).unwrap();
     let mut next = Workspace::new(&native).unwrap();
     assert!(next.attach(&lease, reused).unwrap());
     assert_eq!(fs::read(next.work().join("kept")).unwrap(), b"compiled");
     assert!(next.retry_cold(&lease).unwrap());
     assert!(!next.work().join("kept").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "daily; build the launcher binary first"]
+fn persistent_sdk_process_uses_fresh_retry_tmp_and_isolates_cargo_after_stop() {
+    use super::super::Target::{Client, Server};
+    use std::os::unix::fs::PermissionsExt;
+
+    if !in_child("persistent_sdk_process_uses_fresh_retry_tmp_and_isolates_cargo_after_stop") {
+        return;
+    }
+    let (dir, lease, build) = leased();
+    let native = build.join("native");
+    let program = dir.path().join("sdk");
+    fs::write(&program, r#"#!/bin/sh
+set -eu
+[ "$1" = native-build ]
+read -r plan
+printf '%s\n' "$plan" > "$TMPDIR/plan.json"
+printf '%s\n' "$CARGO_HOME" > "$TMPDIR/cargo-home"
+printf '%s\n' "$TMPDIR" > "$(dirname "$0")/last-tmp"
+[ -z "${CARGO_TARGET_DIR+x}" ]
+if [ -f "$(dirname "$0")/stop" ]; then
+    printf '%s\n' '{"event":"mod","id":"greeter","done":1,"total":1}'
+    # Hold the SDK open after the mod event so the launcher cancels before proof.
+    read -r _ || :
+    exit 1
+fi
+if [ -f "$(dirname "$0")/build/native/w/$(cat "$(dirname "$0")/slot")/warm" ]; then
+    printf '%s\n' '{"event":"failed","error":"stale work","blame":null}'
+    exit 1
+fi
+printf '%s\n' '{"event":"built","route":"prebuilt-api","binary":"unused","libraries":[],"records":[],"mods":[],"internals":{}}'
+"#).unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+    let rust = crate::rust_toolchain::Toolchain {
+        dir: dir.path().join("rust"),
+        host: crate::rust_toolchain::host().unwrap(),
+    };
+    let run = |stage: &mut Workspace,
+               cancel: &tool::Cancellation,
+               on_mod: &dyn Fn(&str, usize, usize)| {
+        let work = stage.work();
+        let result = tool::build(
+            &rust,
+            &program,
+            tool::Plan {
+                work: &work,
+                workspace: stage,
+                package: tool::Package {
+                    runtime: dir.path(),
+                    api: dir.path(),
+                    engine: dir.path(),
+                },
+                mods: dir.path(),
+                server: false,
+                mixins_from_source: false,
+            },
+            on_mod,
+            cancel,
+            None,
+        );
+        stage.note_unproved();
+        result
+    };
+    let assert_plan = |stage: &Workspace, tmp: &Path, cargo: &Path| {
+        let plan: serde_json::Value =
+            serde_json::from_slice(&fs::read(tmp.join("plan.json")).unwrap()).unwrap();
+        assert_eq!(plan["work"], serde_json::json!(stage.work()));
+        assert_eq!(plan["toolchain"]["cargo_home"], serde_json::json!(cargo));
+        assert_eq!(
+            fs::read_to_string(tmp.join("cargo-home"))
+                .unwrap()
+                .trim_end(),
+            cargo.to_str().unwrap()
+        );
+    };
+    let client = key(Client);
+    fs::write(dir.path().join("slot"), client.as_str()).unwrap();
+    let mut stage = Workspace::new(&native).unwrap();
+    assert!(stage.attach(&lease, client.clone()).unwrap());
+    fs::write(stage.work().join("warm"), b"stale").unwrap();
+    assert!(stage.attach(&lease, client.clone()).unwrap());
+    let cancellation = tool::Cancellation::default();
+    let no_mod = |_: &str, _: usize, _: usize| unreachable!();
+    let failed = run(&mut stage, &cancellation, &no_mod).unwrap_err();
+    assert_eq!(failed.error, "stale work");
+    let first_tmp = stage.path().join("tmp");
+    assert_plan(&stage, &first_tmp, &build.join("cargo"));
+    assert!(stage.retry_cold(&lease).unwrap());
+    assert_eq!(
+        run(&mut stage, &cancellation, &no_mod).unwrap().route,
+        tool::CheckRoute::PrebuiltApi
+    );
+    let retry_tmp = fs::read_to_string(dir.path().join("last-tmp")).unwrap();
+    let retry_tmp = Path::new(retry_tmp.trim_end());
+    assert_ne!(first_tmp.as_path(), retry_tmp);
+    assert_plan(&stage, retry_tmp, &build.join("cargo"));
+
+    // A stopped, warm compiler has no proved handoff. Its slot cannot be retried.
+    fs::write(dir.path().join("stop"), b"").unwrap();
+    assert!(stage.attach(&lease, client.clone()).unwrap());
+    fs::write(stage.work().join("kept"), b"output").unwrap();
+    assert!(stage.attach(&lease, client.clone()).unwrap());
+    let stop = tool::Cancellation::default();
+    assert!(run(&mut stage, &stop, &|_, _, _| stop.stop()).is_err());
+    assert!(stop.is_stopped());
+    assert!(client.usable(false).is_none());
+    assert!(!stage.retry_cold(&lease).unwrap());
+    assert!(stage.work().join("kept").is_file());
+
+    fs::remove_file(dir.path().join("stop")).unwrap();
+    let mut another = Workspace::new(&native).unwrap();
+    assert!(another
+        .attach(&lease, key(Server).usable(false).unwrap())
+        .unwrap());
+    assert_ne!(another.work(), stage.work());
+    run(&mut another, &cancellation, &no_mod).unwrap();
+    assert_plan(
+        &another,
+        &another.path().join("tmp"),
+        &another.path().join("cargo"),
+    );
 }
 
 #[test]
