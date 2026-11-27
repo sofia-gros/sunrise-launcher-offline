@@ -512,7 +512,7 @@ fn play_checks_hash_only_takedowns_after_proving_the_actual_package() {
         });
         Some(Arc::new(result))
     };
-    let (active, _) = client
+    let (active, _, _) = client
         .ready(
             &mut profile,
             || FirstBuild::installed(BUILD),
@@ -888,7 +888,7 @@ fn windows_bound_x64_fallback_survives_pending_retry_and_committed_replay() {
     install_candidate(&archive, "x64");
     interrupt_after_proof();
     let mut profile = Profile::open(&home, None).unwrap();
-    let (active, _) = retry(&mut profile).unwrap();
+    let (active, _, _) = retry(&mut profile).unwrap();
     drop(profile);
     let mut reopened = Profile::open(&home, None).unwrap();
     assert_eq!(retry(&mut reopened).unwrap().0, active);
@@ -1001,7 +1001,7 @@ fn play_hashes_the_prepared_files_once_and_still_refuses_damage() {
     // The game's own two steps of a Play, each with the full verifications it asked for.
     let ready = |profile: &mut Profile| {
         FULL_VERIFICATIONS.take();
-        let (active, _) = client.ready(
+        let (active, _, first) = client.ready(
             profile,
             || FirstBuild::installed(BUILD),
             |_, _| Ok(()),
@@ -1009,28 +1009,26 @@ fn play_hashes_the_prepared_files_once_and_still_refuses_damage() {
             |_| {},
             || None,
         )?;
-        Ok::<_, StartError>((active, FULL_VERIFICATIONS.take()))
+        Ok::<_, StartError>((active, FULL_VERIFICATIONS.take(), first))
     };
     let spawned = Cell::new(false);
-    let handoff = |profile: &Profile, active: &Active| {
+    let handoff = |profile: &Profile, active: &Active, first: Option<&VerifiedFirst>| {
         spawned.set(false);
         FULL_VERIFICATIONS.take();
-        let result = profile.verified_handoff(active, &cancellation, |_| {
+        let result = profile.verified_handoff_for(active, first, &cancellation, |_| {
             spawned.set(true);
             Ok::<(), String>(())
         });
         (result, FULL_VERIFICATIONS.take())
     };
     let intact = |profile: &mut Profile| {
-        let (active, before_handoff) = ready(profile).unwrap();
-        assert_eq!(
-            before_handoff, 0,
-            "hashed the prepared files before the handoff"
-        );
-        let (result, at_handoff) = handoff(profile, &active);
+        let (active, before_handoff, proof) = ready(profile).unwrap();
+        let initial = u32::from(proof.is_some());
+        assert_eq!(before_handoff, initial);
+        let (result, at_handoff) = handoff(profile, &active, proof.as_ref());
         result.unwrap();
         assert!(spawned.get());
-        assert_eq!(at_handoff, 1, "hashed the prepared files other than once");
+        assert_eq!(at_handoff, 1 - initial);
         active
     };
     let snapshot_error = |active: &Active, error: String| {
@@ -1046,6 +1044,25 @@ fn play_hashes_the_prepared_files_once_and_still_refuses_damage() {
         assert!(!error.contains(&active.resource_path().to_string_lossy().into_owned()));
     };
 
+    // A cached snapshot with an intact manifest but damaged payload must not bind First Play.
+    let prepared_snapshot = {
+        let preparation = backend::prepare_lock(BUILD).unwrap();
+        super::super::Resources::prepare(BUILD, &preparation, None).unwrap()
+    };
+    let snapshot_blob = prepared_snapshot.path(BUILD).join("fixture-blob.bin");
+    fs::write(&snapshot_blob, b"already damaged").unwrap();
+    let error = ready(&mut profile).unwrap_err();
+    assert!(
+        matches!(error, StartError::Other(detail) if detail.contains("managed_play/resources.rs:"))
+    );
+    assert_eq!(FULL_VERIFICATIONS.take(), 1);
+    assert!(profile.active().unwrap().is_none());
+    assert!(crate::profile_txn::references(&home)
+        .unwrap()
+        .targets
+        .is_empty());
+    fs::write(snapshot_blob, BLOB).unwrap();
+
     // First Play, an unchanged Play, and a Play that refreshes for a changed mod.
     let first = intact(&mut profile);
     assert_eq!(first.generation(), 1);
@@ -1055,13 +1072,12 @@ fn play_hashes_the_prepared_files_once_and_still_refuses_damage() {
     assert_eq!(refreshed.generation(), 2);
 
     // Tamper after publication: the resources must still be checked at the handoff.
-    let (_, before_handoff) = ready(&mut profile).unwrap();
+    let (active, before_handoff, _) = ready(&mut profile).unwrap();
     assert_eq!(before_handoff, 0);
     let blob = refreshed.resource_path().join("fixture-blob.bin");
     fs::write(&blob, b"tampered bytes").unwrap();
-    let (active, before_handoff) = ready(&mut profile).unwrap();
-    assert_eq!((active.clone(), before_handoff), (refreshed.clone(), 0));
-    let (result, at_handoff) = handoff(&profile, &active);
+    assert_eq!(active, refreshed);
+    let (result, at_handoff) = handoff(&profile, &active, None);
     snapshot_error(&active, result.unwrap_err());
     assert_eq!((spawned.get(), at_handoff), (false, 1));
 
@@ -1112,15 +1128,15 @@ fn play_hashes_the_prepared_files_once_and_still_refuses_damage() {
     // A refresh over the changed file advances without sealing it: the next generation keeps
     // the original digest, so the next Play refuses the same way.
     write_package("3.0.0");
-    let (advanced, before_handoff) = ready(&mut profile).unwrap();
+    let (advanced, before_handoff, _) = ready(&mut profile).unwrap();
     assert_eq!((advanced.generation(), before_handoff), (3, 0));
     assert_eq!(advanced.resources, refreshed.resources);
     assert_eq!(profile.active().unwrap(), Some(advanced.clone()));
-    let (result, at_handoff) = handoff(&profile, &advanced);
+    let (result, at_handoff) = handoff(&profile, &advanced, None);
     snapshot_error(&advanced, result.unwrap_err());
     assert_eq!((spawned.get(), at_handoff), (false, 1));
-    let (again, _) = ready(&mut profile).unwrap();
-    let (result, _) = handoff(&profile, &again);
+    let (again, _, _) = ready(&mut profile).unwrap();
+    let (result, _) = handoff(&profile, &again, None);
     snapshot_error(&again, result.unwrap_err());
     assert!(!spawned.get());
 
@@ -1162,9 +1178,9 @@ fn play_hashes_the_prepared_files_once_and_still_refuses_damage() {
     assert_eq!(profile.active().unwrap(), Some(advanced.clone()));
     write_package("3.0.0");
     fs::write(&program, client_bytes).unwrap();
-    let (active, _) = ready(&mut profile).unwrap();
+    let (active, _, _) = ready(&mut profile).unwrap();
     fs::write(&program, b"changed client").unwrap();
-    let (result, _) = handoff(&profile, &active);
+    let (result, _) = handoff(&profile, &active, None);
     assert!(result.unwrap_err().contains("managed_play.rs:"));
     assert!(!spawned.get());
     fs::write(&program, client_bytes).unwrap();

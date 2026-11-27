@@ -464,6 +464,16 @@ impl Profile {
         cancellation: &native_mods::Cancellation,
         spawn: impl FnOnce(ProfileHandoff<'_>) -> Result<T, E>,
     ) -> Result<T, E> {
+        self.verified_handoff_for(active, None, cancellation, spawn)
+    }
+
+    pub(super) fn verified_handoff_for<T, E: From<String>>(
+        &self,
+        active: &Active,
+        first: Option<&VerifiedFirst>,
+        cancellation: &native_mods::Cancellation,
+        spawn: impl FnOnce(ProfileHandoff<'_>) -> Result<T, E>,
+    ) -> Result<T, E> {
         let home = self.home();
         let checking = crate::launcher_log::step("Verifying the game and its prepared files");
         let _manifest = game_lock(home)?;
@@ -473,7 +483,15 @@ impl Profile {
             if self.active()?.as_ref() != Some(active) || inputs(home)? != active.inputs {
                 return Err(unsettled!());
             }
-            active.verify_artifacts()?;
+            // First Play checked this exact snapshot before committing it, and the proof
+            // still owns the game-manifest lock from that check through this handoff.
+            match first {
+                Some(first) if &first.active == active && first.home.as_path() == home => {
+                    active.verify_binaries()?;
+                }
+                Some(_) => return Err(unsettled!()),
+                None => active.verify_artifacts()?,
+            }
             active
                 .resources
                 .check_play_output(active.base())
@@ -578,6 +596,20 @@ pub struct FirstAttempt<'a> {
     stage: Staging<'a>,
 }
 
+/// A first publication and the manifest lock under which its resources were verified.
+/// Never persisted: a later Play must verify the saved resources again.
+pub(super) struct VerifiedFirst {
+    pub(super) active: Active,
+    home: PathBuf,
+    _manifest: HomeLockGuard,
+}
+
+impl std::fmt::Debug for VerifiedFirst {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifiedFirst").finish_non_exhaustive()
+    }
+}
+
 impl FirstAttempt<'_> {
     pub fn base(&self) -> &str {
         &self.bound.base
@@ -618,8 +650,8 @@ impl FirstAttempt<'_> {
         &self,
         log: &dyn Fn(String),
         diagnostics: &dyn Fn(String),
-    ) -> Result<(), String> {
-        Resources::for_play_with(self.base(), self.handoff(), log, diagnostics).map(drop)
+    ) -> Result<Resources, String> {
+        Resources::for_play_with(self.base(), self.handoff(), log, diagnostics)
     }
 
     pub fn exact_image(
@@ -653,8 +685,19 @@ impl FirstAttempt<'_> {
         // publication fence while waiting on a preparer child for this one version.
         self.bound.verify_image()?;
         let resources = Resources::capture(self.base(), &self.stage)?;
-        let _manifest = game_lock(&self.home)?;
+        Ok(self.commit_prepared(image, resources, cancellation)?.active)
+    }
+
+    pub(super) fn commit_prepared(
+        self,
+        image: &str,
+        resources: Resources,
+        cancellation: &native_mods::Cancellation,
+    ) -> Result<VerifiedFirst, String> {
+        let manifest = game_lock(&self.home)?;
         crate::browser::installed::recover_game_install(&self.home)?;
+        // Refuse a damaged reused tree before it can bind an unbound profile.
+        resources.verify(self.base())?;
         let _references = ReferencePublication::begin(&self.home)?;
         self.bound.verify_image()?;
         let active = Active::capture(
@@ -669,13 +712,18 @@ impl FirstAttempt<'_> {
             },
         )?;
         super::inputs::check_browser_rows(&self.home, &scan_packages(&self.home)?)?;
-        publish_generation(
+        let active = publish_generation(
             self.stage,
             active,
             &self.home,
             self.bound.inputs,
             cancellation,
-        )
+        )?;
+        Ok(VerifiedFirst {
+            active,
+            home: self.home,
+            _manifest: manifest,
+        })
     }
 }
 
@@ -689,7 +737,8 @@ fn publish_generation(
 ) -> Result<Active, String> {
     let pointer = serde_json::to_vec(&active).map_err(|e| e.to_string())?;
     stage.seal(pointer, &[])?.publish(|| {
-        // `verified_handoff` hashes the prepared files before the child; see `Profile::refresh`.
+        // First Play checks resources before publication; refresh keeps the saved digest
+        // and checks resources at the handoff.
         active.verify_binaries()?;
         if inputs(home)? != epoch {
             return Err(unsettled!());

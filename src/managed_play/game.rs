@@ -1,5 +1,5 @@
 //! Build the actual admitted client command, then transfer its profile and cache claims.
-use super::{unsettled, Active, Profile, StartError};
+use super::{first::VerifiedFirst, unsettled, Active, Profile, StartError};
 use crate::{
     backend::{self, RuntimeGuard},
     native_mods::Cancellation,
@@ -29,7 +29,7 @@ impl Profile {
             command,
             &[],
             piped,
-            (|_| Ok(()), |_| Ok(())),
+            (None, |_| Ok(()), |_| Ok(())),
         )
         .map_err(String::from)
     }
@@ -48,7 +48,7 @@ impl Profile {
             active,
             cancellation,
             command,
-            (launch, piped, &|_| {}),
+            (launch, piped, &|_| {}, None),
             |_| Ok(()),
             |_| Ok(()),
         )
@@ -59,7 +59,12 @@ impl Profile {
         active: &Active,
         cancellation: &Cancellation,
         mut command: Command,
-        (launch, piped, hook_log): (&crate::launch::Launch, bool, &dyn Fn(String)),
+        (launch, piped, hook_log, first): (
+            &crate::launch::Launch,
+            bool,
+            &dyn Fn(String),
+            Option<&VerifiedFirst>,
+        ),
         prepare_jars: impl FnOnce(&Command) -> Result<(), String>,
         before_spawn: impl FnOnce(&mut Command) -> Result<(), StartError>,
     ) -> Result<(Child, RuntimeGuard), StartError> {
@@ -71,6 +76,7 @@ impl Profile {
             &wrapper,
             piped,
             (
+                first,
                 |command| {
                     prepare_jars(command)?;
                     crate::launch::managed_pre_launch(command, launch, piped, hook_log)
@@ -88,12 +94,13 @@ impl Profile {
         command: Command,
         wrapper: &[std::ffi::OsString],
         piped: bool,
-        (pre_launch, before_spawn): (
+        (first, pre_launch, before_spawn): (
+            Option<&VerifiedFirst>,
             impl FnOnce(&Command) -> Result<(), StartError>,
             impl FnOnce(&mut Command) -> Result<(), StartError>,
         ),
     ) -> Result<(Child, RuntimeGuard), StartError> {
-        self.verified_handoff(active, cancellation, |profile| {
+        self.verified_handoff_for(active, first, cancellation, |profile| {
             let selection = validate_selection(self.home(), &active.resource_path(), &command)?;
             pre_launch(&command)?;
             cancellation.check()?;
