@@ -11,8 +11,10 @@ pub const PRIVATE: &str = "<private>";
 
 #[derive(Clone, Debug, Default)]
 pub struct Scrubber {
-    /// Exact terms to hide, longest first.
+    /// Terms to hide wherever they appear (any case), longest first.
     terms: Vec<String>,
+    /// Whole-word terms to hide (any case), longest first — used for 1–2 byte profile names.
+    word_terms: Vec<String>,
     user: Option<String>,
 }
 
@@ -24,6 +26,7 @@ impl Scrubber {
             .find_map(|k| std::env::var(k).ok().filter(|u| u.trim().len() >= 3));
         Self {
             terms: Vec::new(),
+            word_terms: Vec::new(),
             user,
         }
     }
@@ -38,13 +41,35 @@ impl Scrubber {
         self
     }
 
-    /// Hides `term` wherever it appears. Terms under 3 characters are ignored: they would
-    /// blank out ordinary words.
+    /// Hides `term` wherever it appears (any case). Terms under 3 characters are ignored: they
+    /// would blank out ordinary words.
     pub fn term(mut self, term: impl Into<String>) -> Self {
         let term = term.into();
-        if term.trim().len() >= 3 && !self.terms.contains(&term) {
+        if term.trim().len() >= 3
+            && !self
+                .terms
+                .iter()
+                .any(|existing| existing.to_lowercase() == term.to_lowercase())
+        {
             self.terms.push(term);
             self.terms.sort_by_key(|t| std::cmp::Reverse(t.len()));
+        }
+        self
+    }
+
+    /// Hides whole-word occurrences of `term` (any case), including 1–2 character names that
+    /// would blank out ordinary words if matched as substrings.
+    pub fn word_term(mut self, term: impl Into<String>) -> Self {
+        let term = term.into();
+        let trimmed = term.trim();
+        if !trimmed.is_empty()
+            && !self
+                .word_terms
+                .iter()
+                .any(|existing| existing.to_lowercase() == trimmed.to_lowercase())
+        {
+            self.word_terms.push(trimmed.to_owned());
+            self.word_terms.sort_by_key(|t| std::cmp::Reverse(t.len()));
         }
         self
     }
@@ -57,7 +82,10 @@ impl Scrubber {
         out = connecting_host(&out);
         // Private terms can be part of the text that identifies an address or credential.
         for term in &self.terms {
-            out = out.replace(term.as_str(), PRIVATE);
+            out = replace_term(&out, term, PRIVATE);
+        }
+        for word in &self.word_terms {
+            out = replace_word(&out, word, PRIVATE);
         }
         out = user_folders(&out);
         if let Some(user) = &self.user {
@@ -282,36 +310,103 @@ fn uuid_at(bytes: &[u8], i: usize) -> Option<(usize, &'static str)> {
     (hex(i..i + 32) && ends_token(bytes, i + 32)).then_some((32, UUID))
 }
 
-/// Whole-word occurrences of `word`, in any case.
-fn replace_word(text: &str, word: &str, label: &str) -> String {
+/// Lowercased views of `text` and `needle` when their byte boundaries align with `text`,
+/// falling back to ASCII-only folding for ASCII needles and exact matching otherwise.
+fn match_slices<'a>(
+    text: &'a str,
+    needle: &'a str,
+) -> (std::borrow::Cow<'a, str>, std::borrow::Cow<'a, str>) {
     let lower = text.to_lowercase();
-    let needle = word.to_lowercase();
-    // Lowercasing can change byte lengths outside ASCII: then match exactly instead. Equal total
-    // lengths aren't enough to stand one in for the other: a character can grow (`İ` is 2 bytes and
-    // lowercases to 3) while another shrinks (`K`, U+212A, is 3 and lowercases to 1), so the text
-    // keeps its length while its boundaries move, and a match's offsets in `lower` would slice the
-    // text mid-character.
+    let lower_needle = needle.to_lowercase();
+    // Lowercasing can change byte lengths outside ASCII: then match with ASCII folding (which
+    // preserves every boundary) or exactly instead. Equal total lengths aren't enough to stand one
+    // in for the other: a character can grow (`İ` is 2 bytes and lowercases to 3) while another
+    // shrinks (`K`, U+212A, is 3 and lowercases to 1), so the text keeps its length while its
+    // boundaries move, and a match's offsets in `lower` would slice the text mid-character.
     let aligned = lower.len() == text.len()
+        && lower_needle.len() == needle.len()
         && lower
             .char_indices()
             .map(|(at, _)| at)
             .eq(text.char_indices().map(|(at, _)| at));
-    let (hay, needle) = if aligned && needle.len() == word.len() {
-        (lower.as_str(), needle.as_str())
-    } else {
-        (text, word)
+    if aligned {
+        return (
+            std::borrow::Cow::Owned(lower),
+            std::borrow::Cow::Owned(lower_needle),
+        );
+    }
+    if needle.is_ascii() {
+        return (
+            std::borrow::Cow::Owned(text.to_ascii_lowercase()),
+            std::borrow::Cow::Owned(needle.to_ascii_lowercase()),
+        );
+    }
+    (
+        std::borrow::Cow::Borrowed(text),
+        std::borrow::Cow::Borrowed(needle),
+    )
+}
+
+/// Whether `start..end` overlaps an existing scrubber placeholder (`<user>`, `<private>`, …).
+fn inside_placeholder(bytes: &[u8], start: usize, end: usize) -> bool {
+    const LABELS: [&[u8]; 6] = [
+        USER.as_bytes(),
+        EMAIL.as_bytes(),
+        IP.as_bytes(),
+        UUID.as_bytes(),
+        PRIVATE.as_bytes(),
+        b"<secret>",
+    ];
+    let search_from = start.saturating_sub(PRIVATE.len());
+    let Some(rel) = bytes[search_from..end].iter().rposition(|&b| b == b'<') else {
+        return false;
     };
+    let open = search_from + rel;
+    LABELS
+        .iter()
+        .any(|label| bytes[open..].starts_with(label) && start < open + label.len() && end > open)
+}
+
+/// Substring occurrences of `term`, in any case, without rewriting scrubber placeholders.
+fn replace_term(text: &str, term: &str, label: &str) -> String {
+    if term.is_empty() {
+        return text.to_owned();
+    }
+    let (hay, needle) = match_slices(text, term);
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
     let mut copied = 0;
     let mut from = 0;
-    while let Some(found) = hay[from..].find(needle) {
+    while let Some(found) = hay[from..].find(needle.as_ref()) {
+        let start = from + found;
+        let end = start + needle.len();
+        if !inside_placeholder(bytes, start, end) {
+            out.push_str(&text[copied..start]);
+            out.push_str(label);
+            copied = end;
+        }
+        from = end;
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
+/// Whole-word occurrences of `word`, in any case.
+fn replace_word(text: &str, word: &str, label: &str) -> String {
+    if word.is_empty() {
+        return text.to_owned();
+    }
+    let (hay, needle) = match_slices(text, word);
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut from = 0;
+    while let Some(found) = hay[from..].find(needle.as_ref()) {
         let start = from + found;
         let end = start + needle.len();
         let alone = (start == 0 || !word_byte(bytes[start - 1])) && ends_token(bytes, end);
         // A label put in earlier (`<user>` for a user named "user") stays as it is.
-        let label_inside = start > 0 && bytes[start - 1] == b'<' && bytes.get(end) == Some(&b'>');
-        if alone && !label_inside {
+        if alone && !inside_placeholder(bytes, start, end) {
             out.push_str(&text[copied..start]);
             out.push_str(label);
             copied = end;
@@ -481,6 +576,29 @@ mod tests {
         assert_eq!(
             s.scrub("Saving My World; joined play.example.net:25565, ab"),
             "Saving <private>; joined <private>:25565, ab"
+        );
+    }
+
+    #[test]
+    fn terms_match_any_case_and_word_terms_hide_short_names_safely() {
+        let s = Scrubber::bare()
+            .term("Private Profile")
+            .term("Private")
+            .term("Secret")
+            .word_term("TV")
+            .word_term("X")
+            .word_term("ip");
+        assert_eq!(
+            s.scrub("There is already a profile called PRIVATE PROFILE and private profile."),
+            "There is already a profile called <private> and <private>."
+        );
+        assert_eq!(
+            s.scrub("TV uses 26.3-0.1.0; activity stays; Could not make profile x: denied; example stays"),
+            "<private> uses 26.3-0.1.0; activity stays; Could not make profile <private>: denied; example stays"
+        );
+        assert_eq!(
+            s.scrub("access_token=<secret> from 10.0.0.1 for Private Profile"),
+            "access_token=<secret> from <ip> for <private>"
         );
     }
 }

@@ -601,6 +601,7 @@ impl Instance {
     pub fn resolve_version(&self, requested: Option<&str>) -> Result<String, String> {
         match (requested, &self.version) {
             (None, Some(pinned)) => backend::resolve_version(Some(pinned)).map_err(|_| {
+                register_profile(self);
                 crate::i18n::trf(
                     "{profile} uses {build}, which is not installed. Install it, or use Switch to choose another build.",
                     &[("profile", &self.name), ("build", pinned)],
@@ -702,14 +703,23 @@ pub(crate) fn profile_homes_strict(game: &Path) -> Result<Vec<PathBuf>, String> 
     Ok(homes)
 }
 
-fn list_in(game_home: &Path, data: &Path) -> Vec<Instance> {
-    let instances = list_with_snapshot(game_home, data, true, || {});
-    for instance in &instances {
-        if instance.id != DEFAULT {
-            crate::launcher_log::hide(&instance.name);
-        }
+fn register_profile(instance: &Instance) {
+    if !(instance.kind == Kind::Default && instance.name.eq_ignore_ascii_case("Sunrise")) {
+        crate::launcher_log::hide_profile_name(&instance.name);
     }
-    instances
+    if instance.kind == Kind::Own {
+        crate::launcher_log::hide_profile_name(&instance.id);
+    }
+}
+
+fn register_profile_names(instances: &[Instance]) {
+    for instance in instances {
+        register_profile(instance);
+    }
+}
+
+fn list_in(game_home: &Path, data: &Path) -> Vec<Instance> {
+    list_with_snapshot(game_home, data, true, || {})
 }
 
 fn list_with_snapshot(
@@ -849,6 +859,7 @@ fn list_snapshot(
         })
         .collect();
     out[1..].sort_by_key(|i| (i.group.clone(), i.name.to_lowercase()));
+    register_profile_names(&out);
     out
 }
 
@@ -962,6 +973,7 @@ fn delete_selected(
     instance: Instance,
     trash: &dyn Fn(&Path) -> Result<(), String>,
 ) -> Result<Instance, DeleteError> {
+    register_profile(&instance);
     if instance.kind == Kind::Pack {
         return Err(registry_pack::remove_unavailable().into());
     }
@@ -1230,6 +1242,7 @@ pub fn create_with(
 
 /// What creating or renaming an instance says when another already has `name`.
 pub fn name_taken(name: &str) -> String {
+    crate::launcher_log::hide_profile_name(name);
     crate::i18n::trf(
         "There is already a profile called {name}. Choose another name.",
         &[("name", name)],
@@ -1268,7 +1281,11 @@ fn create_with_publish(
     if name.is_empty() {
         return Err("A profile needs a name.".into());
     }
+    crate::launcher_log::hide_profile_name(name);
     let from = copy.map(CopyFrom::instance);
+    if let Some(from) = from {
+        register_profile(from);
+    }
     if let Some(from) = from.filter(|f| f.kind == Kind::Pack) {
         return Err(format!(
             "{} plays its pack's mods: import the pack again for a second copy.",
@@ -1581,6 +1598,7 @@ fn edit_in(
             if name.is_empty() {
                 return Err(crate::i18n::tr("A profile needs a name.").into());
             }
+            crate::launcher_log::hide_profile_name(&name);
             // Only a new name is checked: an import can share a name, and changing anything
             // else about it must still work.
             let renamed = !name.eq_ignore_ascii_case(&instance.name);

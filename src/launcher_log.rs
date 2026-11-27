@@ -174,6 +174,8 @@ static FILE: Mutex<Option<LogFile>> = Mutex::new(None);
 static SCRUBBER: Mutex<Option<Arc<Scrubber>>> = Mutex::new(None);
 /// What `hide` was told, kept for a scrubber that isn't built yet.
 static HIDDEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Whole-word private terms (1–2 byte profile names), kept for a scrubber that isn't built yet.
+static HIDDEN_WORDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 thread_local! {
     /// Whether this thread is inside building the scrubber, which reads the accounts and may log.
@@ -589,13 +591,53 @@ pub fn hide(term: impl Into<String>) {
     let term = term.into();
     let mut scrubber = lock(&SCRUBBER);
     let mut hidden = lock(&HIDDEN);
-    if hidden.contains(&term) {
+    if hidden
+        .iter()
+        .any(|existing| existing.to_lowercase() == term.to_lowercase())
+    {
         return;
     }
     if let Some(built) = scrubber.as_mut() {
         *built = Arc::new((**built).clone().term(term.clone()));
     }
     hidden.push(term);
+}
+
+/// Hide whole-word occurrences of `term` from now on (for short 1–2 byte profile names).
+fn hide_word(term: impl Into<String>) {
+    let term = term.into();
+    let trimmed = term.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let term = trimmed.to_owned();
+    let mut scrubber = lock(&SCRUBBER);
+    let mut hidden = lock(&HIDDEN_WORDS);
+    if hidden
+        .iter()
+        .any(|existing| existing.to_lowercase() == term.to_lowercase())
+    {
+        return;
+    }
+    if let Some(built) = scrubber.as_mut() {
+        *built = Arc::new((**built).clone().word_term(term.clone()));
+    }
+    hidden.push(term);
+}
+
+/// Hide a custom profile name or folder slug from now on, keeping the default `"Sunrise"` name
+/// visible. Short 1–2 byte names are registered as whole-word terms so they never blank
+/// substrings inside ordinary words.
+pub(crate) fn hide_profile_name(name: &str) {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("Sunrise") {
+        return;
+    }
+    if trimmed.len() >= 3 {
+        hide(trimmed);
+    } else {
+        hide_word(trimmed);
+    }
 }
 
 /// The scrubber, built on first use like `crate::telemetry::scrubber()` and told every hidden term.
@@ -612,6 +654,9 @@ fn scrubber() -> Arc<Scrubber> {
     let mut slot = lock(&SCRUBBER);
     for term in lock(&HIDDEN).iter() {
         base = base.term(term);
+    }
+    for word in lock(&HIDDEN_WORDS).iter() {
+        base = base.word_term(word);
     }
     let built = Arc::new(base);
     *slot = Some(built.clone());
@@ -827,6 +872,109 @@ mod tests {
                     .iter()
                     .any(|instance| instance.name == name));
                 assert_eq!(scrub(&format!("Sunrise: {name}")), "Sunrise: <private>");
+            },
+        );
+    }
+
+    #[test]
+    fn profile_name_forms_are_redacted_across_create_rename_and_short_names() {
+        isolated(
+            "profile_name_forms_are_redacted_across_create_rename_and_short_names",
+            |_, game, _| {
+                // 1. Create failure before listing must still register the proposed name (long and short).
+                fs::create_dir_all(game).unwrap();
+                fs::write(game.join("instances"), "not a directory").unwrap();
+                for proposed in ["Proposed Secret Name", "Q7"] {
+                    let error = crate::instances::create(proposed, None).unwrap_err();
+                    let scrubbed = scrub(&error);
+                    assert!(
+                        !scrubbed.contains(proposed)
+                            && !scrubbed.contains(&proposed.to_lowercase()),
+                        "{proposed} leaked in {scrubbed:?}"
+                    );
+                }
+                fs::remove_file(game.join("instances")).unwrap();
+
+                // 2. Case-variant duplicate names on create and rename are redacted.
+                crate::instances::create("Observatory Beta", None).unwrap();
+                assert_eq!(
+                    scrub("profile OBSERVATORY BETA and observatory beta"),
+                    "profile <private> and <private>"
+                );
+                let dup_create = crate::instances::create("OBSERVATORY BETA", None).unwrap_err();
+                assert!(
+                    !scrub(&dup_create)
+                        .to_ascii_lowercase()
+                        .contains("observatory beta"),
+                    "{dup_create:?}"
+                );
+                crate::instances::create("Second Profile", None).unwrap();
+                let dup_rename = crate::instances::edit("Second Profile", |meta| {
+                    meta.name = Some("observatory beta".into());
+                })
+                .unwrap_err();
+                assert!(
+                    !scrub(&dup_rename)
+                        .to_ascii_lowercase()
+                        .contains("observatory beta"),
+                    "{dup_rename:?}"
+                );
+
+                // 3. Short 1–2 byte profile names are redacted as whole words without harming prose.
+                crate::instances::create("TV", None).unwrap();
+                crate::instances::create("Z", None).unwrap();
+                assert_eq!(
+                    scrub("TV uses 26.3-0.1.0; tv duplicate; activity stays; Z failed; fuzzy stays"),
+                    "<private> uses 26.3-0.1.0; <private> duplicate; activity stays; <private> failed; fuzzy stays"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn headless_for_play_and_renamed_default_register_names_without_listing() {
+        isolated(
+            "headless_for_play_and_renamed_default_register_names_without_listing",
+            |data, game, _| {
+                fs::create_dir_all(game.join("instances/hidden-folder-slug")).unwrap();
+                fs::create_dir_all(data).unwrap();
+                fs::write(
+                    data.join("instances.json"),
+                    serde_json::json!({
+                        "instances": {
+                            "sunrise": {"name": "Private Main Home"},
+                            "hidden-folder-slug": {
+                                "name": "Headless Secret",
+                                "version": "26.3-9.9.9"
+                            }
+                        }
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+
+                // Headless Play lookup without calling `instances::list()` hides display name and slug.
+                let profile = crate::instances::for_play(Some("Headless Secret")).unwrap();
+                let missing = profile.resolve_version(None).unwrap_err();
+                let scrubbed_missing = scrub(&missing);
+                assert!(
+                    !scrubbed_missing.contains("Headless Secret")
+                        && scrubbed_missing.contains("26.3-9.9.9"),
+                    "{scrubbed_missing:?}"
+                );
+                assert_eq!(
+                    scrub("instances/hidden-folder-slug/logs/latest.log"),
+                    "instances/<private>/logs/latest.log"
+                );
+
+                // Renamed default profile is hidden on delete refusal while "Sunrise" stays visible.
+                let refusal = crate::instances::delete("Private Main Home").unwrap_err();
+                let scrubbed_refusal = scrub(&refusal);
+                assert!(
+                    !scrubbed_refusal.contains("Private Main Home"),
+                    "{scrubbed_refusal:?}"
+                );
+                assert_eq!(scrub("Sunrise launcher"), "Sunrise launcher");
             },
         );
     }
