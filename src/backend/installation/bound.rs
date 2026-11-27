@@ -302,11 +302,14 @@ impl GameDownload {
             crate::signed::asset_url,
         )?;
         if let Some(warning) = outcome.receipt_warning() {
-            crate::elog!("{warning}");
+            crate::elog!("{}", warning.message());
         }
         if matches!(outcome, InstallOutcome::Installed(_)) {
             for (build, error) in version_storage::prune_old_versions(&[], tag) {
-                crate::elog!("Could not remove old game build {build}: {error}");
+                crate::elog!(
+                    "Could not remove old game build {build}: {}",
+                    crate::launcher_log::safe_error(&error.to_string())
+                );
             }
         }
         Ok(())

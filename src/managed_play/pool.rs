@@ -72,10 +72,13 @@ pub(super) fn run_with_progress<T: Sync, S, R: Send>(
         }
         done
     };
+    // Workers log for the operation (a switch's sealing) their caller works for.
+    let op = crate::launcher_log::current();
     let finished = std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for _ in 0..workers.clamp(1, items.len().max(1)) {
             match std::thread::Builder::new().spawn_scoped(scope, || {
+                let _in = crate::launcher_log::enter(&op);
                 catch_unwind(AssertUnwindSafe(&work)).unwrap_or_else(|_| {
                     fail("a worker thread panicked".into());
                     Vec::new()

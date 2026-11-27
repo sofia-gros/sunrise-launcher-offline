@@ -8,6 +8,7 @@ use sunrise_launcher_smod::index_v2::{self, Kind as V2Kind};
 use sunrise_launcher_smod::Package;
 use v2::{install_registry_v2_with, update_registry_v2_with, V2EditRequest, V2Transfer};
 
+mod build_switch;
 #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
 mod native;
 #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]

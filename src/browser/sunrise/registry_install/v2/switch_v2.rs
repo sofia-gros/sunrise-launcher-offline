@@ -147,7 +147,7 @@ pub(crate) fn switch_profile_build_v2_with(
         .active()?
         .map(|active| active.holds().cloned().collect())
         .unwrap_or_default();
-    let Some(edit) = profile.begin_switch(tag)? else {
+    let Some(edit) = profile.begin_switch_cancellable(tag, Some(cancellation))? else {
         if let Some(choice) = choice {
             cancellation.begin_publication()?;
             crate::browser::sunrise::registry_install::switch::save_build_choice(
@@ -177,7 +177,10 @@ pub(crate) fn switch_profile_build_v2_with(
             {
                 // The choice is already durable in active-build.json; listing or
                 // editing the profile recovers instances.json on the next write.
-                crate::elog!("Sunrise: instances.json is not saved: {error}");
+                crate::elog!(
+                    "Sunrise: instances.json is not saved: {}",
+                    crate::launcher_log::safe_error(&error)
+                );
             }
         }
     }

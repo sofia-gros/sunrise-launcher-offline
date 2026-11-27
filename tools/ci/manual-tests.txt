@@ -14,3 +14,4 @@ sunrise-launcher downloads::tests::benchmark_download_pipeline by-hand manual # 
 sunrise-launcher-smod holder::game_entry::tests::write_missing_registration_actor subprocess manual # fixture writer subprocess only
 sunrise-launcher-telemetry payload::tests::what_this_machine_sends by-hand manual # prints what this machine would send; run with --ignored --nocapture
 sunrise-launcher mods::model::tests::benchmark_discover_search by-hand manual # local Discover search benchmark over 600 cards; run with --release --ignored --nocapture
+sunrise-launcher browser::sunrise::registry_install::update_tests::build_switch::capture_fixture by-hand manual # writes a window capture fixture when SUNRISE_CAPTURE_CASE and the fixture root are set; the capture job runs it

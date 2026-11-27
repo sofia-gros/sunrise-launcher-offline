@@ -1950,5 +1950,10 @@
   "Sealing the game files": "Sealing the game files",
   "Checking the game files: {done} of {total}": "Checking the game files: {done} of {total}",
   "Sealing the game files: {done} of {total}": "Sealing the game files: {done} of {total}",
-  "Downloading Minecraft's files: {done} of {total}": "Downloading Minecraft's files: {done} of {total}"
+  "Downloading Minecraft's files: {done} of {total}": "Downloading Minecraft's files: {done} of {total}",
+  "Copying the prepared game files": "Copying the prepared game files",
+  "Copying the prepared game files: {done} of {total}": "Copying the prepared game files: {done} of {total}",
+  "Unpacking the build": "Unpacking the build",
+  "Putting the build in place": "Putting the build in place",
+  "Writing the game's data file": "Writing the game's data file"
 }

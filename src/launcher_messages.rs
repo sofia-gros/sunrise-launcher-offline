@@ -27,6 +27,7 @@ impl Launcher {
 
     pub(crate) fn drain(&mut self, window: gpui::AnyWindowHandle, cx: &mut Context<Self>) {
         let mut changed = self.pull_logs();
+        changed |= self.pull_switch_log();
         self.perf.tick();
         if self.bench.as_ref().is_some_and(perf::Bench::ready_for_idle) {
             // Finish one-time fallback font loading before the benchmark starts its idle sample.
@@ -162,7 +163,9 @@ impl Launcher {
                     }
                 }
                 Msg::PlayDetail(detail) => {
-                    if self.starting_client.is_some() || self.preparing {
+                    // A switch's steps come as SwitchDetail, from its own operation.
+                    if self.starting_client.is_some() || self.preparing || self.installing.is_some()
+                    {
                         self.play_detail = Some(detail);
                     }
                 }
@@ -319,6 +322,7 @@ impl Launcher {
                     }
                 }
                 Msg::SwitchProgress(stage) => self.switch_progress(stage),
+                Msg::SwitchDetail(text) => self.switch_detail(text),
                 Msg::SwitchQuestion(question, reply) => self.switch_question(question, reply),
                 Msg::Switched(home, result) => self.switch_finished(&home, *result),
                 Msg::ProviderSwitchProgress(stage) => self.provider_switch_progress(stage),
@@ -393,6 +397,9 @@ impl Launcher {
                 }
                 Msg::Installed(tag, result) => {
                     self.installing = None;
+                    if self.starting_client.is_none() && !self.preparing {
+                        self.play_detail = None;
+                    }
                     self.bar = (0., 0.);
                     self.refresh_installed();
                     if let Some(warning) = self.record_nightly_receipt_outcome(&tag, &result) {

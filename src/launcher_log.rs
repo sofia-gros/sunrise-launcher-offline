@@ -1,7 +1,7 @@
 //! The launcher's own log: every line goes, scrubbed, to a rotating file in the logs folder and to
 //! an in-memory ring the Logs panel reads. Words in log lines are English: the log is for bug
 //! reports, not for the player to read in their language.
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -24,9 +24,10 @@ const SECRET: &str = "<secret>";
 /// name (`access_token`, `refresh_token`, `id_token` all end in `token`).
 const SECRET_KEYS: [&str; 6] = ["code", "token", "client_secret", "password", "key", "sig"];
 
-/// The newest lines, numbered by the revision at which each was logged.
+/// The newest lines, numbered by the revision at which each was logged, each with the
+/// [`Operation`] it was logged in, if any.
 struct Ring {
-    lines: VecDeque<String>,
+    lines: VecDeque<(Option<u64>, String)>,
     /// How many lines were ever pushed.
     revision: u64,
 }
@@ -39,22 +40,38 @@ impl Ring {
         }
     }
 
+    #[cfg(test)]
     fn push(&mut self, line: String) {
+        self.push_in(None, line);
+    }
+
+    fn push_in(&mut self, operation: Option<u64>, line: String) {
         if self.lines.len() == RING_LINES {
             self.lines.pop_front();
         }
-        self.lines.push_back(line);
+        self.lines.push_back((operation, line));
         self.revision += 1;
     }
 
-    /// The lines after revision `since` that are still kept, and the newest revision.
-    fn since(&self, since: u64) -> (u64, Vec<String>) {
+    /// The lines after revision `since` that are still kept, and the newest revision; only
+    /// those logged in operation `only` when it is given.
+    fn since_in(&self, since: u64, only: Option<u64>) -> (u64, Vec<String>) {
         let first = self.revision - self.lines.len() as u64;
         let skip = since.saturating_sub(first).min(self.lines.len() as u64) as usize;
         (
             self.revision,
-            self.lines.iter().skip(skip).cloned().collect(),
+            self.lines
+                .iter()
+                .skip(skip)
+                .filter(|(operation, _)| only.is_none() || *operation == only)
+                .map(|(_, line)| line.clone())
+                .collect(),
         )
+    }
+
+    #[cfg(test)]
+    fn since(&self, since: u64) -> (u64, Vec<String>) {
+        self.since_in(since, None)
     }
 }
 
@@ -131,6 +148,74 @@ static HIDDEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
 thread_local! {
     /// Whether this thread is inside building the scrubber, which reads the accounts and may log.
     static BUILDING: Cell<bool> = const { Cell::new(false) };
+    /// The operation this thread works for, if any (`Operation::enter`).
+    static CURRENT: RefCell<Option<Operation>> = const { RefCell::new(None) };
+}
+
+static OPERATION_NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// One piece of work the window follows on its own, such as a switch with its download,
+/// preparation and profile change: the lines its threads log carry its id, and its live step
+/// text goes to its own sink. Another job's lines and counts (startup's copy of prepared files,
+/// a Play elsewhere) never reach it. A thread joins with [`Operation::enter`]; a thread it
+/// starts joins by entering [`current`] there.
+#[derive(Clone)]
+pub struct Operation {
+    id: u64,
+    sink: Option<PlayDetailSink>,
+}
+
+impl Operation {
+    /// A new operation whose step text goes to `sink`.
+    pub fn new(sink: impl Fn(String) + Send + Sync + 'static) -> Self {
+        Self {
+            id: OPERATION_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            sink: Some(Arc::new(sink)),
+        }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// This thread works for the operation until the guard is dropped.
+    pub fn enter(&self) -> OperationGuard {
+        let prev = CURRENT.with(|current| current.replace(Some(self.clone())));
+        OperationGuard { prev }
+    }
+}
+
+/// Puts back the operation the thread worked for before [`Operation::enter`].
+pub struct OperationGuard {
+    prev: Option<Operation>,
+}
+
+impl Drop for OperationGuard {
+    fn drop(&mut self) {
+        let prev = self.prev.take();
+        CURRENT.with(|current| *current.borrow_mut() = prev);
+    }
+}
+
+/// The operation this thread works for, to hand to a thread it starts.
+pub fn current() -> Option<Operation> {
+    CURRENT.with(|current| current.borrow().clone())
+}
+
+/// Enters `operation` when there is one: for a thread started by a thread that worked for it.
+pub fn enter(operation: &Option<Operation>) -> Option<OperationGuard> {
+    operation.as_ref().map(Operation::enter)
+}
+
+fn current_id() -> Option<u64> {
+    CURRENT.with(|current| current.borrow().as_ref().map(|op| op.id))
+}
+
+/// Where step text goes from this thread: its operation's sink, else the process-wide one.
+fn detail_sink() -> Option<PlayDetailSink> {
+    CURRENT
+        .with(|current| current.borrow().as_ref().map(|op| op.sink.clone()))
+        .unwrap_or_else(|| lock(&PLAY_DETAIL).as_ref().map(|(_, sink)| sink.clone()))
 }
 
 /// A lock that a panic elsewhere can't turn into a panic here.
@@ -165,7 +250,11 @@ pub fn dir() -> Option<PathBuf> {
 /// One line: "HH:MM:SS.mmm text" (local time, chrono), scrubbed, into the ring and the file.
 /// Multi-line text becomes several lines. Never panics; a file error is ignored after the first.
 pub fn line(text: impl AsRef<str>) {
-    let text = scrub(text.as_ref());
+    line_in(current_id(), text.as_ref());
+}
+
+fn line_in(operation: Option<u64>, text: &str) {
+    let text = scrub(text);
     let stamp = chrono::Local::now().format("%H:%M:%S%.3f");
     let mut file = lock(&FILE);
     for text in text.lines() {
@@ -173,7 +262,7 @@ pub fn line(text: impl AsRef<str>) {
         if let Some(file) = file.as_mut() {
             file.write(&line);
         }
-        lock(&RING).push(line);
+        lock(&RING).push_in(operation, line);
     }
 }
 
@@ -212,11 +301,11 @@ pub fn play_detail(text: impl Into<String>) {
     play_detail_ui_only(text);
 }
 
-/// Sends a Play step line to the window without adding another `launcher.log` line.
+/// Sends a Play step line to the window without adding another `launcher.log` line: to this
+/// thread's operation when it works for one, else to the process-wide sink.
 pub fn play_detail_ui_only(text: impl Into<String>) {
     let text = text.into();
-    let sink = lock(&PLAY_DETAIL).as_ref().map(|(_, sink)| sink.clone());
-    if let Some(sink) = sink {
+    if let Some(sink) = detail_sink() {
         sink(text);
     }
 }
@@ -225,15 +314,17 @@ pub fn play_detail_ui_only(text: impl Into<String>) {
 /// and `launcher.log` gets a line at most every ~2 s without flooding either.
 pub struct PlayMeter {
     sink: Option<PlayDetailSink>,
+    /// The operation of the thread that made it: its workers' counts are that operation's.
+    operation: Option<u64>,
     format: fn(usize, usize) -> String,
     state: Mutex<(Option<Instant>, Option<Instant>, usize)>,
 }
 
 impl PlayMeter {
     pub fn new(format: fn(usize, usize) -> String) -> Self {
-        let sink = lock(&PLAY_DETAIL).as_ref().map(|(_, sink)| sink.clone());
         Self {
-            sink,
+            sink: detail_sink(),
+            operation: current_id(),
             format,
             state: Mutex::new((None, None, 0)),
         }
@@ -273,7 +364,7 @@ impl PlayMeter {
         }
         let text = (self.format)(shown, total);
         if emit_log {
-            line(&text);
+            line_in(self.operation, &text);
         }
         if emit_ui {
             if let Some(sink) = &self.sink {
@@ -322,13 +413,24 @@ impl Step {
         ));
     }
 
+    /// The step stopped because the player cancelled it.
+    pub fn cancelled(mut self) {
+        self.finished = true;
+        line(format!(
+            "{}: cancelled after {}",
+            self.what,
+            duration_text(self.started.elapsed())
+        ));
+    }
+
+    /// Logs `why` only as [`safe_error`]'s category: none of its text is kept.
     pub fn failed(mut self, why: impl AsRef<str>) {
         self.finished = true;
         line(format!(
             "{}: failed after {}: {}",
             self.what,
             duration_text(self.started.elapsed()),
-            why.as_ref()
+            safe_error(why.as_ref())
         ));
     }
 }
@@ -356,7 +458,76 @@ fn duration_text(elapsed: Duration) -> String {
 /// The ring (newest 5000 lines): the lines after revision `since`, and the newest revision.
 /// Revision counts every line ever logged, so a reader at revision r asks `since(r)`.
 pub fn since(since: u64) -> (u64, Vec<String>) {
-    lock(&RING).since(since)
+    lock(&RING).since_in(since, None)
+}
+
+/// [`since`], only the lines logged in operation `id`.
+pub fn since_in(since: u64, id: u64) -> (u64, Vec<String>) {
+    lock(&RING).since_in(since, Some(id))
+}
+
+/// What `launcher.log` and the ring keep of a launcher-generated line about preparation: the line
+/// itself, or a fixed note when it names a file, an address, or spans multiple lines. Raw child
+/// stdout and stderr stay in the local diagnostics view and do not pass through here.
+pub fn preparer_line(line: &str) -> String {
+    format!("Preparing: {}", without_paths(line))
+}
+
+/// `line` as the log keeps a launcher-generated line about preparing or downloading a build's
+/// files: as it is, or a fixed note when it has a path separator, line break, or address in it
+/// (see [`preparer_line`]).
+pub fn without_paths(line: &str) -> &str {
+    if line.contains(['/', '\\', '\n', '\r']) || line.contains("://") {
+        "(a line that names a file or an address, left out of the log)"
+    } else {
+        line
+    }
+}
+
+/// An error's text as the log keeps it: a fixed category and, when the text has one, its OS
+/// error code or HTTP status (`entity not found (os error 2)`, `HTTP 404`). Nothing else of the
+/// text reaches `launcher.log` or the ring: an error's words can hold a local path with any
+/// spaces or punctuation in it (`/home/ada/Private Client Backup/drafts`) or an address, and no
+/// rule can tell where such a path ends (review of #615). The window's error view keeps the whole
+/// text, and the step's own name says what failed.
+pub fn safe_error(text: &str) -> String {
+    let text = text.trim();
+    if text == crate::native_mods::CANCELLED || text == crate::downloads::CANCELLED {
+        return "cancelled".into();
+    }
+    if text.ends_with(" is already being prepared.") {
+        return "the build is already being prepared".into();
+    }
+    if let Some(code) = os_error(text) {
+        let kind = std::io::Error::from_raw_os_error(code).kind();
+        return format!("{kind} (os error {code})");
+    }
+    if let Some(status) = http_status(text) {
+        return format!("HTTP {status}");
+    }
+    "an error with no OS error code or HTTP status (its text stays out of the log)".into()
+}
+
+/// The code of the last `(os error N)` in `text`, as Rust's I/O errors write it.
+fn os_error(text: &str) -> Option<i32> {
+    const MARK: &str = "(os error ";
+    let at = text.rfind(MARK)? + MARK.len();
+    let digits = &text[at..text[at..].find(')')? + at];
+    digits.trim().parse().ok()
+}
+
+/// An HTTP status after `answered`, `status` or `HTTP`, as the launcher's downloads write it
+/// (`… answered 404 Not Found`, `status 404`).
+fn http_status(text: &str) -> Option<u16> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    words.windows(2).find_map(|pair| {
+        let lead = pair[0].trim_end_matches(':').to_ascii_lowercase();
+        let number = pair[1].trim_end_matches([',', '.', ':', ';', ')']);
+        (matches!(lead.as_str(), "answered" | "status" | "http") && number.len() == 3)
+            .then(|| number.parse().ok())
+            .flatten()
+            .filter(|status| (100..600).contains(status))
+    })
 }
 
 /// Hide `term` from now on (an account name, a server address). Terms under 3 chars ignored.
@@ -593,6 +764,97 @@ mod tests {
     }
 
     #[test]
+    fn an_operation_sees_only_its_own_lines_and_counts_even_from_its_workers() {
+        let (rev, _) = since(u64::MAX);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let op = Operation::new({
+            let seen = seen.clone();
+            move |text| lock(&seen).push(text)
+        });
+        // Another job's line and step text, outside the operation, while it runs.
+        line("startup: copying another build's files");
+        {
+            let _in = op.enter();
+            line("switch: started");
+            play_detail_ui_only("Preparing the game");
+            let meter = PlayMeter::new(|done, total| format!("Copying: {done} of {total}"));
+            let handed = current();
+            std::thread::spawn(move || {
+                let _in = enter(&handed);
+                line("switch: a worker's line");
+            })
+            .join()
+            .unwrap();
+            std::thread::scope(|scope| {
+                scope.spawn(|| meter.tick(1, 2));
+            });
+        }
+        line("startup: done");
+        let (_, mine) = since_in(rev, op.id());
+        let text: Vec<&str> = mine.iter().map(|l| l.split_once(' ').unwrap().1).collect();
+        assert_eq!(
+            text,
+            [
+                "switch: started",
+                "switch: a worker's line",
+                "Copying: 1 of 2"
+            ]
+        );
+        assert_eq!(*lock(&seen), ["Preparing the game", "Copying: 1 of 2"]);
+        assert!(
+            current().is_none(),
+            "the thread works for nothing once the guard drops"
+        );
+    }
+
+    /// None of an error's words reach the log, only its kind: a Unix path with several spaces
+    /// in a folder's name, a Windows one with spaces and a drive letter, a UNC path and an
+    /// address with credentials (review of #615).
+    #[test]
+    fn a_logged_error_keeps_its_kind_and_none_of_its_text() {
+        let private = [
+            "ada", "Ada", "Private", "Client", "Backup", "drafts", "hunter2", "nas",
+        ];
+        let cases = [
+            (
+                "/home/ada/Private Client Backup/drafts/dev-1/a.tar.gz: No such file or directory (os error 2)",
+                format!("{} (os error 2)", std::io::Error::from_raw_os_error(2).kind()),
+            ),
+            (
+                r"C:\Users\Ada Lovelace\Private Client Backup\drafts\a.tar.gz: Access is denied. (os error 5)",
+                format!("{} (os error 5)", std::io::Error::from_raw_os_error(5).kind()),
+            ),
+            (
+                r"\\nas\Private Client Backup\drafts: (os error 53)",
+                format!("{} (os error 53)", std::io::Error::from_raw_os_error(53).kind()),
+            ),
+            (
+                "https://ada:hunter2@github.com/sunrise-org/Private Client Backup/a.tar.gz answered 404 Not Found",
+                "HTTP 404".into(),
+            ),
+            (
+                "Could not read /home/ada/Private Client Backup/drafts, it's gone",
+                "an error with no OS error code or HTTP status (its text stays out of the log)".into(),
+            ),
+        ];
+        for (error, logged) in cases {
+            let safe = safe_error(error);
+            assert_eq!(safe, logged, "{error}");
+            for word in private {
+                assert!(
+                    !safe.contains(word),
+                    "{word:?} of {error:?} logged as {safe:?}"
+                );
+            }
+        }
+        assert_eq!(safe_error(crate::native_mods::CANCELLED), "cancelled");
+        assert_eq!(
+            safe_error("Sunrise dev-2026-11-25-bbbbbbb is already being prepared."),
+            "the build is already being prepared"
+        );
+    }
+
+    #[test]
     fn since_returns_only_newer_lines_and_the_ring_keeps_the_newest() {
         let mut ring = Ring::new();
         for n in 0..3 {
@@ -672,6 +934,21 @@ mod tests {
             .collect();
         assert_eq!(found.len(), 1, "{lines:?}");
         assert!(!found[0].contains("Steve_Prepare"), "{found:?}");
+    }
+
+    #[test]
+    fn without_paths_leaves_out_multiline_text() {
+        let multiline = "Public\nPrivate Client Backup\nSuffix";
+        assert!(
+            without_paths(multiline).contains("left out of the log"),
+            "{}",
+            without_paths(multiline)
+        );
+        assert!(
+            without_paths("line1\rline2").contains("left out of the log"),
+            "{}",
+            without_paths("line1\rline2")
+        );
     }
 
     static DETAIL_TEST_LOCK: Mutex<()> = Mutex::new(());

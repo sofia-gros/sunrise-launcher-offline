@@ -144,7 +144,10 @@ impl Launcher {
             match backend::switch_from_auto(&home, api) {
                 Ok(changed) => switched |= changed,
                 Err(e) => {
-                    sunrise_launcher::elog!("Sunrise launcher: could not switch to {label}: {e}")
+                    sunrise_launcher::elog!(
+                        "Sunrise launcher: could not switch to {label}: {}",
+                        sunrise_launcher::launcher_log::safe_error(&e.to_string())
+                    )
                 }
             }
         }
@@ -198,7 +201,16 @@ impl Launcher {
         self.install_started = Some(Instant::now());
         self.bar = (0., 0.);
         self.install_error = None;
+        // The steps after the download say what they do, and their counts (#607): into a
+        // switch's own log and dialog when the install is a switch's, else to Home's line.
+        let op = self.switch_operation(&tag).unwrap_or_else(|| {
+            let tx = tx.clone();
+            sunrise_launcher::launcher_log::Operation::new(move |text| {
+                let _ = tx.send(Msg::PlayDetail(text));
+            })
+        });
         std::thread::spawn(move || {
+            let _in = op.enter();
             let progress = |p| {
                 let _ = tx.send(Msg::Progress(tag.clone(), p));
             };
@@ -237,23 +249,49 @@ impl Launcher {
         self.prepare_log
             .push_back("Checking Java and your Minecraft install".into());
         let tx = self.tx.clone();
+        // A switch's preparation logs into the switch's own operation, its child output too;
+        // one started on its own counts its steps on Home's line.
+        let op = self.switch_operation(&tag).or_else(|| {
+            let tx = self.tx.clone();
+            Some(sunrise_launcher::launcher_log::Operation::new(
+                move |text| {
+                    let _ = tx.send(Msg::PlayDetail(text));
+                },
+            ))
+        });
         // The checks may download the server jar, so they run on the thread too.
         std::thread::spawn(move || {
+            let _in = sunrise_launcher::launcher_log::enter(&op);
             let log = |line: String| {
-                sunrise_launcher::launcher_log::line(format!("Preparing: {line}"));
+                sunrise_launcher::launcher_log::line(
+                    sunrise_launcher::launcher_log::preparer_line(&line),
+                );
+                let _ = tx.send(Msg::Line(Job::Prepare, line));
+            };
+            let diagnostics = |line: String| {
                 let _ = tx.send(Msg::Line(Job::Prepare, line));
             };
             let result = (|| {
                 let lock = backend::prepare_lock(&tag)?;
                 let (cmd, minecraft) = match &stop {
-                    Some(stop) => {
-                        backend::preparer_cancellable(&tag, &minecraft, from, &log, &lock, stop)?
+                    Some(stop) => backend::preparer_cancellable(
+                        &tag,
+                        &minecraft,
+                        from,
+                        &log,
+                        &diagnostics,
+                        &lock,
+                        stop,
+                    )?,
+                    None => {
+                        backend::preparer_with(&tag, &minecraft, from, &log, &diagnostics, &lock)?
                     }
-                    None => backend::preparer(&tag, &minecraft, from, &log, &lock)?,
                 };
                 match &stop {
-                    Some(stop) => backend::sounds_cancellable(&tag, &minecraft, &log, &lock, stop),
-                    None => backend::sounds(&tag, &minecraft, &log, &lock),
+                    Some(stop) => {
+                        backend::sounds_cancellable(&tag, &minecraft, &diagnostics, &lock, stop)
+                    }
+                    None => backend::sounds(&tag, &minecraft, &diagnostics, &lock),
                 }
                 backend::set_prepare_step(backend::PrepareStep::Prepare);
                 backend::spawn_holding_cancellable(

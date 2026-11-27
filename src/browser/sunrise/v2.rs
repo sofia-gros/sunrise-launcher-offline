@@ -37,8 +37,16 @@ const STATE_FILE: &str = "state.json";
 pub const PRODUCTION_KEY: &str = "RWTNJaFJ4AekHG/RgVrgmJpvy9B2EaeqbdSNuseKUx2XPxaOZkChLV0q";
 
 /// Built-in minisign public keys trusted to sign the v2 mod registry catalogue.
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "capture-registry-key")))]
 pub const REGISTRY_KEYS: &[&str] = &[PRODUCTION_KEY];
+
+/// A capture build (window screenshots against fixture data) trusts only the disposable key it
+/// was built with, never the production one, so it can't be mistaken for a player's launcher.
+#[cfg(all(not(test), feature = "capture-registry-key"))]
+pub const REGISTRY_KEYS: &[&str] = &[env!("SUNRISE_CAPTURE_REGISTRY_KEY")];
+
+#[cfg(all(feature = "capture-registry-key", not(debug_assertions)))]
+compile_error!("capture-registry-key is for debug capture builds only, never a release build");
 
 /// Disposable test-only minisign public key; never compiled into non-test builds.
 #[cfg(test)]

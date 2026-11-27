@@ -31,8 +31,6 @@ pub(crate) struct State {
     focused: bool,
     /// The build chosen in the list, before it is kept.
     pick: Option<String>,
-    /// The same-channel update that opened the list, if any. It does not pin the chosen build.
-    update: Option<String>,
     preview: Option<FitPreview>,
     /// The list's scroll, which the arrow keys move to the row they land on.
     scroll: gpui::UniformListScrollHandle,
@@ -239,7 +237,6 @@ impl Launcher {
         let v = &mut self.ui.sheets.versions;
         v.find.set(String::new());
         v.pick = pinned;
-        v.update = None;
         v.preview = None;
         v.rows.clear();
     }
@@ -253,12 +250,6 @@ impl Launcher {
     pub(super) fn versions_sheet(&mut self, cx: &mut Context<Self>) -> Stateful<Div> {
         let body = self.versions_content(cx);
         frame("alt-versions", 560., body, cx)
-    }
-
-    pub(crate) fn open_update_picker(&mut self, tag: String) {
-        self.open_versions();
-        self.ui.sheets.versions.update = Some(tag.clone());
-        self.ui.sheets.versions.pick = Some(tag);
     }
 
     fn architecture_repair(&self, tag: &str) -> Option<&Release> {
@@ -305,8 +296,8 @@ impl Launcher {
         let list = Rc::new(self.version_lines(instance, current));
         let list_height = self.versions_list_height(list.len());
         let pick = self.ui.sheets.versions.pick.clone();
-        let is_update = pick.is_some() && pick == self.ui.sheets.versions.update;
-        let choice = (!is_update || instance.version.is_some()).then_some(BuildChoice::Keep);
+        // Picked by hand, so it is kept: Update game moves a following profile on by itself.
+        let choice = Some(BuildChoice::Keep);
         let already_kept = instance.version.as_deref() == current;
 
         let focus = self
@@ -626,7 +617,7 @@ impl Launcher {
                     .children(nothing),
             )
             .children(
-                (!is_pack && !is_update && pick.is_some())
+                (!is_pack && pick.is_some())
                     .then(|| muted(tr("This profile stays on this build until you change it."))),
             )
             .children(plan.map(muted))
