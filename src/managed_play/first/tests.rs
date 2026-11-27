@@ -883,19 +883,62 @@ fn a_pointer_written_by_the_released_launcher_is_read_and_kept() {
 fn edits_switch_and_copies_still_hash_the_prepared_files_and_refuse_damage() {
     use crate::managed_play::FULL_VERIFICATIONS;
     const CASE: &str = "managed_play::first::tests::edits_switch_and_copies_still_hash_the_prepared_files_and_refuse_damage";
-    if std::env::var_os("NON_PLAY_HASH_FIXTURE").is_none() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = backend::plain(temp.path().canonicalize().unwrap());
-        assert!(Command::new(std::env::current_exe().unwrap())
+    const FIXTURE: &str = "NON_PLAY_HASH_FIXTURE";
+    let Some(fixture) = std::env::var_os(FIXTURE) else {
+        let root = tempfile::Builder::new()
+            .prefix("non-play-hash-")
+            .tempdir()
+            .unwrap();
+        fs::write(root.path().join("fixture"), CASE).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", CASE, "--nocapture"])
-            .env("NON_PLAY_HASH_FIXTURE", "1")
-            .env("SUNRISE_HOME", root.join("game"))
-            .env("SUNRISE_LAUNCHER_HOME", root.join("launcher"))
-            .env("XDG_CONFIG_HOME", root.join("config"))
-            .status()
-            .unwrap()
-            .success());
+            .env(FIXTURE, root.path())
+            .env("SUNRISE_HOME", root.path().join("game"))
+            .env("SUNRISE_LAUNCHER_HOME", root.path().join("launcher"))
+            .env(
+                "SUNRISE_LAUNCHER_LOCATION_FILE",
+                root.path().join("location"),
+            )
+            .env("SUNRISE_NO_KEYCHAIN", "1")
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success()
+                && stdout
+                    .lines()
+                    .any(|line| line.starts_with("test result: ok. 1 passed;")),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(&*root.path().to_string_lossy()));
         return;
+    };
+    let fixture = std::path::PathBuf::from(fixture);
+    let canonical = fixture.canonicalize().unwrap();
+    assert_eq!(
+        canonical.parent().unwrap(),
+        std::env::temp_dir().canonicalize().unwrap()
+    );
+    assert!(canonical
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("non-play-hash-"));
+    assert_eq!(fs::read_to_string(fixture.join("fixture")).unwrap(), CASE);
+    for (var, name) in [
+        ("SUNRISE_HOME", "game"),
+        ("SUNRISE_LAUNCHER_HOME", "launcher"),
+        ("SUNRISE_LAUNCHER_LOCATION_FILE", "location"),
+        ("XDG_CONFIG_HOME", "config"),
+    ] {
+        let path = fixture.join(name);
+        assert_eq!(std::env::var_os(var).as_deref(), Some(path.as_os_str()));
+        assert_eq!(
+            fs::symlink_metadata(path).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
     }
     let home = backend::game_home();
     fs::create_dir_all(&home).unwrap();
@@ -912,9 +955,10 @@ fn edits_switch_and_copies_still_hash_the_prepared_files_and_refuse_damage() {
         .commit(BUILD, &native_mods::Cancellation::default())
         .unwrap();
     fs::write(active.resource_path().join("fixture-blob.bin"), b"tampered").unwrap();
-    let prefix = format!("{}: ", active.resource_path().display());
+    let prefix =
+        "Sunrise couldn't verify the profile's saved game build (managed_play/resources.rs:";
     let counted = |what: &str, error: String| {
-        assert!(error.starts_with(&prefix), "{what}: {error}");
+        assert!(error.starts_with(prefix), "{what}: {error}");
         assert_eq!(
             FULL_VERIFICATIONS.take(),
             1,
