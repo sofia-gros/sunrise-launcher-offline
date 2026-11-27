@@ -23,14 +23,13 @@ impl Profile {
         command: Command,
         piped: bool,
     ) -> Result<(Child, RuntimeGuard), String> {
-        let selection = validate_selection(self.home(), &active.resource_path(), &command)?;
         self.spawn_selected(
             active,
             cancellation,
-            (command, selection),
+            command,
             &[],
             piped,
-            |_| Ok(()),
+            (|_| Ok(()), |_| Ok(())),
         )
         .map_err(String::from)
     }
@@ -65,17 +64,20 @@ impl Profile {
         before_spawn: impl FnOnce(&mut Command) -> Result<(), StartError>,
     ) -> Result<(Child, RuntimeGuard), StartError> {
         let wrapper = crate::launch::managed_wrapper(&mut command, launch);
-        let selection = validate_selection(self.home(), &active.resource_path(), &command)?;
-        prepare_jars(&command)?;
-        crate::launch::managed_pre_launch(&command, launch, piped, hook_log)
-            .map_err(StartError::Hook)?;
         self.spawn_selected(
             active,
             cancellation,
-            (command, selection),
+            command,
             &wrapper,
             piped,
-            before_spawn,
+            (
+                |command| {
+                    prepare_jars(command)?;
+                    crate::launch::managed_pre_launch(command, launch, piped, hook_log)
+                        .map_err(StartError::Hook)
+                },
+                before_spawn,
+            ),
         )
     }
 
@@ -83,13 +85,18 @@ impl Profile {
         &self,
         active: &Active,
         cancellation: &Cancellation,
-        selected: (Command, LaunchArguments),
+        command: Command,
         wrapper: &[std::ffi::OsString],
         piped: bool,
-        before_spawn: impl FnOnce(&mut Command) -> Result<(), StartError>,
+        (pre_launch, before_spawn): (
+            impl FnOnce(&Command) -> Result<(), StartError>,
+            impl FnOnce(&mut Command) -> Result<(), StartError>,
+        ),
     ) -> Result<(Child, RuntimeGuard), StartError> {
         self.verified_handoff(active, cancellation, |profile| {
-            let (command, selection) = selected;
+            let selection = validate_selection(self.home(), &active.resource_path(), &command)?;
+            pre_launch(&command)?;
+            cancellation.check()?;
             let (mut command, runtime) = prepare(self.home(), active, command)?;
             let data = backend::data_dir();
             let data = data

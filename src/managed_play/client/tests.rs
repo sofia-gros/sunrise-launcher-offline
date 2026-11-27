@@ -1019,6 +1019,30 @@ fn play_hashes_the_prepared_files_once_and_still_refuses_damage() {
     snapshot_error(&active, result.unwrap_err());
     assert_eq!((spawned.get(), at_handoff), (false, 1));
 
+    let failing_hook = crate::launch::Launch {
+        pre_launch: "exit 23".into(),
+        ..Default::default()
+    };
+    let try_hook = || {
+        let mut command = Command::new(build.join(backend::CLIENT));
+        command
+            .current_dir(&home)
+            .env("SUNRISE_HOME", &home)
+            .arg("--game-dir")
+            .arg(&home)
+            .arg("--resources")
+            .arg(active.resource_path());
+        profile.spawn_configured(&active, &cancellation, command, &failing_hook, true)
+    };
+    let error = try_hook().err().expect("damaged snapshot launched");
+    assert!(matches!(error, StartError::Other(_)), "{error:?}");
+    snapshot_error(&active, error.into());
+    assert_eq!(FULL_VERIFICATIONS.take(), 1);
+    fs::write(&blob, BLOB).unwrap();
+    assert!(matches!(try_hook(), Err(StartError::Hook(_))));
+    assert_eq!(FULL_VERIFICATIONS.take(), 1);
+    fs::write(&blob, b"tampered bytes").unwrap();
+
     // Mod recovery still hashes the files itself, and refuses in its own words.
     let recovery = ModRecovery {
         build: Arc::new(FailedBuild {
