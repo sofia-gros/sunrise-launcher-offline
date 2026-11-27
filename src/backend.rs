@@ -551,8 +551,80 @@ pub fn get_bytes(url: &str) -> Result<Vec<u8>, String> {
     Ok(body)
 }
 
+/// Strip userinfo, query parameters, and fragments from a URL before printing it in an error.
+fn redact_url(raw: &str) -> String {
+    if let Ok(mut parsed) = url::Url::parse(raw) {
+        let _ = parsed.set_username("");
+        let _ = parsed.set_password(None);
+        parsed.set_query(None);
+        parsed.set_fragment(None);
+        return parsed.to_string();
+    }
+    let before_qf = raw.split(['?', '#']).next().unwrap_or(raw);
+    if let Some((scheme, rest)) = before_qf.split_once("://") {
+        let (authority, tail) = match rest.find('/') {
+            Some(slash) => (&rest[..slash], &rest[slash..]),
+            None => (rest, ""),
+        };
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        format!("{scheme}://{host}{tail}")
+    } else {
+        before_qf.to_owned()
+    }
+}
+
+fn redact_urls_in_text(text: &str) -> String {
+    const SCHEMES: [&str; 6] = [
+        "https://",
+        "http://",
+        "socks5h://",
+        "socks5://",
+        "socks4a://",
+        "socks4://",
+    ];
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some((pos, scheme)) = SCHEMES
+        .iter()
+        .filter_map(|&scheme| rest.find(scheme).map(|pos| (pos, scheme)))
+        .min_by_key(|&(pos, _)| pos)
+    {
+        out.push_str(&rest[..pos]);
+        let tail = &rest[pos..];
+        let mut end = scheme.len();
+        let bytes = tail.as_bytes();
+        while end < bytes.len() {
+            let b = bytes[end];
+            if b.is_ascii_whitespace()
+                || matches!(b, b'"' | b'\'' | b'<' | b'>' | b')' | b']')
+                || (b == b':' && bytes.get(end + 1) == Some(&b' '))
+            {
+                break;
+            }
+            end += 1;
+        }
+        out.push_str(&redact_url(&tail[..end]));
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn redact_transport(url: &str, transport: &ureq::Transport) -> String {
+    let rendered = transport.to_string();
+    let redacted = redact_url(url);
+    let replaced = if url.is_empty() {
+        rendered
+    } else {
+        rendered.replace(url, &redacted)
+    };
+    redact_urls_in_text(&replaced)
+}
+
 pub(crate) fn get(url: &str) -> Result<ureq::Response, String> {
-    get_unless_missing(url)?.ok_or_else(|| format!("{url} answered 404"))
+    get_unless_missing(url)?.ok_or_else(|| format!("{} answered 404", redact_url(url)))
 }
 
 /// [`get`], with `None` when the server answers 404: a file that may not exist (a prebuilt game).
@@ -577,8 +649,8 @@ pub(crate) fn get_unless_missing(url: &str) -> Result<Option<ureq::Response>, St
             {
                 "GitHub's rate limit was reached. Try again in a few minutes.".into()
             }
-            ureq::Error::Status(code, _) => format!("{url} answered {code}"),
-            ureq::Error::Transport(t) => format!("No connection: {t}"),
+            ureq::Error::Status(code, _) => format!("{} answered {code}", redact_url(url)),
+            ureq::Error::Transport(t) => format!("No connection: {}", redact_transport(url, &t)),
         }),
     }
 }
@@ -10695,6 +10767,69 @@ esac"#
         let text = String::from(error);
         assert_ne!(text, crate::native_mods::CANCELLED);
         assert!(text.contains("disk read failed"), "{text}");
+    }
+
+    #[test]
+    fn http_errors_strip_url_userinfo_query_and_fragment() {
+        assert_eq!(
+            redact_url("https://alice:s3cr3t@example.invalid:8443/sdk/v1?token=tok123#frag"),
+            "https://example.invalid:8443/sdk/v1"
+        );
+        assert_eq!(
+            redact_url("http://token-only@example.invalid/file?sig=abc"),
+            "http://example.invalid/file"
+        );
+        assert_eq!(
+            redact_urls_in_text(
+                "https://alice:s3cr3t@example.invalid/sdk/v1?token=tok123#frag: Connection Failed via socks5h://bob:pw@127.0.0.1:1080"
+            ),
+            "https://example.invalid/sdk/v1: Connection Failed via socks5h://127.0.0.1:1080"
+        );
+
+        // Live loopback checks for 404 (`get`), 403 (`get_unless_missing`, non-retried), and a
+        // refused transport error through `redact_transport`.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for response in [
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            ] {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf);
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            }
+        });
+        let secret_url = format!("http://alice:s3cr3t@{addr}/sdk/file?token=tok123#frag");
+        let err_404 = get(&secret_url).err().expect("404 must fail");
+        let err_403 = get_unless_missing(&secret_url)
+            .err()
+            .expect("403 must fail");
+        server.join().unwrap();
+        let err_transport = match ureq::AgentBuilder::new().build().get(&secret_url).call() {
+            Err(ureq::Error::Transport(t)) => {
+                format!("No connection: {}", redact_transport(&secret_url, &t))
+            }
+            _ => panic!("closed listener must fail with transport error"),
+        };
+        for error in [&err_404, &err_403, &err_transport] {
+            for secret in ["alice", "s3cr3t", "tok123", "frag"] {
+                assert!(!error.contains(secret), "{secret} leaked in {error}");
+            }
+            assert!(
+                error.contains(&format!("http://{addr}/sdk/file")),
+                "expected safe origin/path in {error}"
+            );
+        }
+        assert!(err_404.contains("404"), "{err_404}");
+        assert!(err_403.contains("403"), "{err_403}");
+        assert!(
+            err_transport.starts_with("No connection: "),
+            "{err_transport}"
+        );
     }
 }
 
