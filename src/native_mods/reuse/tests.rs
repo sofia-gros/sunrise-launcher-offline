@@ -733,8 +733,8 @@ fn in_child(test: &str, child: &str) -> bool {
         return true;
     }
     let home = tempfile::tempdir().unwrap();
-    let status = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", test, "--nocapture"])
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--include-ignored", "--nocapture"])
         .env(child, "1")
         .env("SUNRISE_LAUNCHER_HOME", home.path().join("launcher"))
         .env("SUNRISE_HOME", home.path().join("home"))
@@ -749,9 +749,18 @@ fn in_child(test: &str, child: &str) -> bool {
         .env_remove(sdk_cache::BASE_VAR)
         .env_remove(sdk_cache::DEVELOPER_SDK)
         .env_remove(sdk_cache::DEVELOPER_TOOL)
-        .status()
+        .output()
         .unwrap();
-    assert!(status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("1 passed; 0 failed"),
+        "child did not run {test}: {stdout}"
+    );
     false
 }
 
@@ -898,6 +907,251 @@ fn the_default_build_uses_the_slot_with_the_planned_image() {
         Some(next.as_str()),
         "planning admitted the matching image"
     );
+}
+
+#[test]
+fn switching_mixins_source_mode_selects_a_different_image() {
+    if !in_child(
+        "native_mods::reuse::tests::switching_mixins_source_mode_selects_a_different_image",
+        "SUNRISE_REUSE_MIXINS_MODE_CHILD",
+    ) {
+        return;
+    }
+    let set = Set::new("reuse-mode-switch");
+    let options = BuildOptions::default();
+    let release = set.install(&options);
+    assert_eq!(set.found().as_deref(), Some(release.as_str()));
+
+    mixins_from_source(true);
+    assert!(
+        set.found().is_none(),
+        "an ordinary image cannot prove a source build"
+    );
+    let source = set.install(&options);
+    assert_ne!(release, source);
+    assert_eq!(set.found().as_deref(), Some(source.as_str()));
+
+    mixins_from_source(false);
+    assert_eq!(set.found().as_deref(), Some(release.as_str()));
+    fs::remove_dir_all(backend::version_dir(release.as_str())).unwrap();
+    assert!(
+        set.found().is_none(),
+        "a source image cannot prove an ordinary build"
+    );
+}
+
+#[test]
+fn a_missing_developer_manifest_does_not_expose_its_path() {
+    if !in_child(
+        "native_mods::reuse::tests::a_missing_developer_manifest_does_not_expose_its_path",
+        "SUNRISE_REUSE_MANIFEST_ERROR_CHILD",
+    ) {
+        return;
+    }
+    for (shape, private_component) in [
+        ("home/private-unix-account/checkout", "private-unix-account"),
+        (
+            r"Users\private-windows-account\checkout",
+            "private-windows-account",
+        ),
+    ] {
+        let scratch = tempfile::tempdir().unwrap();
+        let folder = scratch.path().join(shape);
+        let failed = logged(&Cancellation::default(), &|| {}, |_| {
+            Chosen::select(Some(&folder), None, || unreachable!())
+        })
+        .unwrap_err();
+        let log = fs::read_to_string(super::super::build_log::log_path()).unwrap();
+        for text in [failed.to_string(), log] {
+            assert!(text.contains(PREBUILT_IDENTITY), "{text}");
+            assert!(
+                text.contains(&std::io::ErrorKind::NotFound.to_string()),
+                "{text}"
+            );
+            assert!(!text.contains(private_component), "{text}");
+        }
+    }
+}
+
+#[test]
+fn occupied_unproved_slots_refuse_with_a_fixed_build_reason() {
+    if !in_child(
+        "native_mods::reuse::tests::occupied_unproved_slots_refuse_with_a_fixed_build_reason",
+        "SUNRISE_REUSE_EXHAUSTED_CHILD",
+    ) {
+        return;
+    }
+    let set = Set::new("reuse-exhausted");
+    let options = BuildOptions::default();
+    let plan = derive(&set.request(&options), &set.copies()).unwrap();
+    let digests = scan_bundles(&set.folder)
+        .unwrap()
+        .iter()
+        .map(|bundle| (bundle.manifest.id.clone(), source_digest(bundle)))
+        .collect();
+    let contents = Contents {
+        revision: &plan.revision,
+        origin: &plan.origin,
+        mixins: &plan.mixins,
+        profile: Profile::Optimized,
+        kept: &plan.mods,
+        digests: &digests,
+        left_out: &plan.left_out,
+    };
+    let paths: Vec<_> = versions(&plan.version)
+        .map(|version| Target::Client.directory(&version))
+        .collect();
+    assert_eq!(paths.len(), 8);
+    for folder in &paths {
+        fs::create_dir_all(folder).unwrap();
+    }
+    crate::launcher_log::init(&set.root);
+    let (before, _) = crate::launcher_log::since(0);
+    assert!(installable(&plan.version, &contents, &plan.image).is_err());
+    let (_, lines) = crate::launcher_log::since(before);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].ends_with("Native build refused: no vacant or proved installed image slot"));
+    for folder in paths {
+        assert!(fs::read_dir(folder).unwrap().next().is_none());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "daily; build the launcher binary first"]
+fn verified_native_publication_seals_once_and_reuses_without_the_tool() {
+    use std::os::unix::fs::PermissionsExt;
+    if !in_child(
+        "native_mods::reuse::tests::verified_native_publication_seals_once_and_reuses_without_the_tool",
+        "SUNRISE_REUSE_FIRST_SEAL_CHILD",
+    ) {
+        return;
+    }
+    const DEVELOPER: &str = "developer-first-seal";
+    let developer = format!(r#"{{"revision":"{PINNED}"}}"#);
+    let instance = install_base(DEVELOPER, &[("developer.json", developer)]);
+    let mut set = Set::developer("reuse-first-seal", DEVELOPER);
+    set.against("fixture package");
+    let sdk = set.local_sdk.as_deref().unwrap();
+    let runtime = sdk.join("runtime/bin");
+    fs::create_dir_all(&runtime).unwrap();
+    fs::write(runtime.join(backend::CLIENT), game_executable()).unwrap();
+    for id in ["alpha", "beta"] {
+        fs::write(set.folder.join(id).join("Cargo.lock"), b"version = 4\n").unwrap();
+    }
+    // Use local fixture inputs throughout: neither a Rust download nor a system linker probe
+    // should be needed to exercise launcher publication of the SDK's verified outputs.
+    let host = rust_toolchain::host().unwrap();
+    let rust = rust_toolchain::root().join(format!("{}-{}", rust_toolchain::VERSION, host.target));
+    fs::create_dir_all(&rust).unwrap();
+    fs::write(rust.join(".installed"), b"").unwrap();
+    for name in ["cc", "pkg-config"] {
+        let program = set.root.join(name);
+        fs::write(&program, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        [set.root.clone()]
+            .into_iter()
+            .chain(std::env::split_paths(&path)),
+    )
+    .unwrap();
+    let tool = set.root.join("developer-tool");
+    fs::write(&tool, r#"#!/usr/bin/env python3
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+here = Path(__file__).parent
+with (here / 'tool-calls').open('a') as log:
+    print(sys.argv[1], file=log)
+plan = json.loads(input())
+if sys.argv[1] == 'native-layout':
+    sdk = Path(plan['prebuilt'])
+    print(json.dumps({'package': {name: str(sdk / name) for name in ('runtime', 'api', 'engine')}}))
+    sys.exit(0)
+assert sys.argv[1] == 'native-build'
+work = Path(plan['work'])
+work.mkdir(parents=True, exist_ok=True)
+records = []
+libraries = []
+for mod in ('alpha', 'beta'):
+    name = f'lib{mod}.so'
+    lib = work / name
+    lib.write_bytes(mod.encode())
+    libraries.append(str(lib))
+    records.append({'file': name, 'sha256': hashlib.sha256(mod.encode()).hexdigest(),
+                    'kind': 'mod', 'mod': mod,
+                    'identity': f'{(here / "revision").read_text()} {mod} 0.1.0 {(here / "rust-version").read_text()} unwind'})
+print(json.dumps({'event': 'built', 'route': 'prebuilt-api',
+                  'binary': str(Path(plan['package']['runtime']) / 'bin' / (here / 'client-name').read_text()),
+                  'libraries': libraries, 'records': records, 'mods': ['alpha', 'beta'], 'internals': {}}))
+"#).unwrap();
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(set.root.join("revision"), PINNED).unwrap();
+    fs::write(set.root.join("rust-version"), rust_toolchain::VERSION).unwrap();
+    fs::write(set.root.join("client-name"), backend::CLIENT).unwrap();
+    std::env::set_var("PATH", path);
+    std::env::set_var(sdk_cache::DEVELOPER_SDK, sdk);
+    std::env::set_var(sdk_cache::DEVELOPER_TOOL, &tool);
+
+    let options = BuildOptions::default();
+    let derived = derive(&set.request(&options), &set.copies()).unwrap();
+    let version = derived.version;
+    let dest = Target::Client.directory(&version);
+    let failed = build(
+        DEVELOPER,
+        &set.folder,
+        &instance,
+        Some(Profile::Optimized),
+        false,
+        &Cancellation::default(),
+        |step| {
+            if step == Step::Install {
+                fs::create_dir(&dest).unwrap();
+                fs::write(dest.join("occupied"), b"keep").unwrap();
+            }
+        },
+        || None,
+    );
+    assert!(
+        failed.is_err(),
+        "an occupied publication destination was accepted"
+    );
+    assert_eq!(fs::read(dest.join("occupied")).unwrap(), b"keep");
+    assert!(!set.evidence(&version).exists());
+    assert!(set.found().is_none());
+    fs::remove_dir_all(&dest).unwrap();
+
+    let (built, _, steps) = build_default(&set, &instance);
+    assert!(
+        matches!(&built, Ok(ClientBuild::Native(found)) if found == &version),
+        "{built:?}"
+    );
+    assert!(steps.contains(&Step::Install));
+    assert!(
+        Evidence::read(&dest).unwrap().is_some(),
+        "publication did not write its first seal"
+    );
+    let calls = set.root.join("tool-calls");
+    let before = fs::read_to_string(&calls).unwrap();
+    assert_eq!(
+        before
+            .lines()
+            .filter(|call| *call == "native-build")
+            .count(),
+        2
+    );
+    let (built, checks, steps) = build_default(&set, &instance);
+    assert!(
+        matches!(&built, Ok(ClientBuild::Native(found)) if found == &version),
+        "{built:?}"
+    );
+    assert_eq!(checks, 0);
+    assert_eq!(steps, [Step::Plan(Plan::UpToDate, Profile::Optimized)]);
+    assert_eq!(fs::read_to_string(calls).unwrap(), before);
 }
 
 mod unsealed;

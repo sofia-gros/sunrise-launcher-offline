@@ -713,6 +713,48 @@ fn a_link_poisoned_slot_is_removed_without_following_it_and_built_cold() {
     canaries();
 }
 
+#[cfg(unix)]
+#[test]
+fn a_persistent_sdk_invocation_refuses_a_linked_build_log() {
+    let (dir, lease, build) = leased();
+    let mut stage = Workspace::new(&build.join("native")).unwrap();
+    assert!(stage
+        .attach(&lease, key(crate::native_mods::Target::Client))
+        .unwrap());
+    let log = stage.work().join("build.log");
+    let canary = dir.path().join("outside.log");
+    fs::write(&canary, b"untouched").unwrap();
+    std::os::unix::fs::symlink(&canary, &log).unwrap();
+    let mut command = std::process::Command::new("unused");
+    assert!(stage.isolate(&mut command).is_err());
+    assert_eq!(fs::read(&canary).unwrap(), b"untouched");
+    fs::remove_file(&log).unwrap();
+    fs::write(&log, b"old diagnostics").unwrap();
+    stage.isolate(&mut command).unwrap();
+    assert!(!log.exists());
+}
+
+#[test]
+fn a_file_in_an_sdk_owned_folder_position_resets_the_slot() {
+    let (_dir, lease, build) = leased();
+    let native = build.join("native");
+    let client = key(crate::native_mods::Target::Client);
+    let mut first = Workspace::new(&native).unwrap();
+    assert!(first.attach(&lease, client.clone()).unwrap());
+    for name in [
+        "prebuilt-build/key",
+        "prebuilt-build/key/target",
+        "prebuilt-build/key/stage-1",
+    ] {
+        let wrong_type = first.work().join(name);
+        fs::create_dir_all(wrong_type.parent().unwrap()).unwrap();
+        fs::write(wrong_type, b"not a folder").unwrap();
+        let mut stage = Workspace::new(&native).unwrap();
+        assert!(stage.attach(&lease, client.clone()).unwrap());
+        assert!(listing(&stage.work()).is_empty(), "{name}");
+    }
+}
+
 #[test]
 fn a_failed_kept_slot_is_emptied_and_built_cold_once_after_a_proved_stop() {
     let (_dir, lease, build) = leased();
@@ -732,7 +774,21 @@ fn a_failed_kept_slot_is_emptied_and_built_cold_once_after_a_proved_stop() {
     assert!(!stage.retry_cold(&lease).unwrap());
     assert!(stale.is_file());
     stage.worker_finished();
+    let tmp_for = |stage: &Workspace| {
+        let mut command = std::process::Command::new("unused");
+        stage.isolate(&mut command).unwrap();
+        command
+            .get_envs()
+            .find_map(|(key, val)| (key == "TMPDIR").then(|| val.unwrap()))
+            .map(PathBuf::from)
+            .unwrap()
+    };
+    let first_tmp = tmp_for(&stage);
+    fs::write(first_tmp.join("stale"), b"old scratch").unwrap();
     assert!(stage.retry_cold(&lease).unwrap());
+    let retry_tmp = tmp_for(&stage);
+    assert_ne!(first_tmp, retry_tmp);
+    assert!(fs::read_dir(retry_tmp).unwrap().next().is_none());
     assert!(!stale.exists());
     assert!(stage.work().is_dir());
     assert!(listing(&stage.work()).is_empty());
@@ -742,12 +798,73 @@ fn a_failed_kept_slot_is_emptied_and_built_cold_once_after_a_proved_stop() {
     assert!(stage.work().join("partial").is_file());
 }
 
+#[cfg(unix)]
+#[test]
+fn cold_retry_refuses_a_redirected_slot_parent() {
+    let (dir, lease, build) = leased();
+    let native = build.join("native");
+    let key = key(crate::native_mods::Target::Client);
+    let mut stage = Workspace::new(&native).unwrap();
+    assert!(stage.attach(&lease, key.clone()).unwrap());
+    fs::write(stage.work().join("warm"), b"old output").unwrap();
+    assert!(stage.attach(&lease, key.clone()).unwrap());
+
+    let outside = dir.path().join("outside");
+    let matching = outside.join(key.as_str());
+    fs::create_dir_all(&matching).unwrap();
+    let canary = matching.join("canary");
+    fs::write(&canary, b"untouched").unwrap();
+    fs::rename(native.join("w"), native.join("original-work")).unwrap();
+    std::os::unix::fs::symlink(&outside, native.join("w")).unwrap();
+    assert!(stage.retry_cold(&lease).is_err());
+    assert_eq!(fs::read(&canary).unwrap(), b"untouched");
+}
+
+fn in_child(name: &str) -> bool {
+    const CHILD: &str = "SUNRISE_NATIVE_WORKSPACE_TEST_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        return true;
+    }
+    let scratch = tempfile::tempdir().unwrap();
+    let module = module_path!().split_once("::").unwrap().1;
+    let test = format!("{module}::{name}");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &test, "--include-ignored", "--nocapture"])
+        .env(CHILD, "1")
+        .env("SUNRISE_LAUNCHER_HOME", scratch.path().join("launcher"))
+        .env("SUNRISE_HOME", scratch.path().join("game"))
+        .env(
+            "SUNRISE_LAUNCHER_LOCATION_FILE",
+            scratch.path().join("location"),
+        )
+        .env("SUNRISE_NO_KEYCHAIN", "1")
+        .env("SUNRISE_LAUNCHER_NO_SELF_UPDATE", "1")
+        .env("XDG_DATA_HOME", scratch.path().join("data"))
+        .env("XDG_CONFIG_HOME", scratch.path().join("config"))
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("1 passed; 0 failed"),
+        "child test did not run {test}: {stdout}"
+    );
+    false
+}
+
 #[test]
 fn an_unproved_exit_skips_the_slot_in_memory_only_until_the_next_start() {
+    if !in_child("an_unproved_exit_skips_the_slot_in_memory_only_until_the_next_start") {
+        return;
+    }
     let (_dir, lease, build) = leased();
     let native = build.join("native");
     let client = crate::native_mods::Target::Client;
-    // Keys of their own: the skipped set is the process's, and other tests share it.
+    // The unproved state belongs to this scratch child only.
     let unproved = SlotKey::keyed(COMMIT, "unproved-triple", client, "9.9.9").unwrap();
     let proved = SlotKey::keyed(COMMIT, "proved-triple", client, "9.9.9").unwrap();
     let mut stage = Workspace::new(&native).unwrap();
@@ -762,11 +879,13 @@ fn an_unproved_exit_skips_the_slot_in_memory_only_until_the_next_start() {
     // The builds that follow take the attempt's own folders.
     let attempt = Workspace::new(&native).unwrap();
     assert!(attempt.work().starts_with(attempt.path()));
-    // Another game build is not affected.
-    assert!(proved.clone().usable(false).is_some());
-    // A compiler tree proved gone leaves its slot in use.
+    // Another game build can still use its own work slot, but not the shared Cargo home.
+    let another = proved.clone().usable(false).unwrap();
     let mut stopped = Workspace::new(&native).unwrap();
-    assert!(stopped.attach(&lease, proved.clone()).unwrap());
+    assert!(stopped.attach(&lease, another).unwrap());
+    assert_ne!(stopped.work(), stage.work());
+    assert_eq!(stopped.cargo_home(), stopped.path().join("cargo"));
+    // A compiler tree proved gone leaves its slot in use.
     stopped.allow_worker();
     stopped.worker_finished();
     stopped.note_unproved();
@@ -785,6 +904,130 @@ fn an_unproved_exit_skips_the_slot_in_memory_only_until_the_next_start() {
     assert_eq!(fs::read(next.work().join("kept")).unwrap(), b"compiled");
     assert!(next.retry_cold(&lease).unwrap());
     assert!(!next.work().join("kept").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "daily; build the launcher binary first"]
+fn persistent_sdk_process_uses_fresh_retry_tmp_and_isolates_cargo_after_stop() {
+    use super::super::Target::{Client, Server};
+    use std::os::unix::fs::PermissionsExt;
+
+    if !in_child("persistent_sdk_process_uses_fresh_retry_tmp_and_isolates_cargo_after_stop") {
+        return;
+    }
+    let (dir, lease, build) = leased();
+    let native = build.join("native");
+    let program = dir.path().join("sdk");
+    fs::write(&program, r#"#!/bin/sh
+set -eu
+[ "$1" = native-build ]
+read -r plan
+printf '%s\n' "$plan" > "$TMPDIR/plan.json"
+printf '%s\n' "$CARGO_HOME" > "$TMPDIR/cargo-home"
+printf '%s\n' "$TMPDIR" > "$(dirname "$0")/last-tmp"
+[ -z "${CARGO_TARGET_DIR+x}" ]
+if [ -f "$(dirname "$0")/stop" ]; then
+    printf '%s\n' '{"event":"mod","id":"greeter","done":1,"total":1}'
+    # Hold the SDK open after the mod event so the launcher cancels before proof.
+    read -r _ || :
+    exit 1
+fi
+if [ -f "$(dirname "$0")/build/native/w/$(cat "$(dirname "$0")/slot")/warm" ]; then
+    printf '%s\n' '{"event":"failed","error":"stale work","blame":null}'
+    exit 1
+fi
+printf '%s\n' '{"event":"built","route":"prebuilt-api","binary":"unused","libraries":[],"records":[],"mods":[],"internals":{}}'
+"#).unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+    let rust = crate::rust_toolchain::Toolchain {
+        dir: dir.path().join("rust"),
+        host: crate::rust_toolchain::host().unwrap(),
+    };
+    let run = |stage: &mut Workspace,
+               cancel: &tool::Cancellation,
+               on_mod: &dyn Fn(&str, usize, usize)| {
+        let work = stage.work();
+        let result = tool::build(
+            &rust,
+            &program,
+            tool::Plan {
+                work: &work,
+                workspace: stage,
+                package: tool::Package {
+                    runtime: dir.path(),
+                    api: dir.path(),
+                    engine: dir.path(),
+                },
+                mods: dir.path(),
+                server: false,
+                mixins_from_source: false,
+            },
+            on_mod,
+            cancel,
+            None,
+        );
+        stage.note_unproved();
+        result
+    };
+    let assert_plan = |stage: &Workspace, tmp: &Path, cargo: &Path| {
+        let plan: serde_json::Value =
+            serde_json::from_slice(&fs::read(tmp.join("plan.json")).unwrap()).unwrap();
+        assert_eq!(plan["work"], serde_json::json!(stage.work()));
+        assert_eq!(plan["toolchain"]["cargo_home"], serde_json::json!(cargo));
+        assert_eq!(
+            fs::read_to_string(tmp.join("cargo-home"))
+                .unwrap()
+                .trim_end(),
+            cargo.to_str().unwrap()
+        );
+    };
+    let client = key(Client);
+    fs::write(dir.path().join("slot"), client.as_str()).unwrap();
+    let mut stage = Workspace::new(&native).unwrap();
+    assert!(stage.attach(&lease, client.clone()).unwrap());
+    fs::write(stage.work().join("warm"), b"stale").unwrap();
+    assert!(stage.attach(&lease, client.clone()).unwrap());
+    let cancellation = tool::Cancellation::default();
+    let no_mod = |_: &str, _: usize, _: usize| unreachable!();
+    let failed = run(&mut stage, &cancellation, &no_mod).unwrap_err();
+    assert_eq!(failed.error, "stale work");
+    let first_tmp = stage.path().join("tmp");
+    assert_plan(&stage, &first_tmp, &build.join("cargo"));
+    assert!(stage.retry_cold(&lease).unwrap());
+    assert_eq!(
+        run(&mut stage, &cancellation, &no_mod).unwrap().route,
+        tool::CheckRoute::PrebuiltApi
+    );
+    let retry_tmp = fs::read_to_string(dir.path().join("last-tmp")).unwrap();
+    let retry_tmp = Path::new(retry_tmp.trim_end());
+    assert_ne!(first_tmp.as_path(), retry_tmp);
+    assert_plan(&stage, retry_tmp, &build.join("cargo"));
+
+    // A stopped, warm compiler has no proved handoff. Its slot cannot be retried.
+    fs::write(dir.path().join("stop"), b"").unwrap();
+    assert!(stage.attach(&lease, client.clone()).unwrap());
+    fs::write(stage.work().join("kept"), b"output").unwrap();
+    assert!(stage.attach(&lease, client.clone()).unwrap());
+    let stop = tool::Cancellation::default();
+    assert!(run(&mut stage, &stop, &|_, _, _| stop.stop()).is_err());
+    assert!(stop.is_stopped());
+    assert!(client.usable(false).is_none());
+    assert!(!stage.retry_cold(&lease).unwrap());
+    assert!(stage.work().join("kept").is_file());
+
+    fs::remove_file(dir.path().join("stop")).unwrap();
+    let mut another = Workspace::new(&native).unwrap();
+    assert!(another
+        .attach(&lease, key(Server).usable(false).unwrap())
+        .unwrap());
+    assert_ne!(another.work(), stage.work());
+    run(&mut another, &cancellation, &no_mod).unwrap();
+    assert_plan(
+        &another,
+        &another.path().join("tmp"),
+        &another.path().join("cargo"),
+    );
 }
 
 #[test]
@@ -818,6 +1061,7 @@ fn a_persistent_build_binds_each_output_to_the_one_root_it_belongs_to() {
     let in_other_work = work.join("elsewhere/libelsewhere.so.1");
     let in_other_slot = build.join("native/w/another-slot/prebuilt-build/key/target/libother.so.1");
     let stamped_in_cargo = cargo.join("libgreeter.so");
+    let stamped_in_runtime = package.runtime.join("lib/libgreeter.so");
     let all = [
         &binary,
         &patch,
@@ -831,6 +1075,7 @@ fn a_persistent_build_binds_each_output_to_the_one_root_it_belongs_to() {
         &in_other_work,
         &in_other_slot,
         &stamped_in_cargo,
+        &stamped_in_runtime,
     ];
     for file in all {
         fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -890,6 +1135,7 @@ fn a_persistent_build_binds_each_output_to_the_one_root_it_belongs_to() {
         verify(&stamped_in_cargo, &[]).is_err(),
         "a stamped library is the SDK's output, from the work folder only"
     );
+    assert!(verify(&stamped_in_runtime, &[]).is_err());
     #[cfg(unix)]
     {
         use std::os::unix::fs::symlink;

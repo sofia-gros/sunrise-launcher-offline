@@ -6,7 +6,10 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     fs, io,
     path::{Component, PathBuf},
-    sync::{LazyLock, Mutex, PoisonError},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        LazyLock, Mutex, PoisonError,
+    },
 };
 use sunrise_launcher_smod::{
     index::{library_identity::LibraryIdentity, sha256, sha256_file},
@@ -54,6 +57,9 @@ const WORK_SLOT_HEX: usize = 10;
 /// Game builds whose work folder was left with compiler workers not proved stopped, in this
 /// launcher run only. Nothing is written to disk: the next start reuses the folder as usual.
 static UNPROVED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
+
+/// Even another slot must not use the shared Cargo home after an unproved compiler exit.
+static CARGO_HOME_UNPROVED: AtomicBool = AtomicBool::new(false);
 
 /// Which game build a persistent work folder belongs to: its commit, the Rust target, the side
 /// and the Rust version. Never a mod set or a profile: Cargo's own fingerprints decide what a
@@ -136,7 +142,7 @@ impl SlotKey {
 struct Slot {
     key: SlotKey,
     work: PathBuf,
-    cargo_home: PathBuf,
+    shared_cargo: Option<PathBuf>,
     /// Something was in the work folder before this build: a failure there may be its leftovers.
     warm: bool,
 }
@@ -144,6 +150,7 @@ struct Slot {
 pub(super) struct Workspace {
     dir: tempfile::TempDir,
     slot: Option<Slot>,
+    retry_tmp: Option<PathBuf>,
     /// No compiler worker of this attempt may still be running: true until one starts, and
     /// again once an OS proof says the tree is gone.
     workers_stopped: bool,
@@ -180,6 +187,7 @@ impl Workspace {
             .map(|dir| Self {
                 dir,
                 slot: None,
+                retry_tmp: None,
                 workers_stopped: true,
             })
     }
@@ -199,7 +207,8 @@ impl Workspace {
     pub(super) fn cargo_home(&self) -> PathBuf {
         self.slot
             .as_ref()
-            .map_or_else(|| self.path().join("cargo"), |slot| slot.cargo_home.clone())
+            .and_then(|slot| slot.shared_cargo.clone())
+            .unwrap_or_else(|| self.path().join("cargo"))
     }
 
     /// Moves the SDK's work folder and Cargo's home out of the attempt into `key`'s slot and the
@@ -215,11 +224,13 @@ impl Workspace {
             return Ok(false);
         }
         let work = lease.work_slot(key.as_str())?;
-        let cargo_home = lease.cargo_home()?;
+        let shared_cargo = (!CARGO_HOME_UNPROVED.load(Ordering::Relaxed))
+            .then(|| lease.cargo_home())
+            .transpose()?;
         self.slot = Some(Slot {
             key,
             work: work.path,
-            cargo_home,
+            shared_cargo,
             warm: !work.cold,
         });
         Ok(true)
@@ -233,10 +244,17 @@ impl Workspace {
         lease: &crate::native_cache::Cache,
     ) -> Result<bool, crate::native_cache::Error> {
         let stopped = self.workers_stopped;
+        let parent = self.dir.path();
         let Some(slot) = self.slot.as_mut().filter(|slot| slot.warm && stopped) else {
             return Ok(false);
         };
         slot.work = lease.fresh_work_slot(slot.key.as_str())?.path;
+        self.retry_tmp = Some(
+            tempfile::Builder::new()
+                .prefix("tmp-")
+                .tempdir_in(parent)?
+                .keep(),
+        );
         slot.warm = false;
         Ok(true)
     }
@@ -244,7 +262,11 @@ impl Workspace {
     /// After an attempt: a persistent folder whose compiler tree was not proved gone is not
     /// used again in this launcher run (builds take their own folders), and nothing is written.
     pub(super) fn note_unproved(&self) {
-        if let Some(slot) = self.slot.as_ref().filter(|_| !self.workers_stopped) {
+        if self.workers_stopped {
+            return;
+        }
+        CARGO_HOME_UNPROVED.store(true, Ordering::Relaxed);
+        if let Some(slot) = &self.slot {
             UNPROVED
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -253,11 +275,22 @@ impl Workspace {
     }
 
     pub(super) fn isolate(&self, command: &mut std::process::Command) -> io::Result<()> {
+        if self.slot.is_some() {
+            let work = self.work();
+            let log = work.join("build.log");
+            match regular_under(&work, &log) {
+                Ok(()) => fs::remove_file(log)?,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => (),
+                Err(err) => return Err(err),
+            }
+        }
         let path = self.path();
-        let tmp = path.join("tmp");
+        let tmp = self.retry_tmp.clone().unwrap_or_else(|| path.join("tmp"));
         fs::create_dir_all(&tmp)?;
+        let cargo_home = self.cargo_home();
+        fs::create_dir_all(&cargo_home)?;
         command
-            .env("CARGO_HOME", self.cargo_home())
+            .env("CARGO_HOME", cargo_home)
             .env("TMPDIR", &tmp)
             .env("TMP", &tmp)
             .env("TEMP", &tmp);
@@ -265,9 +298,7 @@ impl Workspace {
             // The SDK gives Cargo its own target folder inside the work folder.
             command.env_remove("CARGO_TARGET_DIR");
         } else {
-            for dir in ["cargo", "target"] {
-                fs::create_dir_all(path.join(dir))?;
-            }
+            fs::create_dir_all(path.join("target"))?;
             command.env("CARGO_TARGET_DIR", path.join("target"));
         }
         Ok(())
@@ -451,12 +482,13 @@ impl Workspace {
                     && file == mingw.join(name)
                     && regular_under(&mingw, &file).is_ok()
             };
-            let produced = (stamped && file.starts_with(&work))
-                || (!stamped
-                    && built.route == tool::CheckRoute::Prebuilt
-                    && file.starts_with(&joined_runtime));
-            let source = if dynamic
-                && ((produced && regular_under(&work, &file).is_ok())
+            let source = if stamped {
+                regular_under(&work, &file)?;
+                file.clone()
+            } else if dynamic
+                && ((built.route == tool::CheckRoute::Prebuilt
+                    && file.starts_with(&joined_runtime)
+                    && regular_under(&work, &file).is_ok())
                     || runtime()
                     || standard()
                     || gnu())

@@ -35,7 +35,7 @@ impl From<io::Error> for Error {
 
 pub(crate) struct Cache {
     root: PathBuf,
-    _directory: Dir,
+    directory: Dir,
     _lease: Locked,
 }
 
@@ -130,16 +130,6 @@ fn remove(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Refuses a link at `path`; whether it is there at all is the caller's to say.
-fn unlinked(path: &Path) -> Result<Option<Metadata>, Error> {
-    match fs::symlink_metadata(path) {
-        Ok(meta) if linked(&meta) => Err(Error::Unsafe(path.to_owned())),
-        Ok(meta) => Ok(Some(meta)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-    }
-}
-
 /// The folders of a work slot the SDK's tool keeps and reuses, checked for links one level at a
 /// time before any of them is handed to a compiler: the slot itself, `prebuilt-build` and
 /// `prebuilt-package`, each build folder in `prebuilt-build`, and in it `target` and `stage-*`.
@@ -147,26 +137,21 @@ fn sdk_owned(slot: &Path) -> Result<(), Error> {
     if checked(slot, true)?.is_none() {
         return Ok(());
     }
-    for name in ["prebuilt-build", "prebuilt-package"] {
-        let folder = slot.join(name);
-        if unlinked(&folder)?.is_some_and(|meta| !meta.is_dir()) {
-            return Err(Error::Unsafe(folder));
-        }
-    }
+    checked(&slot.join("prebuilt-package"), true)?;
     let builds = slot.join("prebuilt-build");
-    if unlinked(&builds)?.is_none() {
+    if checked(&builds, true)?.is_none() {
         return Ok(());
     }
     for build in fs::read_dir(&builds)? {
         let build = build?.path();
-        if !unlinked(&build)?.is_some_and(|meta| meta.is_dir()) {
+        if checked(&build, true)?.is_none() {
             continue;
         }
         for entry in fs::read_dir(&build)? {
             let entry = entry?;
             let name = entry.file_name();
             if name == "target" || name.to_string_lossy().starts_with("stage-") {
-                unlinked(&entry.path())?;
+                checked(&entry.path(), true)?;
             }
         }
     }
@@ -208,7 +193,7 @@ impl Cache {
         let lease = lock(&root.join(".build.lock"))?;
         Ok(Self {
             root,
-            _directory: directory,
+            directory,
             _lease: lease,
         })
     }
@@ -262,7 +247,13 @@ impl Cache {
     /// [`Self::work_slot`] after removing what the slot held: the one cold build a slot that
     /// failed gets.
     pub(crate) fn fresh_work_slot(&self, slot: &str) -> Result<Provisioned, Error> {
-        remove(&self.root.join(WORK).join(single(slot)?))?;
+        let work = self.root.join(WORK);
+        let leaf = single(slot)?;
+        // A completed compiler could have changed this parent since the slot was attached.
+        // Check it from the held native directory before inspecting the slot by path.
+        let _parent = self.directory.open_dir_nofollow(WORK)?;
+        self.unchanged_path(&work)?;
+        remove(&work.join(leaf))?;
         self.work_slot(slot)
     }
 
