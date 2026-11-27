@@ -1,5 +1,5 @@
 //! Build the actual admitted client command, then transfer its profile and cache claims.
-use super::{first::VerifiedFirst, unsettled, Active, Profile, StartError};
+use super::{first::VerifiedSnapshot, unsettled, Active, Profile, StartError};
 use crate::{
     backend::{self, RuntimeGuard},
     native_mods::Cancellation,
@@ -59,11 +59,11 @@ impl Profile {
         active: &Active,
         cancellation: &Cancellation,
         mut command: Command,
-        (launch, piped, hook_log, first): (
+        (launch, piped, hook_log, proof): (
             &crate::launch::Launch,
             bool,
             &dyn Fn(String),
-            Option<&VerifiedFirst>,
+            Option<VerifiedSnapshot>,
         ),
         prepare_jars: impl FnOnce(&Command) -> Result<(), String>,
         before_spawn: impl FnOnce(&mut Command) -> Result<(), StartError>,
@@ -76,7 +76,7 @@ impl Profile {
             &wrapper,
             piped,
             (
-                first,
+                proof,
                 |command| {
                     prepare_jars(command)?;
                     crate::launch::managed_pre_launch(command, launch, piped, hook_log)
@@ -105,13 +105,13 @@ impl Profile {
         command: Command,
         wrapper: &[std::ffi::OsString],
         piped: bool,
-        (first, pre_launch, before_spawn): (
-            Option<&VerifiedFirst>,
+        (proof, pre_launch, before_spawn): (
+            Option<VerifiedSnapshot>,
             impl FnOnce(&Command) -> Result<(), StartError>,
             impl FnOnce(&mut Command) -> Result<(), StartError>,
         ),
     ) -> Result<(Child, RuntimeGuard), StartError> {
-        self.verified_handoff_for(active, first, cancellation, |profile| {
+        self.verified_handoff_for(active, proof, cancellation, |profile| {
             let selection = validate_selection(self.home(), &active.resource_path(), &command)?;
             pre_launch(&command)?;
             cancellation.check()?;

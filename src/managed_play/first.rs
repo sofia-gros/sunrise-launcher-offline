@@ -1,7 +1,7 @@
 //! First Play freezes the candidate and its proof before downloading or preparing anything.
 use super::{
-    at, inputs, scan_packages, unsettled, Active, Artifact, Generation, HeldReason,
-    ReferencePublication, Resources,
+    at, inputs, resources::PreparedResources, scan_packages, unsettled, Active, Artifact,
+    Generation, HeldReason, ReferencePublication, Resources,
 };
 use crate::{
     backend::{
@@ -470,7 +470,7 @@ impl Profile {
     pub(super) fn verified_handoff_for<T, E: From<String>>(
         &self,
         active: &Active,
-        first: Option<&VerifiedFirst>,
+        proof: Option<VerifiedSnapshot>,
         cancellation: &native_mods::Cancellation,
         spawn: impl FnOnce(ProfileHandoff<'_>) -> Result<T, E>,
     ) -> Result<T, E> {
@@ -483,10 +483,10 @@ impl Profile {
             if self.active()?.as_ref() != Some(active) || inputs(home)? != active.inputs {
                 return Err(unsettled!());
             }
-            // First Play checked this exact snapshot before committing it, and the proof
+            // First Play (or a fresh prepare seal) proved this exact snapshot, and the proof
             // still owns the game-manifest lock from that check through this handoff.
-            match first {
-                Some(first) if &first.active == active && first.home.as_path() == home => {
+            match &proof {
+                Some(proof) if &proof.active == active && proof.home.as_path() == home => {
                     active.verify_binaries()?;
                 }
                 Some(_) => return Err(unsettled!()),
@@ -596,17 +596,28 @@ pub struct FirstAttempt<'a> {
     stage: Staging<'a>,
 }
 
-/// A first publication and the manifest lock under which its resources were verified.
-/// Never persisted: a later Play must verify the saved resources again.
-pub(super) struct VerifiedFirst {
+/// A committed generation and the manifest lock under which its snapshot was either
+/// verified or freshly sealed in `prepare`. Never persisted: a later Play must verify
+/// the saved resources again.
+pub(super) struct VerifiedSnapshot {
     pub(super) active: Active,
     home: PathBuf,
     _manifest: HomeLockGuard,
 }
 
-impl std::fmt::Debug for VerifiedFirst {
+impl VerifiedSnapshot {
+    pub(super) fn new(active: Active, home: PathBuf, manifest: HomeLockGuard) -> Self {
+        Self {
+            active,
+            home,
+            _manifest: manifest,
+        }
+    }
+}
+
+impl std::fmt::Debug for VerifiedSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("VerifiedFirst").finish_non_exhaustive()
+        f.debug_struct("VerifiedSnapshot").finish_non_exhaustive()
     }
 }
 
@@ -650,7 +661,7 @@ impl FirstAttempt<'_> {
         &self,
         log: &dyn Fn(String),
         diagnostics: &dyn Fn(String),
-    ) -> Result<Resources, String> {
+    ) -> Result<PreparedResources, String> {
         Resources::for_play_with(self.base(), self.handoff(), log, diagnostics)
     }
 
@@ -685,19 +696,24 @@ impl FirstAttempt<'_> {
         // publication fence while waiting on a preparer child for this one version.
         self.bound.verify_image()?;
         let resources = Resources::capture(self.base(), &self.stage)?;
-        Ok(self.commit_prepared(image, resources, cancellation)?.active)
+        Ok(self
+            .commit_prepared(image, PreparedResources::reused(resources), cancellation)?
+            .active)
     }
 
     pub(super) fn commit_prepared(
         self,
         image: &str,
-        resources: Resources,
+        prepared: PreparedResources,
         cancellation: &native_mods::Cancellation,
-    ) -> Result<VerifiedFirst, String> {
+    ) -> Result<VerifiedSnapshot, String> {
         let manifest = game_lock(&self.home)?;
         crate::browser::installed::recover_game_install(&self.home)?;
         // Refuse a damaged reused tree before it can bind an unbound profile.
-        resources.verify(self.base())?;
+        // A snapshot just sealed inside `prepare` is already proven by its seal.
+        if !prepared.proven_by_seal {
+            prepared.resources.verify(self.base())?;
+        }
         let _references = ReferencePublication::begin(&self.home)?;
         self.bound.verify_image()?;
         let active = Active::capture(
@@ -707,7 +723,7 @@ impl FirstAttempt<'_> {
             self.bound.inputs,
             Generation::First {
                 profile: self.bound.profile,
-                resources,
+                resources: prepared.resources,
                 variant: self.variant().map(Box::new),
             },
         )?;
@@ -719,11 +735,7 @@ impl FirstAttempt<'_> {
             self.bound.inputs,
             cancellation,
         )?;
-        Ok(VerifiedFirst {
-            active,
-            home: self.home,
-            _manifest: manifest,
-        })
+        Ok(VerifiedSnapshot::new(active, self.home, manifest))
     }
 }
 

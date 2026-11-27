@@ -1044,10 +1044,10 @@ fi
         Ok::<_, StartError>((active, FULL_VERIFICATIONS.take(), first))
     };
     let spawned = Cell::new(false);
-    let handoff = |profile: &Profile, active: &Active, first: Option<&VerifiedFirst>| {
+    let handoff = |profile: &Profile, active: &Active, proof: Option<VerifiedSnapshot>| {
         spawned.set(false);
         FULL_VERIFICATIONS.take();
-        let result = profile.verified_handoff_for(active, first, &cancellation, |_| {
+        let result = profile.verified_handoff_for(active, proof, &cancellation, |_| {
             spawned.set(true);
             Ok::<(), String>(())
         });
@@ -1057,7 +1057,7 @@ fi
         let (active, before_handoff, proof) = ready(profile).unwrap();
         let initial = u32::from(proof.is_some());
         assert_eq!(before_handoff, initial);
-        let (result, at_handoff) = handoff(profile, &active, proof.as_ref());
+        let (result, at_handoff) = handoff(profile, &active, proof);
         result.unwrap();
         assert!(spawned.get());
         assert_eq!(at_handoff, 1 - initial);
@@ -1075,6 +1075,58 @@ fi
         );
         assert!(!error.contains(&active.resource_path().to_string_lossy().into_owned()));
     };
+
+    // First Play without a receipt seals inside prepare (no separate verify pass after the
+    // seal), and a repeat Play still verifies once at handoff.
+    let fresh_home = home.join("instances/fresh");
+    fs::create_dir_all(&fresh_home).unwrap();
+    let fresh_active = {
+        let mut fresh = Profile::open(&fresh_home, None).unwrap();
+        let (active, before_handoff, proof) = ready(&mut fresh).unwrap();
+        assert_eq!(before_handoff, 0);
+        assert!(proof.is_some());
+        let (result, at_handoff) = handoff(&fresh, &active, proof);
+        result.unwrap();
+        assert!(spawned.get());
+        assert_eq!(at_handoff, 0);
+        assert_eq!(intact(&mut fresh), active);
+        active
+    };
+
+    // Without a receipt, Play must not uncounted-hash or repair an already-existing damaged
+    // snapshot; it refuses once at commit, and accepts an intact one with one verify total.
+    let receipt_file = build.join(".local/launcher-prepared/current.json");
+    fs::remove_file(&receipt_file).unwrap();
+    let existing_blob = fresh_active.resource_path().join("fixture-blob.bin");
+    fs::write(&existing_blob, b"damaged without receipt").unwrap();
+    let no_receipt_home = home.join("instances/no-receipt");
+    fs::create_dir_all(&no_receipt_home).unwrap();
+    {
+        let mut no_receipt = Profile::open(&no_receipt_home, None).unwrap();
+        let error = ready(&mut no_receipt).unwrap_err();
+        assert!(
+            matches!(error, StartError::Other(detail) if detail.contains("managed_play/resources.rs:"))
+        );
+        assert_eq!(FULL_VERIFICATIONS.take(), 1);
+        assert!(no_receipt.active().unwrap().is_none());
+        assert_eq!(
+            fs::read(&existing_blob).unwrap(),
+            b"damaged without receipt"
+        );
+        assert!(!receipt_file.exists());
+    }
+    fs::write(&existing_blob, BLOB).unwrap();
+    {
+        let mut no_receipt = Profile::open(&no_receipt_home, None).unwrap();
+        let (active, before_handoff, proof) = ready(&mut no_receipt).unwrap();
+        assert_eq!(before_handoff, 1);
+        assert!(proof.is_some());
+        let (result, at_handoff) = handoff(&no_receipt, &active, proof);
+        result.unwrap();
+        assert!(spawned.get());
+        assert_eq!(at_handoff, 0);
+    }
+    fs::remove_dir_all(build.join(".local/launcher-prepared")).unwrap();
 
     // A cached snapshot with an intact manifest but damaged payload must not bind First Play.
     let prepared_snapshot = {
@@ -1306,7 +1358,7 @@ fi
             &cancellation,
             |_| {},
             None,
-            Some(resources),
+            Some(resources.clone()),
         )
         .unwrap()
         .unwrap();
@@ -1317,14 +1369,40 @@ fi
     assert_eq!(FULL_VERIFICATIONS.take(), 1);
     assert_eq!(profile.active().unwrap(), Some(server.clone()));
     fs::write(&blob, BLOB).unwrap();
-    let (upgraded, old_verifications, _) = ready(&mut profile).unwrap();
+    let (upgraded, old_verifications, proof) = ready(&mut profile).unwrap();
     assert_eq!(old_verifications, 1);
+    assert!(proof.is_none());
     assert_eq!(upgraded.generation(), server.generation() + 1);
     assert_eq!(upgraded.resources, advanced.resources);
-    let (result, replacement_verifications) = handoff(&profile, &upgraded, None);
+    let (result, replacement_verifications) = handoff(&profile, &upgraded, proof);
     result.unwrap();
     assert!(spawned.get());
     assert_eq!(replacement_verifications, 1);
+
+    // An intact ServerOnly upgrade that freshly seals the new client snapshot inside prepare
+    // verifies the old snapshot once and does not run a second verify pass after the seal.
+    let server_again = profile
+        .refresh(
+            instance.native_profile,
+            &cancellation,
+            |_| {},
+            None,
+            Some(resources),
+        )
+        .unwrap()
+        .unwrap();
+    fs::remove_file(&receipt_file).unwrap();
+    fs::remove_dir_all(upgraded.resource_path().parent().unwrap()).unwrap();
+    let (sealed_upgrade, old_verifications, proof) = ready(&mut profile).unwrap();
+    assert_eq!(old_verifications, 1);
+    assert!(proof.is_some());
+    assert_eq!(sealed_upgrade.generation(), server_again.generation() + 1);
+    assert_eq!(sealed_upgrade.resources, advanced.resources);
+    let (result, replacement_verifications) = handoff(&profile, &sealed_upgrade, proof);
+    result.unwrap();
+    assert!(spawned.get());
+    assert_eq!(replacement_verifications, 0);
+    assert_eq!(intact(&mut profile), sealed_upgrade);
     let log = fs::read_to_string(log_dir.join("launcher.log")).unwrap();
     assert!(log.contains("Verifying game files: done"));
     assert!(!log.contains(&*fixture.to_string_lossy()));

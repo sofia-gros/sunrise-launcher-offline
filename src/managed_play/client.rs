@@ -1,7 +1,7 @@
 //! Ordinary client Play keeps one admission on its worker through the actual spawn.
 use super::{
     catalogue,
-    first::{game_lock, VerifiedFirst},
+    first::{game_lock, VerifiedSnapshot},
     unsettled, Active, FirstBuild, Profile,
 };
 use crate::{
@@ -205,7 +205,7 @@ impl Client<'_> {
             backend::managed_game_architecture_launch_error(tag, variant)
                 .map_or(Ok(()), |error| Err(StartError::Other(error)))
         };
-        let (active, registry_notices, first) = self.ready(
+        let (active, registry_notices, proof) = self.ready(
             &mut profile,
             || selected.map_or_else(|| choose.expect("a first Play needs a selection")(), Ok),
             check_build,
@@ -250,7 +250,7 @@ impl Client<'_> {
                     launch,
                     self.piped,
                     &|line| progress(Progress::HookLine(line)),
-                    first.as_ref(),
+                    proof,
                 ),
                 prepare_jars,
                 |cmd| {
@@ -303,7 +303,7 @@ impl Client<'_> {
         cancellation: &native_mods::Cancellation,
         progress: impl Fn(Progress),
         load_index: impl FnOnce() -> Option<std::sync::Arc<sunrise_launcher_smod::index_v2::Index>>,
-    ) -> Result<(Active, Vec<String>, Option<VerifiedFirst>), StartError> {
+    ) -> Result<(Active, Vec<String>, Option<VerifiedSnapshot>), StartError> {
         let home = profile.home().to_owned();
         let mode = self.instance.native_profile;
         let started = std::cell::Cell::new(false);
@@ -340,22 +340,28 @@ impl Client<'_> {
             };
             // Legacy writers still use the game lock, not profile admission. Keep
             // them out until refresh has staged the exact set we checked.
-            let _manifest = game_lock(&home)?;
+            let manifest = game_lock(&home)?;
             checking.note("the profile's lock is held");
             crate::browser::installed::recover_game_install(&home).map_err(StartError::Journal)?;
             let notices = catalogue::inspect(&home, load_index)?;
+            let (replacement_resources, proven_by_seal) = match replacement {
+                Some(prepared) => (Some(prepared.resources), prepared.proven_by_seal),
+                None => (None, false),
+            };
             let active = profile
                 .refresh(
                     mode,
                     cancellation,
                     |step| native(old.base(), step),
                     Some(&log),
-                    replacement,
+                    replacement_resources,
                 )
                 .map_err(|error| native_failure(&home, error, || Some(Build::Active(old))))?
                 .ok_or_else(|| unsettled!())?;
+            let proof = proven_by_seal
+                .then(|| VerifiedSnapshot::new(active.clone(), home.clone(), manifest));
             checking.done("");
-            return Ok((active, notices, None));
+            return Ok((active, notices, proof));
         }
 
         let ready = (|| {
@@ -364,7 +370,7 @@ impl Client<'_> {
             })?;
             check_build(first.base(), first.variant().as_ref())?;
             progress(Progress::Prepare);
-            let resources = first
+            let prepared = first
                 .prepare_with(&|line| emit_prepare_line(&progress, line), &|line| {
                     progress(Progress::Line(line))
                 })?;
@@ -388,7 +394,7 @@ impl Client<'_> {
                     })?;
                 (image, notices)
             };
-            let first = first.commit_prepared(&image, resources, cancellation)?;
+            let first = first.commit_prepared(&image, prepared, cancellation)?;
             Ok((first.active.clone(), notices, Some(first)))
         })();
         if ready.is_err() {

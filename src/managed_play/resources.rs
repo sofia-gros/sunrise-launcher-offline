@@ -24,6 +24,24 @@ pub(crate) struct Resources {
     accelerator: Option<[u8; 32]>,
 }
 
+/// Prepared resources selected for Play. `proven_by_seal` is true only when this call
+/// just sealed a brand-new snapshot into place (the seal itself already hashed the source
+/// tree under the preparation lock), so Play skips a redundant verify pass over that tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct PreparedResources {
+    pub(super) resources: Resources,
+    pub(super) proven_by_seal: bool,
+}
+
+impl PreparedResources {
+    pub(super) fn reused(resources: Resources) -> Self {
+        Self {
+            resources,
+            proven_by_seal: false,
+        }
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// Full prepared-file verifications requested on this thread. Tests take it with `Cell::take`.
@@ -72,7 +90,7 @@ impl Resources {
         base: &str,
         profile: ProfileHandoff<'_>,
         log: &dyn Fn(String),
-    ) -> Result<Self, String> {
+    ) -> Result<PreparedResources, String> {
         Self::for_play_with(base, profile, log, log)
     }
 
@@ -83,12 +101,12 @@ impl Resources {
         profile: ProfileHandoff<'_>,
         log: &dyn Fn(String),
         diagnostics: &dyn Fn(String),
-    ) -> Result<Self, String> {
+    ) -> Result<PreparedResources, String> {
         let preparation = backend::prepare_lock(base)?;
         // A prepared profile uses its receipt here, without sealing or hashing again.
         // The admitted Play handoff checks the saved snapshot digest.
         if let Some(resources) = Self::current(&backend::version_dir(base))? {
-            return Ok(resources);
+            return Ok(PreparedResources::reused(resources));
         }
         let handoff = preparation.handoff(Some(profile));
         if !backend::check_prepared(base) {
@@ -117,7 +135,7 @@ impl Resources {
                 }
             }
         }
-        Self::seal_prepared(base, &preparation, &handoff, None, None)
+        Self::seal_prepared(base, &preparation, &handoff, None, None, false)
     }
 
     /// Finish the shared preparation under its existing lock, before a profile needs it.
@@ -127,7 +145,15 @@ impl Resources {
         preparation: &preparer::Preparation,
         profile: Option<ProfileHandoff<'_>>,
     ) -> Result<Self, String> {
-        Self::seal_prepared(base, preparation, &preparation.handoff(profile), None, None)
+        Self::seal_prepared(
+            base,
+            preparation,
+            &preparation.handoff(profile),
+            None,
+            None,
+            true,
+        )
+        .map(|prepared| prepared.resources)
     }
 
     /// [`Self::prepare`] when the caller already probed `missing-extras` unlocked (startup).
@@ -143,7 +169,9 @@ impl Resources {
             &preparation.handoff(profile),
             None,
             Some(missing),
+            true,
         )
+        .map(|prepared| prepared.resources)
     }
 
     /// [`Self::prepare`], stopping at the next step once `stop` is set.
@@ -157,7 +185,8 @@ impl Resources {
             Some(stop) => preparation.handoff_cancellable(profile, stop),
             None => preparation.handoff(profile),
         };
-        Self::seal_prepared(base, preparation, &handoff, stop, None)
+        Self::seal_prepared(base, preparation, &handoff, stop, None, true)
+            .map(|prepared| prepared.resources)
     }
 
     fn seal_prepared(
@@ -166,7 +195,8 @@ impl Resources {
         handoff: &preparer::Handoff<'_>,
         stop: Option<&crate::native_mods::Cancellation>,
         probed_missing: Option<Option<preparer::Extras>>,
-    ) -> Result<Self, String> {
+        allow_repair: bool,
+    ) -> Result<PreparedResources, String> {
         let check = || stop.map_or(Ok(()), crate::native_mods::Cancellation::check);
         check()?;
         backend::need_base_prepared(base, Some(preparation))?;
@@ -179,14 +209,20 @@ impl Resources {
         }
         check()?;
         let root = backend::version_dir(base);
-        Self::seal(&root, &backend::resources(base), stop, |resources| {
-            check()?;
-            let Some(binary) = preparer::binary(&root) else {
-                return Ok(None);
-            };
-            launcher_log::play_detail(crate::i18n::tr("Preparing the game"));
-            pack_data_cache(&binary, &root, resources, Some(handoff), stop)
-        })
+        Self::seal_at(
+            &root,
+            &backend::resources(base),
+            stop,
+            allow_repair,
+            |resources| {
+                check()?;
+                let Some(binary) = preparer::binary(&root) else {
+                    return Ok(None);
+                };
+                launcher_log::play_detail(crate::i18n::tr("Preparing the game"));
+                pack_data_cache(&binary, &root, resources, Some(handoff), stop)
+            },
+        )
     }
 
     pub(crate) fn invalidate(root: &Path) -> io::Result<()> {
@@ -260,13 +296,31 @@ impl Resources {
     // Build the optional cache against the final path: the game caches
     // the canonical resource root inside it. A kill after exposure but before its evidence
     // write leaves a usable primary tree and an untrusted accelerator, never the reverse.
+    #[cfg(test)]
     fn seal(
         root: &Path,
         source: &Path,
         stop: Option<&Cancellation>,
         accelerator: impl FnOnce(&Path) -> Result<Option<[u8; 32]>, String>,
     ) -> Result<Self, String> {
-        Self::seal_with(root, source, pool::workers(), stop, accelerator)
+        Self::seal_at(root, source, stop, true, accelerator).map(|prepared| prepared.resources)
+    }
+
+    fn seal_at(
+        root: &Path,
+        source: &Path,
+        stop: Option<&Cancellation>,
+        allow_repair: bool,
+        accelerator: impl FnOnce(&Path) -> Result<Option<[u8; 32]>, String>,
+    ) -> Result<PreparedResources, String> {
+        Self::seal_with(
+            root,
+            source,
+            pool::workers(),
+            stop,
+            allow_repair,
+            accelerator,
+        )
     }
 
     // Each pass (hash, copy, flush) runs on `workers` threads and joins them before the next.
@@ -275,8 +329,9 @@ impl Resources {
         source: &Path,
         workers: usize,
         stop: Option<&Cancellation>,
+        allow_repair: bool,
         accelerator: impl FnOnce(&Path) -> Result<Option<[u8; 32]>, String>,
-    ) -> Result<Self, String> {
+    ) -> Result<PreparedResources, String> {
         let relative = source.strip_prefix(root).map_err(|_| setup_error())?;
         if relative.as_os_str().is_empty()
             || relative
@@ -318,6 +373,20 @@ impl Resources {
         let exists = snapshot.exists();
         if exists {
             require_dir(&snapshot)?;
+        }
+        if let Some(stop) = stop {
+            stop.check()?;
+        }
+        // Only explicit preparation may verify-and-repair an existing snapshot here.
+        // On Play's receipt-miss path, leave an already-existing snapshot untouched and
+        // unhashed for the single counted cutoff, and do not publish a receipt for it yet.
+        if exists && !allow_repair {
+            let accelerator =
+                optional_bytes(&evidence)?.and_then(|bytes| serde_json::from_slice(&bytes).ok());
+            return Ok(PreparedResources::reused(Self {
+                primary,
+                accelerator,
+            }));
         }
         // Only preparation may repair a snapshot. Check reuse here, not on Play
         // for a profile with a prepared snapshot.
@@ -391,7 +460,10 @@ impl Resources {
             accelerator,
         };
         write_receipt(&parent.join(CURRENT), &prepared)?;
-        Ok(prepared)
+        Ok(PreparedResources {
+            resources: prepared,
+            proven_by_seal: true,
+        })
     }
 }
 
@@ -813,8 +885,9 @@ mod tests {
                 let path = source.join("assets/empty.txt");
                 fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
             }
-            let prepared =
-                Resources::seal_with(root, &source, workers, None, |_| Ok(None)).unwrap();
+            let prepared = Resources::seal_with(root, &source, workers, None, true, |_| Ok(None))
+                .unwrap()
+                .resources;
             let snapshot = prepared.path_at(root);
             assert_eq!(
                 artifact::tree(&snapshot, true).unwrap(),
@@ -845,7 +918,7 @@ mod tests {
         let stop = Cancellation::default();
         stop.stop();
         for workers in [1, 2] {
-            let error = Resources::seal_with(root, &source, workers, Some(&stop), |_| {
+            let error = Resources::seal_with(root, &source, workers, Some(&stop), true, |_| {
                 panic!("sealed after a stop")
             })
             .unwrap_err();
@@ -876,7 +949,7 @@ mod tests {
             assert_eq!(error, setup_error());
             fs::remove_dir_all(root.join("copy")).unwrap();
             let error =
-                Resources::seal_with(root, &source, workers, None, |_| Ok(None)).unwrap_err();
+                Resources::seal_with(root, &source, workers, None, true, |_| Ok(None)).unwrap_err();
             assert!(error.contains("invalid data"), "{error}");
             assert!(!parent(root).exists());
         }
@@ -901,5 +974,40 @@ mod tests {
         assert_eq!(artifact::tree(&snapshot, true).unwrap(), Some(primary));
         let again = Resources::seal(root, &source, None, |_| panic!("sealed again")).unwrap();
         assert_eq!(again, sealed);
+    }
+
+    #[test]
+    fn play_receipt_miss_seals_new_snapshot_but_never_repairs_an_existing_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let source = nested_source(root);
+        let sealed = Resources::seal_with(root, &source, 1, None, false, |_| Ok(None)).unwrap();
+        assert!(sealed.proven_by_seal);
+        assert_eq!(
+            Resources::current(root).unwrap().as_ref(),
+            Some(&sealed.resources)
+        );
+        let snapshot = sealed.resources.path_at(root);
+        let blob = snapshot.join("assets/deep/er/blob.bin");
+        Resources::invalidate(root).unwrap();
+        fs::write(&blob, b"damaged on disk").unwrap();
+        let reused = Resources::seal_with(root, &source, 1, None, false, |_| {
+            panic!("Play receipt miss must not seal over an existing snapshot")
+        })
+        .unwrap();
+        assert!(!reused.proven_by_seal);
+        assert_eq!(reused.resources, sealed.resources);
+        assert_eq!(fs::read(&blob).unwrap(), b"damaged on disk");
+        assert_eq!(Resources::current(root).unwrap(), None);
+        let repaired = Resources::seal_with(root, &source, 1, None, true, |_| Ok(None)).unwrap();
+        assert!(repaired.proven_by_seal);
+        assert_eq!(
+            artifact::tree(&snapshot, true).unwrap(),
+            Some(sealed.resources.primary)
+        );
+        assert_eq!(
+            Resources::current(root).unwrap().as_ref(),
+            Some(&repaired.resources)
+        );
     }
 }
