@@ -6,7 +6,7 @@ use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::Instant;
 
-const UUID: &str = "069a79f444e94726a5befca90e38aaf5";
+pub(crate) const UUID: &str = "069a79f444e94726a5befca90e38aaf5";
 
 /// What the mock answers and what it was asked.
 #[derive(Default)]
@@ -367,6 +367,11 @@ fn mock(f: impl FnOnce(&mut Mock)) -> (Arc<Mutex<Mock>>, Endpoints) {
     let m = Arc::new(Mutex::new(m));
     let ep = serve(m.clone());
     (m, ep)
+}
+
+#[cfg(unix)]
+pub(crate) fn minecraft_services_mock() -> String {
+    mock(|_| {}).1.minecraft
 }
 
 fn notch() -> Account {
