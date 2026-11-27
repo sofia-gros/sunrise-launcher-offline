@@ -129,7 +129,7 @@ pub(crate) fn cap_linked(meta: &cap_std::fs::Metadata) -> bool {
 /// Removes `name` under `parent` without opening what a link there points to: a symlink or a
 /// junction goes as the link, and a folder with links inside goes with each of them unlinked
 /// through the held `Dir` handle.
-fn remove_entry(parent: &Dir, name: &Path) -> io::Result<()> {
+pub(crate) fn remove_entry(parent: &Dir, name: &Path) -> io::Result<()> {
     let meta = match parent.symlink_metadata(name) {
         Ok(meta) => meta,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),

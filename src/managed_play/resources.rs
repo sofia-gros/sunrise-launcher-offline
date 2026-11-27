@@ -437,18 +437,13 @@ impl Resources {
             }
             // Move the entire damaged snapshot aside, including stale accelerator evidence.
             // Publish only the already-flushed replacement while the preparation lock is held.
-            let _retired = if exists {
-                let retired = tempfile::Builder::new()
-                    .prefix(".prepared-damaged-")
-                    .tempdir_in(root.join(".local"))
-                    .map_err(io_failure)?;
-                durable::move_new_directory(&snapshot, &retired.path().join("snapshot"))
-                    .map_err(io_failure)?;
-                Some(retired)
-            } else {
-                None
-            };
-            durable::move_new_directory(stage.path(), &snapshot).map_err(io_failure)?;
+            publish_snapshot(
+                root,
+                stage.path(),
+                &snapshot,
+                exists,
+                durable::move_new_directory,
+            )?;
             let digest = accelerator(&resources)?;
             if let Some(digest) = digest {
                 write_receipt(&evidence, &digest)?;
@@ -474,6 +469,46 @@ pub(super) fn generated_cache(name: &OsStr) -> bool {
                 .and_then(|name| name.strip_suffix(".tmp"))
                 .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|c| c.is_ascii_digit()))
         })
+}
+
+fn publish_snapshot(
+    root: &Path,
+    staged: &Path,
+    snapshot: &Path,
+    exists: bool,
+    publish: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> Result<(), String> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static RETIRED: AtomicUsize = AtomicUsize::new(0);
+
+    let local = root.join(".local");
+    let retired = if exists {
+        require_dir(&local)?;
+        let name = format!(
+            ".prepared-damaged-{}-{}",
+            std::process::id(),
+            RETIRED.fetch_add(1, Ordering::Relaxed)
+        );
+        let path = local.join(&name);
+        durable::move_new_directory(snapshot, &path).map_err(io_failure)?;
+        Some((name, path))
+    } else {
+        None
+    };
+    if let Err(publish_err) = publish(staged, snapshot) {
+        if let Some((_, retired_path)) = retired {
+            durable::move_new_directory(&retired_path, snapshot).map_err(io_failure)?;
+        }
+        return Err(io_failure(publish_err));
+    }
+    if let Some((retired_name, _)) = retired {
+        if let Ok(local_dir) =
+            cap_std::fs::Dir::open_ambient_dir(&local, cap_std::ambient_authority())
+        {
+            let _ = crate::native_cache::remove_entry(&local_dir, Path::new(&retired_name));
+        }
+    }
+    Ok(())
 }
 
 fn parent(root: &Path) -> PathBuf {
@@ -1008,6 +1043,62 @@ mod tests {
         assert_eq!(
             Resources::current(root).unwrap().as_ref(),
             Some(&repaired.resources)
+        );
+    }
+
+    #[test]
+    fn publish_snapshot_restores_previous_on_failure_and_removes_retired_sibling_on_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let local = root.join(".local");
+        let snapshot = parent(root).join("snapshot-a");
+        let staged = local.join(".prepared-stage");
+        fs::create_dir_all(snapshot.join("resources")).unwrap();
+        fs::create_dir_all(staged.join("resources")).unwrap();
+        fs::write(snapshot.join("resources/blob.bin"), b"original snapshot").unwrap();
+        fs::write(snapshot.join("data-file.json"), b"old evidence").unwrap();
+        fs::write(staged.join("resources/blob.bin"), b"replacement snapshot").unwrap();
+
+        let damaged_siblings = || {
+            fs::read_dir(&local)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with(".prepared-damaged-"))
+                .collect::<Vec<_>>()
+        };
+
+        let err = publish_snapshot(root, &staged, &snapshot, true, |_, _| {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        })
+        .expect_err("failing publish must return an error");
+        assert!(!err.is_empty());
+        assert_eq!(
+            fs::read(snapshot.join("resources/blob.bin")).unwrap(),
+            b"original snapshot"
+        );
+        assert_eq!(
+            fs::read(snapshot.join("data-file.json")).unwrap(),
+            b"old evidence"
+        );
+        assert!(
+            damaged_siblings().is_empty(),
+            "retired sibling must be restored, not left behind"
+        );
+        assert_eq!(
+            fs::read(staged.join("resources/blob.bin")).unwrap(),
+            b"replacement snapshot"
+        );
+
+        publish_snapshot(root, &staged, &snapshot, true, durable::move_new_directory).unwrap();
+        assert_eq!(
+            fs::read(snapshot.join("resources/blob.bin")).unwrap(),
+            b"replacement snapshot"
+        );
+        assert!(!snapshot.join("data-file.json").exists());
+        assert!(!staged.exists());
+        assert!(
+            damaged_siblings().is_empty(),
+            "retired sibling must be removed after publish succeeds"
         );
     }
 }
