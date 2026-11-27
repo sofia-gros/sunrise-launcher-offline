@@ -902,7 +902,7 @@ fn windows_bound_x64_fallback_survives_pending_retry_and_committed_replay() {
 
 /// One Play hashes the prepared files once, at the handoff right before the child. Damage still
 /// refuses every Play, from the saved generation and from the one a refresh advanced to, and
-/// putting the files back is all it takes to play again.
+/// re-preparing restores Play without removing the damaged snapshot by hand.
 #[test]
 fn play_hashes_the_prepared_files_once_and_still_refuses_damage() {
     use super::super::FULL_VERIFICATIONS;
@@ -911,23 +911,61 @@ fn play_hashes_the_prepared_files_once_and_still_refuses_damage() {
         "managed_play::client::tests::play_hashes_the_prepared_files_once_and_still_refuses_damage";
     const BUILD: &str = "v0.1.8";
     const BLOB: &[u8] = b"original bytes";
-    if std::env::var_os("PLAY_ONE_HASH_FIXTURE").is_none() {
-        let root = tempfile::tempdir().unwrap();
-        assert!(Command::new(std::env::current_exe().unwrap())
+    const FIXTURE: &str = "PLAY_ONE_HASH_FIXTURE";
+    let Some(fixture) = std::env::var_os(FIXTURE) else {
+        let root = tempfile::Builder::new()
+            .prefix("play-one-hash-")
+            .tempdir()
+            .unwrap();
+        fs::write(root.path().join("fixture"), TEST).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", TEST, "--nocapture"])
-            .env("PLAY_ONE_HASH_FIXTURE", "1")
+            .env(FIXTURE, root.path())
             .env("SUNRISE_HOME", root.path().join("game"))
             .env("SUNRISE_LAUNCHER_HOME", root.path().join("launcher"))
             .env(
                 "SUNRISE_LAUNCHER_LOCATION_FILE",
-                root.path().join("location")
+                root.path().join("location"),
             )
             .env("SUNRISE_NO_KEYCHAIN", "1")
             .env("XDG_CONFIG_HOME", root.path().join("config"))
-            .status()
-            .unwrap()
-            .success());
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success()
+                && stdout
+                    .lines()
+                    .any(|line| line.starts_with("test result: ok. 1 passed;")),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         return;
+    };
+    let fixture = std::path::PathBuf::from(fixture);
+    let canonical = fixture.canonicalize().unwrap();
+    assert_eq!(
+        canonical.parent().unwrap(),
+        std::env::temp_dir().canonicalize().unwrap()
+    );
+    assert!(canonical
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("play-one-hash-"));
+    assert_eq!(fs::read_to_string(fixture.join("fixture")).unwrap(), TEST);
+    for (var, name) in [
+        ("SUNRISE_HOME", "game"),
+        ("SUNRISE_LAUNCHER_HOME", "launcher"),
+        ("SUNRISE_LAUNCHER_LOCATION_FILE", "location"),
+        ("XDG_CONFIG_HOME", "config"),
+    ] {
+        let path = fixture.join(name);
+        assert_eq!(std::env::var_os(var).as_deref(), Some(path.as_os_str()));
+        assert_eq!(
+            fs::symlink_metadata(path).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
     }
     let home = backend::game_home();
     let build = backend::version_dir(BUILD);
@@ -1010,7 +1048,9 @@ fn play_hashes_the_prepared_files_once_and_still_refuses_damage() {
     let refreshed = intact(&mut profile);
     assert_eq!(refreshed.generation(), 2);
 
-    // A changed prepared file: an unchanged Play gets to the handoff and is refused there.
+    // Tamper after publication: the resources must still be checked at the handoff.
+    let (_, before_handoff) = ready(&mut profile).unwrap();
+    assert_eq!(before_handoff, 0);
     let blob = refreshed.resource_path().join("fixture-blob.bin");
     fs::write(&blob, b"tampered bytes").unwrap();
     let (active, before_handoff) = ready(&mut profile).unwrap();
@@ -1078,8 +1118,12 @@ fn play_hashes_the_prepared_files_once_and_still_refuses_damage() {
     snapshot_error(&again, result.unwrap_err());
     assert!(!spawned.get());
 
-    // Putting the file back is the way out from generation 3, as it was from 2.
-    fs::write(&blob, BLOB).unwrap();
+    // Prepare the same build without deleting its damaged snapshot. The committed digest
+    // and generation need not change to recover.
+    {
+        let preparation = backend::prepare_lock(BUILD).unwrap();
+        backend::finish_preparation(BUILD, &preparation).unwrap();
+    }
     assert_eq!(intact(&mut profile), advanced);
 
     // A client snapshot cannot authorize its own replacement by claiming to be server-only.
@@ -1101,12 +1145,16 @@ fn play_hashes_the_prepared_files_once_and_still_refuses_damage() {
     fs::write(&manifest_file, b"{}").unwrap();
     assert_eq!(intact(&mut profile), advanced);
 
-    // A changed binary is refused by the first check of an unchanged Play, without hashing
+    // A changed binary is refused before refreshing changed inputs, without hashing
     // the prepared files, and again at the handoff when it changes after Play was ready.
     let program = build.join(backend::CLIENT);
+    write_package("4.0.0");
     fs::write(&program, b"changed client").unwrap();
     let error = ready(&mut profile).unwrap_err();
     assert!(String::from(error).contains("managed_play.rs:"));
+    assert_eq!(FULL_VERIFICATIONS.take(), 0);
+    assert_eq!(profile.active().unwrap(), Some(advanced.clone()));
+    write_package("3.0.0");
     fs::write(&program, client_bytes).unwrap();
     let (active, _) = ready(&mut profile).unwrap();
     fs::write(&program, b"changed client").unwrap();

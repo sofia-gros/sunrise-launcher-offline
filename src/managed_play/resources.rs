@@ -24,6 +24,12 @@ pub(crate) struct Resources {
     accelerator: Option<[u8; 32]>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Full prepared-file verifications requested on this thread. Tests take it with `Cell::take`.
+    pub(crate) static FULL_VERIFICATIONS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 impl Resources {
     pub(super) fn capture(
         base: &str,
@@ -201,6 +207,8 @@ impl Resources {
     }
 
     pub(super) fn verify(&self, base: &str) -> Result<(), String> {
+        #[cfg(test)]
+        FULL_VERIFICATIONS.with(|count| count.set(count.get() + 1));
         let root = backend::version_dir(base);
         let path = self.path(base);
         for dir in [

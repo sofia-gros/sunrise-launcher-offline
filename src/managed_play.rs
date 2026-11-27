@@ -827,9 +827,7 @@ impl Active {
         Ok(())
     }
 
-    /// The binaries and signed receipts only: milliseconds, unlike the prepared files. Play's
-    /// earlier checks use this; `Profile::verified_handoff` runs the full
-    /// [`Self::verify_artifacts`] right before the child exists.
+    /// Check the binaries and signed receipts without walking the prepared resource tree.
     pub fn verify_binaries(&self) -> Result<(), String> {
         let base = match &self.variant {
             Some(variant) => variant.verify(self.base())?,
@@ -846,14 +844,12 @@ impl Active {
 
     pub fn verify_artifacts(&self) -> Result<(), String> {
         self.verify_binaries()?;
-        #[cfg(test)]
-        FULL_VERIFICATIONS.with(|count| count.set(count.get() + 1));
         self.resources.verify(self.base())
     }
 
     /// Capture a full immutable generation after owning the admitted profile and checking
     /// the chosen image. Only the journal's Switch arm may advance to a distinct base.
-    /// Verify the bound resources at the publication cutoff, not while assembling the pointer.
+    /// The caller owns resource verification at its cutoff; capture only records the selection.
     fn capture(
         base: &str,
         executable: &str,
@@ -936,10 +932,7 @@ impl Active {
 }
 
 #[cfg(test)]
-thread_local! {
-    /// Full prepared-file verifications requested on this thread. Tests take it with `Cell::take`.
-    pub(crate) static FULL_VERIFICATIONS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-}
+pub(crate) use resources::FULL_VERIFICATIONS;
 
 fn capture_mod_locks(home: &Path) -> Result<Vec<ModLock>, String> {
     let path = home.join(crate::browser::installed::MANIFEST);
