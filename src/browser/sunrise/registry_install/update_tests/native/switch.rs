@@ -168,6 +168,7 @@ fn switch_with(
             },
             confirm_publisher_change: None,
             pin_dir: None,
+            recover_held: false,
         },
         || Ok(fixture.index_for(tag)),
         &fetch_fixture,

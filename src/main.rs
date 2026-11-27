@@ -40,6 +40,7 @@ mod glass_storage;
 mod glass_toast;
 mod glass_ui;
 mod home;
+mod home_fit;
 mod home_mods;
 mod instance_icons;
 mod instances_page;

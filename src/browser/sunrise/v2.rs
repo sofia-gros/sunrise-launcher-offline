@@ -186,6 +186,16 @@ struct RefreshContext<'a> {
 }
 
 static LOADED: Mutex<Option<LoadedState>> = Mutex::new(None);
+
+/// The serial of the verified catalogue held in memory, if one is: what a cached answer drawn
+/// from the index (Home's build suggestion) keys on, with no file read or fetch.
+pub fn loaded_serial() -> Option<u64> {
+    LOADED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .map(|loaded| loaded.catalog.index.serial)
+}
 /// The verified snapshot on disk, read by [`read_saved_index`] while nothing is loaded yet.
 static SAVED: Mutex<Option<Catalog>> = Mutex::new(None);
 /// Serializes on-disk serial-floor checks and cache publication across stores.
