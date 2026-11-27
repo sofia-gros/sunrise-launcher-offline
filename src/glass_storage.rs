@@ -38,7 +38,7 @@ pub(super) fn kept_line(
     let size = storage::format_bytes(remaining);
     Some(if !after_clear {
         trf(
-            "{size} kept because compiler workers may still be using it.",
+            "{size} is protected and can't be cleared. See the launcher log for details.",
             &[("size", &size)],
         )
     } else if older_build_kept {

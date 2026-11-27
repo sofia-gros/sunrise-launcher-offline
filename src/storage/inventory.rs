@@ -31,8 +31,6 @@ pub struct Row {
     pub after_clear: bool,
     #[serde(skip)]
     pub older_build_kept: bool,
-    #[serde(skip)]
-    private_compiler_bytes: u64,
     /// Refused or busy units are retained, with their allocated bytes and a visible reason.
     pub kept: Vec<Kept>,
 }
@@ -46,14 +44,12 @@ impl Row {
             remaining_bytes: 0,
             after_clear: false,
             older_build_kept: false,
-            private_compiler_bytes: 0,
             kept: Vec::new(),
         }
     }
 
     pub fn clearable_bytes(&self) -> u64 {
         self.remaining_bytes
-            .saturating_sub(self.private_compiler_bytes)
     }
 
     fn keep(&mut self, bytes: u64, error: Error, log: bool) {
@@ -76,14 +72,6 @@ impl Row {
             bytes,
             reason: native_mods::cache_error(error),
         });
-    }
-
-    /// Private compiler work counts toward the row but is never offered for clearing.
-    fn retain_compiler(&mut self, bytes: u64) {
-        self.private_compiler_bytes = bytes;
-        self.bytes = self.bytes.saturating_add(bytes);
-        self.remaining_bytes = self.remaining_bytes.saturating_add(bytes);
-        self.kept.push(Kept { bytes, reason: crate::i18n::tr("Private compiler work was kept because the launcher couldn't prove all workers had stopped.").into() });
     }
 }
 
@@ -132,17 +120,6 @@ impl Report {
         self.total_bytes = self.total_bytes.saturating_add(row.bytes);
         self.rows.push(row);
     }
-
-    fn include_retained_compiler(&mut self, bytes: Option<u64>) {
-        if let Some(bytes) = bytes {
-            self.rows
-                .iter_mut()
-                .find(|r| r.category == Category::BuildFiles)
-                .expect("report contains Build files")
-                .retain_compiler(bytes);
-            self.total_bytes = self.total_bytes.saturating_add(bytes);
-        }
-    }
 }
 
 impl Category {
@@ -185,6 +162,13 @@ impl Root {
     }
 }
 
+fn compiler_attempt(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|name| {
+        name.starts_with(native_mods::ATTEMPT_PREFIX)
+            || name.starts_with(native_mods::OLD_ATTEMPT_PREFIX)
+    })
+}
+
 struct Entry {
     category: Category,
     directory: Option<Arc<Dir>>,
@@ -215,12 +199,18 @@ impl Entry {
         })
     }
 
+    fn is_compiler_attempt(&self) -> bool {
+        self.relative.parent() == Some(Path::new("native"))
+            && self.relative.file_name().is_some_and(compiler_attempt)
+    }
+
     /// The lease integration changes this classification, not deletion code.
     fn access(&self) -> Result<Access, Error> {
         #[cfg(test)]
         ACCESS.with(|calls| calls.set(calls.get() + 1));
         match self.category {
             Category::RustCompiler => Ok(Access::BuildTools),
+            _ if self.is_compiler_attempt() => Ok(Access::BuildTools),
             // No game runs from kept mod libraries: a build copies them into its workspace.
             _ if self.relative.starts_with(BuildCache::KeptMods.relative()) => {
                 Ok(Access::BuildTools)
@@ -245,7 +235,14 @@ impl Entry {
         for part in self.relative.parent().unwrap_or(Path::new("")).components() {
             parent = parent.open_dir_nofollow(part.as_os_str())?;
         }
-        Storage::clear_entry(root, &parent, Path::new(self.relative.file_name().unwrap()))
+        let name = Path::new(self.relative.file_name().expect("entry has a name"));
+        if self.is_compiler_attempt() {
+            // Attempts are never reused. Explicit Clear holds the build lease, but an old
+            // compiler could still be writing here. Use no-follow removal and let the OS
+            // reject any open file it can't unlink.
+            return present(parent.remove_dir_all(name)).map(|_| ());
+        }
+        Storage::clear_entry(root, &parent, name)
     }
 }
 
@@ -364,6 +361,7 @@ impl Storage {
     }
 
     fn build_entries(&self, entries: &mut Vec<Entry>, build_root: &Root) -> Result<(), Error> {
+        let native = Entry::fixed(build_root, Path::new("native"), Category::BuildFiles)?;
         for cache in BUILD_CACHES {
             if matches!(
                 cache,
@@ -392,6 +390,17 @@ impl Storage {
             }
         }
         let build_files = Category::BuildFiles;
+        for child in children(&native.path)? {
+            if compiler_attempt(&child.file_name())
+                && present(child.file_type())?.is_some_and(|kind| kind.is_dir())
+            {
+                entries.push(Entry::fixed(
+                    build_root,
+                    &Path::new("native").join(child.file_name()),
+                    build_files,
+                )?);
+            }
+        }
         for name in [
             "built.json",
             "internals.json",
@@ -466,30 +475,6 @@ impl Storage {
         Ok(())
     }
 
-    /// Not deletion candidates: an unproved worker can still be writing to them.
-    fn retained_compiler_bytes(
-        &self,
-        counted: &mut HashSet<(u64, u64)>,
-        cancel: &Cancel,
-    ) -> Result<Option<u64>, Error> {
-        let native = self.root.join("native");
-        let mut bytes = None;
-        if checked(&native, true)?.is_some() {
-            for entry in children(&native)? {
-                if entry.file_name().to_str().is_some_and(|name| {
-                    name.starts_with(native_mods::ATTEMPT_PREFIX)
-                        || name.starts_with(native_mods::OLD_ATTEMPT_PREFIX)
-                }) {
-                    // A changing or unreadable tree is still protected; zero means its size is unknown.
-                    let size = Tree::build_until(&entry.path(), cancel)
-                        .map_or(0, |tree| tree.size(counted));
-                    bytes = Some(bytes.unwrap_or(0u64).saturating_add(size));
-                }
-            }
-        }
-        Ok(bytes)
-    }
-
     /// A read-only count, or a manual Clear of one row or all of them under the build lease.
     pub fn report(&self, clear: Option<Category>, all: bool) -> Result<Report, Error> {
         if clear.is_none() && !all {
@@ -510,11 +495,7 @@ impl Storage {
             Err(error) => return Err(error.into()),
         }
         let entries = self.entries()?;
-        let mut report = self.apply_retaining(entries, clear, all, true, Some(&lease))?;
-        report.include_retained_compiler(
-            self.retained_compiler_bytes(&mut HashSet::new(), &Cancel::default())?,
-        );
-        Ok(report)
+        self.apply_retaining(entries, clear, all, true, Some(&lease))
     }
 
     #[cfg(test)]
@@ -617,6 +598,18 @@ impl Storage {
                         if matches!(entry.access()?, Access::BuildTools) {
                             break;
                         }
+                    }
+                    Err(error @ Error::Io(_)) if retain && entry.is_compiler_attempt() => {
+                        // A failed recursive removal can already have freed some files. If
+                        // the rest can't be measured, conservatively keep its original size.
+                        if let Ok(tree) = Tree::build(&entry.path) {
+                            trees[index] = tree;
+                        }
+                        let row = rows
+                            .iter_mut()
+                            .find(|row| row.category == entry.category)
+                            .expect("all categories have a row");
+                        row.keep(trees[index].size(&mut HashSet::new()), error, true);
                     }
                     Err(error) => return Err(error),
                 }
@@ -906,22 +899,66 @@ mod manual_tests {
     }
 
     #[test]
-    fn retained_compiler_bytes_cannot_be_cleared() {
+    fn explicit_clear_removes_retained_attempts_under_the_build_lease() {
         let home = crate::storage::tests::Home::new();
         let old_worker = home.seed("native/.nb-old/compiler/w");
         let older_launchers = home.seed("native/.native-attempt-older/compiler/work");
         let storage = Storage::at(&home.0).unwrap();
+        let lease = storage.build_lease().unwrap();
         let report = storage.report(None, false).unwrap();
-        let protected = &report.rows[0];
-        assert_eq!(protected.category, Category::BuildFiles);
-        assert!(protected.remaining_bytes > 0);
-        assert_eq!(protected.bytes, protected.remaining_bytes);
-        assert_eq!(protected.clearable_bytes(), 0);
-        assert_eq!(protected.kept[0].bytes, protected.remaining_bytes);
+        let built = report
+            .rows
+            .iter()
+            .find(|row| row.category == Category::BuildFiles)
+            .unwrap();
+        let bytes = allocated_bytes(&home.0.join("native/.nb-old")).unwrap()
+            + allocated_bytes(&home.0.join("native/.native-attempt-older")).unwrap();
+        assert!(bytes > 0);
+        assert_eq!(built.clearable_bytes(), bytes);
+        assert!(built.kept.is_empty());
+        assert!(matches!(
+            storage.report(Some(Category::BuildFiles), false),
+            Err(Error::Busy)
+        ));
+        assert!(old_worker.exists() && older_launchers.exists());
+        drop(lease);
         let manual = storage.report(Some(Category::BuildFiles), false).unwrap();
-        assert_eq!(manual.rows[0].clearable_bytes(), 0);
-        assert!(old_worker.is_file());
-        assert!(older_launchers.is_file());
+        let built = manual
+            .rows
+            .iter()
+            .find(|row| row.category == Category::BuildFiles)
+            .unwrap();
+        assert_eq!(built.freed_bytes, bytes);
+        assert_eq!(built.remaining_bytes, 0);
+        assert!(!home.0.join("native/.nb-old").exists());
+        assert!(!home.0.join("native/.native-attempt-older").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn clear_retries_a_retained_attempt_after_its_locked_file_closes() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+        let home = crate::storage::tests::Home::new();
+        let path = home.seed("native/.nb-old/locked");
+        let storage = Storage::at(&home.0).unwrap();
+        let kept_open = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&path)
+            .unwrap();
+        let report = storage.report(Some(Category::BuildFiles), false).unwrap();
+        let row = report
+            .rows
+            .iter()
+            .find(|row| row.category == Category::BuildFiles)
+            .unwrap();
+        assert_eq!(row.kept.len(), 1);
+        assert!(row.remaining_bytes > 0);
+        assert!(path.is_file());
+        drop(kept_open);
+        storage.report(Some(Category::BuildFiles), false).unwrap();
+        assert!(!path.exists());
     }
 
     #[test]

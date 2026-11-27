@@ -35,7 +35,7 @@ fn idle_clear_explains_only_a_wholly_protected_row() {
     let line = kept_line(2_000_000, 0, false, true, false).unwrap();
     assert_eq!(
         line,
-        "2.0 MB kept because compiler workers may still be using it."
+        "2.0 MB is protected and can't be cleared. See the launcher log for details."
     );
     assert_eq!(kept_line(2_000_000, 1_000_000, false, true, false), None);
 }
