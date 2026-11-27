@@ -404,14 +404,21 @@ impl Entry {
             };
             // On Windows, a junction is a directory entry; unlink it without opening it.
             #[cfg(windows)]
-            if linked(&meta) {
-                use std::os::windows::fs::MetadataExt;
-                use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
-                if meta.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0 {
+            let is_link = {
+                use cap_std::fs::MetadataExt;
+                use windows_sys::Win32::Storage::FileSystem::{
+                    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+                };
+                let attributes = meta.file_attributes();
+                let is_link = attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+                if is_link && attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
                     return present(parent.remove_dir(name)).map(|_| ());
                 }
-            }
-            if linked(&meta) || meta.is_file() {
+                is_link
+            };
+            #[cfg(not(windows))]
+            let is_link = meta.file_type().is_symlink();
+            if is_link || meta.is_file() {
                 return present(parent.remove_file(name)).map(|_| ());
             }
             // Keep the no-follow parent as the boundary throughout recursive removal.
@@ -721,15 +728,19 @@ impl Storage {
         ]
         .into_iter()
         .collect();
+        let game = backend::plain(backend::game_home());
+        let profile_home = |path: &Path| {
+            let path = backend::plain(path.to_owned());
+            path == game
+                || profiles
+                    .iter()
+                    .any(|profile| backend::plain(profile.home.clone()) == path)
+        };
         for parent in parents {
             if cancel.is_cancelled() {
                 break;
             }
-            if profile_home(&parent, profiles)
-                || parent
-                    .parent()
-                    .is_some_and(|outer| profile_home(outer, profiles))
-            {
+            if profile_home(&parent) || parent.parent().is_some_and(&profile_home) {
                 continue;
             }
             let root = match Root::open(&parent) {
