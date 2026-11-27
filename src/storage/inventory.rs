@@ -315,8 +315,10 @@ fn children(folder: &Path) -> Result<Vec<fs::DirEntry>, Error> {
 
 // Lets a test change the disk between a folder's listing and what is done with its entries.
 #[cfg(test)]
+type ListedHook = Box<dyn Fn(&Path)>;
+#[cfg(test)]
 thread_local! {
-    static LISTED: std::cell::RefCell<Option<Box<dyn Fn(&Path)>>> =
+    static LISTED: std::cell::RefCell<Option<ListedHook>> =
         const { std::cell::RefCell::new(None) };
 }
 

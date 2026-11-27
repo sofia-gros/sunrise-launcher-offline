@@ -63,28 +63,29 @@ impl Home {
 }
 
 #[test]
-fn storage_counts_unproved_compiler_work_but_never_offers_to_clear_it() {
+fn storage_clears_retained_compiler_attempts_on_explicit_clear() {
     let home = Home::new();
-    let old = home.file(
+    home.file("launcher/native/.nb-old/compiler/w", &[9; 16384]);
+    home.file(
         "launcher/native/.native-attempt-old/compiler/work",
         &[9; 16384],
     );
-    let output = home.run(&["storage", "--clear", "build-files"]);
-    assert!(!output.status.success(), "{output:?}");
-    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let report = home.clear("build-files");
     let row = report["rows"]
         .as_array()
         .unwrap()
         .iter()
         .find(|row| row["category"] == "build-files")
         .unwrap();
-    assert!(row["kept"][0]["reason"]
-        .as_str()
-        .unwrap()
-        .contains("prove all workers had stopped"));
-    assert!(row["kept"][0]["bytes"].as_u64().unwrap() >= 16384);
-    assert_eq!(row["kept"][0]["bytes"], row["remaining_bytes"]);
-    assert_eq!(fs::read(old).unwrap(), [9; 16384]);
+    assert!(row["kept"].as_array().unwrap().is_empty());
+    assert!(row["freed_bytes"].as_u64().unwrap() >= 32768);
+    assert_eq!(row["remaining_bytes"].as_u64().unwrap(), 0);
+    assert!(!home.0.path().join("launcher/native/.nb-old").exists());
+    assert!(!home
+        .0
+        .path()
+        .join("launcher/native/.native-attempt-old")
+        .exists());
 }
 
 #[test]
