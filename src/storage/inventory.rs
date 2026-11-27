@@ -710,6 +710,16 @@ fn refused(
                 .find(|row| row.category == entry.category)
                 .unwrap()
                 .keep(0, error, clearing(entry.category)),
+            Err(Error::Io(error))
+                if clearing(entry.category)
+                    && (error.kind() == std::io::ErrorKind::PermissionDenied
+                        || cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33))) =>
+            {
+                rows.iter_mut()
+                    .find(|row| row.category == entry.category)
+                    .unwrap()
+                    .keep(0, Error::Io(error), true);
+            }
             Err(error) => return Err(error),
         }
     }

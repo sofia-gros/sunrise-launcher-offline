@@ -214,6 +214,32 @@ fn clear_retries_a_retained_attempt_after_its_locked_file_closes() {
     assert!(!path.exists());
 }
 
+#[cfg(windows)]
+#[test]
+fn clear_keeps_an_attempt_that_denies_read_sharing_and_removes_other_attempts() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let home = Home::new();
+    let locked = home.seed("native/.nb-locked/output");
+    let free = home.seed("native/.nb-free/output");
+    let handle = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&locked)
+        .unwrap();
+    let storage = Storage::at(&home.0).unwrap();
+    let report = storage.report(Some(Category::BuildFiles), false).unwrap();
+    let row = report
+        .rows
+        .iter()
+        .find(|row| row.category == Category::BuildFiles)
+        .unwrap();
+    assert_eq!(row.kept.len(), 1);
+    assert!(row.freed_bytes > 0);
+    assert!(!free.exists());
+    drop(handle);
+    assert!(locked.exists());
+}
+
 #[test]
 fn mod_build_cache_counts_slots_and_detached_trash_then_clears_under_the_build_lease() {
     let home = Home::new();
