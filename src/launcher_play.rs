@@ -144,7 +144,10 @@ impl Launcher {
             match backend::switch_from_auto(&home, api) {
                 Ok(changed) => switched |= changed,
                 Err(e) => {
-                    sunrise_launcher::elog!("Sunrise launcher: could not switch to {label}: {e}")
+                    sunrise_launcher::elog!(
+                        "Sunrise launcher: could not switch to {label}: {}",
+                        sunrise_launcher::launcher_log::safe_error(&e.to_string())
+                    )
                 }
             }
         }
@@ -260,7 +263,12 @@ impl Launcher {
         std::thread::spawn(move || {
             let _in = sunrise_launcher::launcher_log::enter(&op);
             let log = |line: String| {
-                sunrise_launcher::launcher_log::line(format!("Preparing: {line}"));
+                sunrise_launcher::launcher_log::line(
+                    sunrise_launcher::launcher_log::preparer_line(&line),
+                );
+                let _ = tx.send(Msg::Line(Job::Prepare, line));
+            };
+            let diagnostics = |line: String| {
                 let _ = tx.send(Msg::Line(Job::Prepare, line));
             };
             let result = (|| {
@@ -272,8 +280,10 @@ impl Launcher {
                     None => backend::preparer(&tag, &minecraft, from, &log, &lock)?,
                 };
                 match &stop {
-                    Some(stop) => backend::sounds_cancellable(&tag, &minecraft, &log, &lock, stop),
-                    None => backend::sounds(&tag, &minecraft, &log, &lock),
+                    Some(stop) => {
+                        backend::sounds_cancellable(&tag, &minecraft, &diagnostics, &lock, stop)
+                    }
+                    None => backend::sounds(&tag, &minecraft, &diagnostics, &lock),
                 }
                 backend::set_prepare_step(backend::PrepareStep::Prepare);
                 backend::spawn_holding_cancellable(

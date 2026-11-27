@@ -2145,7 +2145,10 @@ fn resources_compatible(from: &Path, to: &Path, resources: &Path, legacy: &[(&st
     }
     let declared = |root: &Path| {
         output_version_at(root).inspect_err(|error| {
-            crate::elog!("{}: {}", root.display(), preparer_source_error(error));
+            crate::elog!(
+                "Could not read a build's preparer source: {}",
+                crate::launcher_log::safe_error(&error.to_string())
+            );
         })
     };
     let (Ok(source), Ok(target)) = (declared(from), declared(to)) else {
@@ -2525,6 +2528,21 @@ pub(crate) fn reuse_prepared_for(tag: &str) {
 }
 
 fn reuse_prepared_for_cancellable(tag: &str, stop: Option<&crate::native_mods::Cancellation>) {
+    reuse_prepared_within(tag, stop, DATA_FILE_DEADLINE);
+}
+
+/// How long an install that has no Cancel of its own (Play's install, a local build's import)
+/// waits for the optional data-file writer before it stops it. A switch's Cancel stops it at
+/// any time instead.
+const DATA_FILE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// [`reuse_prepared_for_cancellable`], waiting at most `deadline` for the data-file writer when
+/// there is no `stop` to end it.
+fn reuse_prepared_within(
+    tag: &str,
+    stop: Option<&crate::native_mods::Cancellation>,
+    deadline: std::time::Duration,
+) {
     if stop.is_some_and(crate::native_mods::Cancellation::is_stopped) {
         return;
     }
@@ -2562,16 +2580,49 @@ fn reuse_prepared_for_cancellable(tag: &str, stop: Option<&crate::native_mods::C
     // a virus scanner (#1961), so it says so.
     crate::launcher_log::play_detail(crate::i18n::tr("Writing the game's data file"));
     let writing = crate::launcher_log::step(format!("Writing {tag}'s data file"));
-    match write_data_file(&version_dir(tag), &resources(tag), stop) {
+    let (result, gave_up) =
+        write_data_file_within(&version_dir(tag), &resources(tag), stop, deadline);
+    match result {
         Ok(()) => writing.done(""),
-        Err(e) => {
-            crate::elog!(
-                "{tag}: the data file was not written: {}",
-                crate::launcher_log::safe_error(&e)
-            );
-            writing.failed(e);
+        Err(_) if gave_up => {
+            writing.note(format!(
+                "stopped after {} s: nothing could cancel it, and the data file is optional",
+                deadline.as_secs()
+            ));
+            writing.cancelled();
         }
+        Err(e) => writing.failed(e),
     }
+}
+
+/// [`write_data_file`] that never waits past `deadline` when there is no `stop`: the writer
+/// gets a cancellation of its own, stopped at the deadline, so a preparer that never answers
+/// can't hang an install after its build is in place (review of #615). The lock is still
+/// held only while it runs. The flag says whether the deadline stopped it.
+fn write_data_file_within(
+    root: &Path,
+    resources: &Path,
+    stop: Option<&crate::native_mods::Cancellation>,
+    deadline: std::time::Duration,
+) -> (Result<(), String>, bool) {
+    if let Some(stop) = stop {
+        return (write_data_file(root, resources, Some(stop)), false);
+    }
+    let own = crate::native_mods::Cancellation::default();
+    let (finished, wait) = std::sync::mpsc::channel::<()>();
+    let watchdog = {
+        let own = own.clone();
+        std::thread::spawn(move || {
+            if wait.recv_timeout(deadline) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                own.stop();
+            }
+        })
+    };
+    let result = write_data_file(root, resources, Some(&own));
+    drop(finished);
+    let _ = watchdog.join();
+    let gave_up = result.is_err() && own.is_stopped();
+    (result, gave_up)
 }
 
 /// Writes a prepared version's `sunrise-data.bin` so its first start already reads one file, not
@@ -2635,7 +2686,7 @@ pub fn reuse_prepared_everywhere() -> Vec<(String, String)> {
         refill_own_store(&tag, missing.as_ref());
         if was_reused {
             if let Err(error) = finish_preparation_with_missing(&tag, &preparation, missing) {
-                crate::elog!("{tag}: {error}");
+                crate::elog!("{tag}: {}", crate::launcher_log::safe_error(&error));
             }
         } else if let Some(lacking) = missing {
             complete_assets_lacking_staged(&tag, &handoff, lacking);
@@ -2760,6 +2811,7 @@ pub(crate) fn complete_assets_staged(tag: &str, handoff: &crate::preparer::Hando
         &versions_dir(),
         tag,
         minecraft_folders,
+        // Its lines name no path: each failure in it is logged as its kind alone.
         &|line| crate::elog!("{line}"),
         Some(handoff),
     );
@@ -2775,6 +2827,7 @@ pub(crate) fn complete_assets_lacking_staged(
         tag,
         Some(lacking),
         minecraft_folders,
+        // Its lines name no path: each failure in it is logged as its kind alone.
         &|line| crate::elog!("{line}"),
         Some(handoff),
     );
@@ -2831,8 +2884,13 @@ fn refill_own_store(tag: &str, missing: Option<&crate::preparer::Extras>) {
             .map_err(|e| e.to_string())?;
         Ok(body)
     };
-    if let Err(e) = download_for_owner(&pins, &own, &fetch, None, &|line| crate::elog!("{line}")) {
-        crate::elog!("{tag}: the missing assets were not downloaded: {e}");
+    if let Err(e) = download_for_owner(&pins, &own, &fetch, None, &|line| {
+        crate::elog!("{}", crate::launcher_log::without_paths(&line))
+    }) {
+        crate::elog!(
+            "{tag}: the missing assets were not downloaded: {}",
+            crate::launcher_log::safe_error(&e.to_string())
+        );
     }
 }
 
@@ -3006,7 +3064,10 @@ fn download_for_owner(
         &mut accounts,
     );
     if let Err(e) = accounts.save_renewed() {
-        log(format!("Sunrise: the accounts are not saved: {e}"));
+        log(format!(
+            "Sunrise: the accounts are not saved: {}",
+            crate::launcher_log::safe_error(&e.to_string())
+        ));
     }
     download_for(
         pins,
@@ -3230,7 +3291,10 @@ fn assets_folder(
             chosen.to_path_buf()
         }
         Err(e) => {
-            log(format!("Minecraft {version}'s assets: {e}"));
+            log(format!(
+                "Minecraft {version}'s assets: {}",
+                crate::launcher_log::safe_error(&e.to_string())
+            ));
             chosen.to_path_buf()
         }
     }
@@ -3552,17 +3616,22 @@ pub(crate) fn sounds_staged(
     let tag = tag.as_str();
     let dir = version_dir(tag);
     set_prepare_step(PrepareStep::Sounds);
+    let step = crate::launcher_log::step("Copying game sounds");
     log(tr("Copying the sounds from your Minecraft install").into());
     let result = match crate::preparer::binary(&dir) {
         Some(binary) => crate::preparer::sounds(&binary, &dir, minecraft, log, Some(handoff))
             .and_then(|done| done.ok_or_else(|| crate::preparer::too_old(tag))),
         None => Err(crate::preparer::too_old(tag)),
     };
-    if let Err(why) = result {
-        log(trf(
-            "No sound (the game will be silent): {why}",
-            &[("why", &why)],
-        ));
+    match result {
+        Ok(()) => step.done(""),
+        Err(why) => {
+            step.failed(&why);
+            log(trf(
+                "No sound (the game will be silent): {why}",
+                &[("why", &why)],
+            ));
+        }
     }
 }
 
@@ -4516,7 +4585,7 @@ fn install_selected_release(
     let before = installed();
     let outcome = install(release)?;
     if let Some(warning) = outcome.receipt_warning() {
-        crate::elog!("{warning}");
+        crate::elog!("{}", warning.message());
     }
     if matches!(outcome, InstallOutcome::ReceiptOnly(_)) {
         return Ok(release.tag.clone());
@@ -4530,7 +4599,10 @@ fn install_selected_release(
     }
     if let Some(releases) = catalog {
         for (tag, error) in version_storage::prune_old_versions(releases, &release.tag) {
-            crate::elog!("Could not remove old game build {tag}: {error}");
+            crate::elog!(
+                "Could not remove old game build {tag}: {}",
+                crate::launcher_log::safe_error(&error.to_string())
+            );
         }
     }
     Ok(release.tag.clone())
@@ -5388,6 +5460,8 @@ fn monitor(
     if group {
         crate::process::owned::CHILDREN.track_group(pid);
     }
+    let prepare_step =
+        (job == Job::Prepare).then(|| crate::launcher_log::step("Preparing game files"));
     let tracked = stop
         .as_ref()
         .map(|stop| stop.track_process(pid))
@@ -5408,17 +5482,14 @@ fn monitor(
         let tx = tx.clone();
         let forwarding = Arc::clone(&forwarding);
         let reader_live = reader_live.clone();
-        // The preparer's own lines belong to the operation (a switch) that started it.
-        let op = crate::launcher_log::current();
+        // Raw child stdout/stderr stays in the local diagnostics view (`Msg::Line`): Unix paths
+        // can contain newlines whose middle fragments have no separator, so arbitrary child lines
+        // never enter `launcher.log` or the switch operation log.
         readers.push(std::thread::spawn(move || {
-            let _in = crate::launcher_log::enter(&op);
             for line in BufReader::new(stream).lines().map_while(Result::ok) {
                 let live = forwarding.lock().unwrap();
                 if !*live {
                     break;
-                }
-                if job == Job::Prepare {
-                    crate::launcher_log::line(format!("Preparing: {line}"));
                 }
                 if tx.send(Msg::Line(job, line)).is_err() {
                     break;
@@ -5430,7 +5501,7 @@ fn monitor(
     drop(reader_live);
     let child = Arc::new(Mutex::new(child));
     let waited = child.clone();
-    // The monitor's lines (how the preparer ended) belong to the same operation as its output.
+    // The monitor's lines (how the preparer ended) belong to the same operation as its step.
     let op = crate::launcher_log::current();
     std::thread::spawn(move || {
         let _in = crate::launcher_log::enter(&op);
@@ -5470,6 +5541,9 @@ fn monitor(
         }
         if relayed {
             if let Err(error) = status {
+                if let Some(step) = prepare_step {
+                    step.failed(error.to_string());
+                }
                 let _ = tx.send(Msg::ClientObservationLost(
                     crate::process::child::unconfirmed_exit(error),
                 ));
@@ -5497,6 +5571,16 @@ fn monitor(
                 result
             })
         };
+        if let Some(step) = prepare_step {
+            if cancelled {
+                step.cancelled();
+            } else {
+                match &result {
+                    Ok(()) => step.done(""),
+                    Err(error) => step.failed(error),
+                }
+            }
+        }
         let _ = tx.send(Msg::Exit(job, result));
     });
     Running { child, stdin }
@@ -8288,6 +8372,73 @@ pub fn {f}("
         }
     }
 
+    /// A data-file writer that never answers, in an install with no Cancel of its own (Play's
+    /// install, a local build's import): the install stops it at its deadline and returns, and
+    /// the preparation lock is free (review of #615).
+    #[cfg(unix)]
+    #[test]
+    fn a_writer_that_never_answers_cant_hang_an_install() {
+        use std::os::unix::fs::PermissionsExt;
+        const TAG: &str = "v2026.11.26";
+        let Some(root) = std::env::var_os("DATA_FILE_HANG_ROOT") else {
+            let root = tempfile::tempdir().unwrap();
+            assert!(Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "backend::tests::a_writer_that_never_answers_cant_hang_an_install",
+                ])
+                .env("DATA_FILE_HANG_ROOT", root.path())
+                .env("SUNRISE_LAUNCHER_HOME", root.path())
+                .env("SUNRISE_HOME", root.path().join("home"))
+                .env("XDG_DATA_HOME", root.path().join("xdg-data"))
+                .env("XDG_CONFIG_HOME", root.path().join("xdg-config"))
+                .env("SUNRISE_LAUNCHER_NO_SELF_UPDATE", "1")
+                .env("SUNRISE_NO_AUDIO", "1")
+                .status()
+                .unwrap()
+                .success());
+            return;
+        };
+        let root = PathBuf::from(root);
+        let version = root.join("versions").join(TAG);
+        let resources = version.join(".local/sunrise-client/26.3");
+        fs::create_dir_all(&resources).unwrap();
+        fs::write(
+            version.join("research-lock.json"),
+            r#"{"minecraft":{"version":"26.3"}}"#,
+        )
+        .unwrap();
+        fs::write(version.join(COMPLETE), "").unwrap();
+        fs::write(resources.join(RESOURCES_MANIFEST), "{}").unwrap();
+        // A writer that would take half a minute for the install's data file, and no Cancel to
+        // stop it. A seal's cache, packed in its snapshot under `launcher-prepared` first, is
+        // answered at once: this is about the install's own writer.
+        let preparer = version.join("sunrise-prepare");
+        fs::write(
+            &preparer,
+            "#!/bin/sh\ncase \"$*\" in\n  data-file*launcher-prepared*) echo '{\"format\":1,\"written\":false}';;\n  data-file*) sleep 30; echo '{\"format\":1,\"written\":true}';;\n  *) exit 2;;\nesac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&preparer, fs::Permissions::from_mode(0o700)).unwrap();
+        let before = crate::launcher_log::since(0).0;
+        let started = std::time::Instant::now();
+        reuse_prepared_within(TAG, None, std::time::Duration::from_secs(1));
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(10),
+            "the install waited {took:?} for a writer that never answered"
+        );
+        assert!(
+            prepare_lock(TAG).is_ok(),
+            "the stopped writer let go of the lock"
+        );
+        let (_, lines) = crate::launcher_log::since(before);
+        assert!(
+            lines.iter().any(|line| line.contains("stopped after 1 s")),
+            "{lines:?}"
+        );
+    }
+
     /// Cancel reaches the data-file writer once it runs: the preparer it started is stopped,
     /// and the install returns at once rather than when the writer would have finished.
     #[cfg(unix)]
@@ -9992,6 +10143,158 @@ esac"#
                 mine.iter()
                     .any(|line| line.contains(expected.0) && line.contains(expected.1)),
                 "switch log missing {expected:?}: {mine:?}"
+            );
+        }
+        for word in SECRET_WORDS {
+            assert!(
+                mine.iter().all(|line| !line.contains(word)),
+                "{word} leaked to switch log: {mine:?}"
+            );
+        }
+    }
+
+    /// Multiline preparer stdout and stderr (such as a Unix directory name containing line
+    /// breaks) stay in the local diagnostics view and never reach `launcher.log` or the switch
+    /// operation log; both sinks receive launcher-generated stage lines instead.
+    #[cfg(unix)]
+    #[test]
+    fn multiline_preparer_child_output_stays_out_of_disk_and_switch_logs() {
+        use std::os::unix::fs::PermissionsExt;
+        const SECRET_WORDS: &[&str] = &[
+            "Public",
+            "Private Client Backup",
+            "Suffix",
+            "Secret Err Folder",
+            "Secret Sounds Dir",
+            "Secret Sounds Err",
+            "/home/ada",
+        ];
+        let Some(root) = std::env::var_os("PREPARER_MULTILINE_LOG_ROOT") else {
+            let root = tempfile::tempdir().unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "backend::tests::multiline_preparer_child_output_stays_out_of_disk_and_switch_logs",
+                    "--nocapture",
+                ])
+                .env("PREPARER_MULTILINE_LOG_ROOT", root.path())
+                .env("SUNRISE_LAUNCHER_HOME", root.path())
+                .env("SUNRISE_HOME", root.path().join("home"))
+                .env("XDG_DATA_HOME", root.path().join("xdg-data"))
+                .env("XDG_CONFIG_HOME", root.path().join("xdg-config"))
+                .env("SUNRISE_LAUNCHER_NO_SELF_UPDATE", "1")
+                .env("SUNRISE_NO_AUDIO", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            let disk_log = fs::read_to_string(root.path().join("logs/launcher.log")).unwrap();
+            for expected in [
+                "Preparing game files: started",
+                "Preparing game files: done in",
+                "Copying game sounds: started",
+                "Copying game sounds: failed after",
+            ] {
+                assert!(
+                    disk_log.contains(expected),
+                    "launcher.log missing {expected}: {disk_log}"
+                );
+            }
+            for word in SECRET_WORDS {
+                assert!(
+                    !disk_log.contains(word),
+                    "{word} leaked to launcher.log: {disk_log}"
+                );
+            }
+            return;
+        };
+        let root = PathBuf::from(root);
+        crate::launcher_log::init(&root.join("logs"));
+        let op = crate::launcher_log::Operation::new(|_| {});
+        let _guard = op.enter();
+        let before = crate::launcher_log::since(0).0;
+
+        let script = root.join("fake-prepare.sh");
+        fs::write(
+            &script,
+            concat!(
+                "#!/bin/sh\n",
+                "printf 'Imported client 26.3 from /home/ada/Public\\nPrivate Client Backup\\nSuffix/versions/26.3/26.3.jar\\n'\n",
+                "printf 'error: /home/ada/Public\\nSecret Err Folder\\nSuffix/bad.jar\\n' >&2\n",
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _running =
+            spawn_holding_cancellable(Job::Prepare, Command::new(&script), tx, None, None).unwrap();
+        let mut local_lines = Vec::new();
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap() {
+                Msg::Line(Job::Prepare, line) => local_lines.push(line),
+                Msg::Exit(Job::Prepare, result) => {
+                    assert_eq!(result, Ok(()));
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            local_lines.iter().any(|l| l == "Private Client Backup"),
+            "local diagnostics must keep raw stdout: {local_lines:?}"
+        );
+        assert!(
+            local_lines.iter().any(|l| l == "Secret Err Folder"),
+            "local diagnostics must keep raw stderr: {local_lines:?}"
+        );
+
+        let version = root.join("versions/v-sounds");
+        fs::create_dir_all(&version).unwrap();
+        let preparer = version.join("sunrise-prepare");
+        fs::write(
+            &preparer,
+            concat!(
+                "#!/bin/sh\n",
+                "printf 'Copied from /home/ada/Public\\nSecret Sounds Dir\\nSuffix/index.json\\n'\n",
+                "printf 'error: /home/ada/Public\\nSecret Sounds Err\\nSuffix/missing (os error 2)\\n' >&2\n",
+                "exit 1\n",
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&preparer, fs::Permissions::from_mode(0o700)).unwrap();
+        let lock = prepare_lock("v-sounds").unwrap();
+        let sound_lines = std::cell::RefCell::new(Vec::new());
+        sounds_staged(
+            "v-sounds",
+            &root.join("minecraft"),
+            &|line| sound_lines.borrow_mut().push(line),
+            &lock.handoff(None),
+        );
+        let sound_lines = sound_lines.into_inner();
+        assert!(
+            sound_lines.iter().any(|l| l == "Secret Sounds Dir"),
+            "local diagnostics must keep sounds stdout: {sound_lines:?}"
+        );
+        assert!(
+            sound_lines.iter().any(|l| l.contains("Secret Sounds Err")),
+            "local diagnostics must keep sounds stderr: {sound_lines:?}"
+        );
+
+        let (_, mine) = crate::launcher_log::since_in(before, op.id());
+        for expected in [
+            "Preparing game files: started",
+            "Preparing game files: done in",
+            "Copying game sounds: started",
+            "Copying game sounds: failed after",
+        ] {
+            assert!(
+                mine.iter().any(|line| line.contains(expected)),
+                "switch log missing {expected}: {mine:?}"
             );
         }
         for word in SECRET_WORDS {

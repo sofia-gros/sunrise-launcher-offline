@@ -466,6 +466,24 @@ pub fn since_in(since: u64, id: u64) -> (u64, Vec<String>) {
     lock(&RING).since_in(since, Some(id))
 }
 
+/// What `launcher.log` and the ring keep of a launcher-generated line about preparation: the line
+/// itself, or a fixed note when it names a file, an address, or spans multiple lines. Raw child
+/// stdout and stderr stay in the local diagnostics view and do not pass through here.
+pub fn preparer_line(line: &str) -> String {
+    format!("Preparing: {}", without_paths(line))
+}
+
+/// `line` as the log keeps a launcher-generated line about preparing or downloading a build's
+/// files: as it is, or a fixed note when it has a path separator, line break, or address in it
+/// (see [`preparer_line`]).
+pub fn without_paths(line: &str) -> &str {
+    if line.contains(['/', '\\', '\n', '\r']) || line.contains("://") {
+        "(a line that names a file or an address, left out of the log)"
+    } else {
+        line
+    }
+}
+
 /// An error's text as the log keeps it: a fixed category and, when the text has one, its OS
 /// error code or HTTP status (`entity not found (os error 2)`, `HTTP 404`). Nothing else of the
 /// text reaches `launcher.log` or the ring: an error's words can hold a local path with any
@@ -916,6 +934,21 @@ mod tests {
             .collect();
         assert_eq!(found.len(), 1, "{lines:?}");
         assert!(!found[0].contains("Steve_Prepare"), "{found:?}");
+    }
+
+    #[test]
+    fn without_paths_leaves_out_multiline_text() {
+        let multiline = "Public\nPrivate Client Backup\nSuffix";
+        assert!(
+            without_paths(multiline).contains("left out of the log"),
+            "{}",
+            without_paths(multiline)
+        );
+        assert!(
+            without_paths("line1\rline2").contains("left out of the log"),
+            "{}",
+            without_paths("line1\rline2")
+        );
     }
 
     static DETAIL_TEST_LOCK: Mutex<()> = Mutex::new(());

@@ -115,7 +115,10 @@ pub fn recover_game_installations() {
             continue;
         };
         if let Err(error) = recover_replacement(tag) {
-            crate::elog!("Could not recover game installation {tag}: {error}");
+            crate::elog!(
+                "Could not recover game installation {tag}: {}",
+                crate::launcher_log::safe_error(&error.to_string())
+            );
         }
     }
 }
