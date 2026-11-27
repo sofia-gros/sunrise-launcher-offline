@@ -151,6 +151,7 @@ pub(crate) fn stage_game(
     for (name, into) in &wanted {
         fetch_into_cancellable(&sdk, base, name, into, &mut fetched, stop, &report)?;
     }
+    progress(InstallPhase::Finishing);
     let [(_, runtime), (_, programs)] = wanted;
     let bin = runtime.join("bin");
     let io = |error: std::io::Error| Refusal::Cache(error.to_string());

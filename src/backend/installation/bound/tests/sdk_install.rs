@@ -208,7 +208,28 @@ fn first_play_proves_and_installs_the_two_sdk_slices() {
                     InstallIntent::Exact,
                     crate::backend::installation::Transfer {
                         stop: None,
-                        progress: |phase| phases.borrow_mut().push(phase),
+                        progress: |phase| {
+                            if phase == InstallPhase::Finishing {
+                                let stage = fs::read_dir(versions_dir())
+                                    .unwrap()
+                                    .map(|entry| entry.unwrap())
+                                    .find(|entry| {
+                                        crate::backend::installation::private_stage(
+                                            &entry.file_name(),
+                                        )
+                                    })
+                                    .expect("SDK stage while finishing")
+                                    .path();
+                                let preparer = crate::preparer::BINARY;
+                                assert!(stage.join(Kind::Programs.name()).join(preparer).is_file());
+                                assert!(!stage
+                                    .join(Kind::Runtime.name())
+                                    .join("bin")
+                                    .join(preparer)
+                                    .exists());
+                            }
+                            phases.borrow_mut().push(phase);
+                        },
                     },
                     |_, _| unreachable!("SDK reads from the mirror"),
                     (&base, &keys),

@@ -487,7 +487,6 @@ impl GameDownload {
                         ),
                         other => other.to_string(),
                     })?;
-                    progress(InstallPhase::Finishing);
                     super::finish_image(&top, self.architecture(), Some((&facts, facts_sha)))?;
                     Artifact::record_sdk(&top, tag, slices)?;
                     Ok(top)
@@ -678,24 +677,31 @@ mod tests {
 
     fn isolated_case(test: &str, run: impl FnOnce()) {
         const ACTOR: &str = "SUNRISE_TEST_ARCHIVE_REPAIR";
+        const COMPLETE: &str = "isolated archive case completed";
         if std::env::var_os(ACTOR).is_some() {
             run();
+            println!("\n{COMPLETE}");
             return;
         }
         let root = tempfile::tempdir().unwrap();
         let module = module_path!().split_once("::").unwrap().1;
-        assert!(std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", &format!("{module}::{test}")])
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("{module}::{test}"), "--nocapture"])
             .env(ACTOR, "1")
             .env("SUNRISE_HOME", root.path().join("game"))
             .env("SUNRISE_LAUNCHER_HOME", root.path().join("launcher"))
             .env(
                 crate::native_mods::sdk_cache::BASE_VAR,
-                root.path().join("sdk-mirror")
+                root.path().join("sdk-mirror"),
             )
-            .status()
-            .unwrap()
-            .success());
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        assert!(
+            child.status.success() && stdout.lines().any(|line| line == COMPLETE),
+            "isolated test {test}: {stdout}\n{}",
+            String::from_utf8_lossy(&child.stderr),
+        );
     }
 
     fn serve_windows_archive(
