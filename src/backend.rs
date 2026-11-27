@@ -1622,9 +1622,13 @@ fn write_checked(
     let mut hash = sunrise_launcher_release_verify::Sha256::default();
     let (mut done, mut buf) = (0u64, vec![0u8; 1 << 16]);
     loop {
-        let n = reader
-            .read(&mut buf)
-            .map_err(|e| SaveCheckedError::Download(format!("Download interrupted: {e}")))?;
+        let n = reader.read(&mut buf).map_err(|e| {
+            if crate::native_mods::is_cancelled_io(&e) {
+                SaveCheckedError::Download(crate::native_mods::CANCELLED.into())
+            } else {
+                SaveCheckedError::Download(format!("Download interrupted: {e}"))
+            }
+        })?;
         if n == 0 {
             break;
         }
@@ -9996,6 +10000,57 @@ esac"#
                 "{word} leaked to switch log: {mine:?}"
             );
         }
+    }
+
+    /// Cancelling a local draft archive copy mid-read returns `native_mods::CANCELLED` (so a
+    /// switch closes quietly), while an unrelated read failure with a cancel pending keeps its own
+    /// read error instead of being hidden (review of #615).
+    #[test]
+    fn cancelling_a_local_draft_copy_mid_read_preserves_cancel_without_hiding_read_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("draft.tar.gz");
+        let dst = dir.path().join("out.tar.gz");
+        let payload = vec![b'a'; 256 * 1024];
+        fs::write(&src, &payload).unwrap();
+
+        let stop = crate::native_mods::Cancellation::default();
+        let file = fs::File::open(&src).unwrap();
+        let error = save_checked(
+            stop.reader(file),
+            payload.len() as u64,
+            "draft.tar.gz",
+            "0".repeat(64).as_str(),
+            &dst,
+            &|_| stop.stop(),
+        )
+        .unwrap_err();
+        assert_eq!(String::from(error), crate::native_mods::CANCELLED);
+        assert!(!dst.exists(), "cancelled copy must not publish destination");
+
+        // An unrelated read error that arrives while a cancel is also set keeps its own error.
+        struct FailingReader(crate::native_mods::Cancellation);
+        impl std::io::Read for FailingReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0.stop();
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "disk read failed",
+                ))
+            }
+        }
+        let stop = crate::native_mods::Cancellation::default();
+        let error = save_checked(
+            stop.reader(FailingReader(stop.clone())),
+            payload.len() as u64,
+            "draft.tar.gz",
+            "0".repeat(64).as_str(),
+            &dst,
+            &|_| {},
+        )
+        .unwrap_err();
+        let text = String::from(error);
+        assert_ne!(text, crate::native_mods::CANCELLED);
+        assert!(text.contains("disk read failed"), "{text}");
     }
 }
 
