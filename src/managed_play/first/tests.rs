@@ -898,6 +898,7 @@ fn edits_switch_and_copies_still_hash_the_prepared_files_and_refuse_damage() {
         return;
     }
     let home = backend::game_home();
+    fs::create_dir_all(&home).unwrap();
     let resources = backend::resources(BUILD);
     fs::create_dir_all(&resources).unwrap();
     fs::write(resources.join("sunrise-resources.json"), b"{}").unwrap();
