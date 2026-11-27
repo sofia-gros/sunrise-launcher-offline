@@ -2846,16 +2846,29 @@ fn refill_wanted(
 /// Read-only check for missing extras, run without `.preparing.lock`. A stale "nothing missing"
 /// only postpones repair to the next start.
 fn probe_missing_extras(versions: &Path, tag: &str) -> Option<crate::preparer::Extras> {
+    probe_missing_extras_with(versions, tag, |binary, root, resources| {
+        crate::preparer::missing_extras(binary, root, resources, None)
+    })
+}
+
+fn probe_missing_extras_with(
+    versions: &Path,
+    tag: &str,
+    probe: impl FnOnce(&Path, &Path, &Path) -> Result<Option<crate::preparer::Extras>, String>,
+) -> Option<crate::preparer::Extras> {
     let root = versions.join(tag);
     let resources = resources_at(&root);
     if read_json(&resources.join(RESOURCES_MANIFEST)).is_none_or(|m| server_profile(&m)) {
         return None;
     }
     let binary = crate::preparer::binary(&root)?;
-    match crate::preparer::missing_extras(&binary, &root, &resources, None) {
+    match probe(&binary, &root, &resources) {
         Ok(missing) => missing,
         Err(error) => {
-            crate::elog!("{tag}: {}", crate::launcher_log::safe_error(&error));
+            crate::elog!(
+                "Could not check for missing game extras: {}",
+                crate::launcher_log::safe_error(&error)
+            );
             None
         }
     }
@@ -10039,6 +10052,58 @@ esac"#
         );
     }
 
+    #[test]
+    fn failed_startup_extras_probe_logs_no_private_text() {
+        const TAG: &str = "Private Customer Build";
+        const PRIVATE_CHILD: &str = "Private Child Folder";
+        let Some(root) = std::env::var_os("SUNRISE_TEST_EXTRAS_PROBE_LOG_ROOT") else {
+            let root = tempfile::tempdir().unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "backend::tests::failed_startup_extras_probe_logs_no_private_text",
+                    "--nocapture",
+                ])
+                .env("SUNRISE_TEST_EXTRAS_PROBE_LOG_ROOT", root.path())
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "child failed:\nstdout:\n{}\nstderr:\n{stderr}",
+                String::from_utf8_lossy(&output.stdout),
+            );
+            let disk_log = fs::read_to_string(root.path().join("logs/launcher.log")).unwrap();
+            for log in [stderr.as_ref(), disk_log.as_str()] {
+                assert!(
+                    log.lines().any(|line| line
+                        .contains("Could not check for missing game extras:")
+                        && line.contains("(os error 2)")),
+                    "missing categorized probe failure: {log}"
+                );
+                for private in [TAG, PRIVATE_CHILD, "private-probe.dat"] {
+                    assert!(!log.contains(private), "{private} leaked: {log}");
+                }
+            }
+            return;
+        };
+        let root = PathBuf::from(root);
+        crate::launcher_log::init(&root.join("logs"));
+        let versions = root.join("versions");
+        let build = versions.join(TAG);
+        let resources = resources_at(&build);
+        fs::create_dir_all(&resources).unwrap();
+        fs::write(build.join(COMPLETE), "").unwrap();
+        fs::write(resources.join(RESOURCES_MANIFEST), "{}").unwrap();
+        fs::write(build.join(crate::preparer::BINARY), "").unwrap();
+        assert!(probe_missing_extras_with(&versions, TAG, |_, _, _| {
+            Err(format!(
+                r"could not open C:\Users\{PRIVATE_CHILD}\private-probe.dat (os error 2)"
+            ))
+        })
+        .is_none());
+    }
+
     /// A preparer reply whose error message, progress message, or stderr names a local path keeps
     /// that path out of the on-disk `launcher.log`, stderr, and an active switch operation's log
     /// while still reporting the categorized failure (review of #615).
@@ -10055,7 +10120,6 @@ esac"#
             "data.bin",
             "msg.txt",
             "stderr.log",
-            "probe.dat",
             "sounds.json",
             "extras.err",
             "extras.out",
@@ -10120,14 +10184,6 @@ esac"#
                     "launcher.log missing {expected}: {disk_log}"
                 );
             }
-            for log in [&*stderr, disk_log.as_str()] {
-                assert!(
-                    log.lines()
-                        .any(|line| line.contains("v-startup-probe:")
-                            && line.contains("(os error 2)")),
-                    "missing categorized startup probe failure: {log}"
-                );
-            }
             for word in SECRET_WORDS {
                 assert!(
                     !disk_log.contains(word),
@@ -10154,15 +10210,6 @@ esac"#
             fs::set_permissions(&preparer, fs::Permissions::from_mode(0o700)).unwrap();
             version
         };
-        make_version(
-            "v-startup-probe",
-            concat!(
-                "[ \"$1\" = missing-extras ] || exit 2\n",
-                "printf '%s\\n' '{\"format\":1,\"error\":{\"message\":\"could not open /home/ada/Private Client Backup/drafts/probe.dat (os error 2)\"}}'\n",
-                "exit 1",
-            ),
-        );
-        assert!(probe_missing_extras(&root.join("versions"), "v-startup-probe").is_none());
         let lacking =
             r#"{"format":1,"prepared":true,"missing":[{"kind":"sounds","what":"The sounds"}]}"#;
         let partial_lacking = r#"{"format":1,"prepared":true,"missing":[{"kind":"sounds","what":"Public\nSecret What\nSuffix"},{"kind":"Public\nSecret Kind\nSuffix","what":"Secret What"}]}"#;
