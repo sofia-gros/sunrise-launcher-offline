@@ -4,7 +4,7 @@ pub use crate::native_cache::Error;
 use crate::native_cache::{checked, known_link, linked, Cache};
 use cap_fs_ext::DirExt;
 use cap_std::fs::Dir;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -262,15 +262,14 @@ pub(crate) fn entries_calls() -> usize {
     ENTRIES.with(|calls| calls.get())
 }
 
-/// One validated walk of a folder: every file and directory's allocated size and identity,
-/// refusing any link or file the launcher does not expect. Sizes are read from it afterwards,
-/// each with its own set of already-counted blocks, without touching the disk again.
-pub(crate) struct Tree(Option<Node>);
+/// Allocation identities from one validated walk, independent of directory shape.
+pub(crate) struct Tree(HashMap<(u64, u64), u64>);
 
-struct Node {
-    id: (u64, u64),
-    bytes: u64,
-    children: Vec<Node>,
+#[cfg(test)]
+type WalkHook = Box<dyn Fn(&Path)>;
+#[cfg(test)]
+thread_local! {
+    static STATTED: std::cell::RefCell<Option<WalkHook>> = const { std::cell::RefCell::new(None) };
 }
 
 impl Tree {
@@ -292,25 +291,38 @@ impl Tree {
     fn walk(path: &Path, cancel: Option<&Cancel>, skip_links: bool) -> Result<Self, Error> {
         #[cfg(test)]
         WALKS.with(|walks| walks.set(walks.get() + 1));
-        Self::node(path, cancel, skip_links).map(Self)
+        let mut found = HashMap::new();
+        Self::visit(path, cancel, skip_links, &mut found)?;
+        Ok(Self(found))
     }
 
-    fn node(path: &Path, cancel: Option<&Cancel>, skip_links: bool) -> Result<Option<Node>, Error> {
+    fn visit(
+        path: &Path,
+        cancel: Option<&Cancel>,
+        skip_links: bool,
+        found: &mut HashMap<(u64, u64), u64>,
+    ) -> Result<(), Error> {
         if cancel.is_some_and(Cancel::is_cancelled) {
-            return Ok(None);
+            return Ok(());
         }
         let meta = match fs::symlink_metadata(path) {
             Ok(meta) => meta,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error.into()),
         };
+        #[cfg(test)]
+        STATTED.with(|hook| {
+            if let Some(hook) = &*hook.borrow() {
+                hook(path);
+            }
+        });
         if linked(&meta) {
             if skip_links {
-                return Ok(None);
+                return Ok(());
             }
-            // A known link holds nothing of its own, and what it points at is not this cache's.
             return match fs::read_link(path) {
-                Ok(target) if known_link(&target) => Ok(None),
+                Ok(target) if known_link(&target) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 _ => Err(Error::Unsafe(path.to_owned())),
             };
         }
@@ -319,47 +331,40 @@ impl Tree {
         }
         let (id, bytes) = match allocation(path, &meta) {
             Ok(allocated) => allocated,
-            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(None);
-            }
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error),
         };
-        let mut children = Vec::new();
         if meta.is_dir() {
             let entries = match fs::read_dir(path) {
                 Ok(entries) => entries,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
                 Err(error) => return Err(error.into()),
             };
             for entry in entries {
+                if cancel.is_some_and(Cancel::is_cancelled) {
+                    break;
+                }
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(error) => return Err(error.into()),
                 };
-                children.extend(Self::node(&entry.path(), cancel, skip_links)?);
+                Self::visit(&entry.path(), cancel, skip_links, found)?;
             }
         }
-        Ok(Some(Node {
-            id,
-            bytes,
-            children,
-        }))
+        found.entry(id).or_insert(bytes);
+        Ok(())
     }
 
-    /// The allocated bytes not already in `seen`: a block reached twice (a hard link, or a file
-    /// shared with an earlier folder using the same set) counts once, and a directory already
-    /// counted is not entered again.
+    /// The allocated bytes not already in `seen`, including links shared across units.
     pub(crate) fn size(&self, seen: &mut HashSet<(u64, u64)>) -> u64 {
-        fn count(node: &Node, seen: &mut HashSet<(u64, u64)>) -> u64 {
-            if !seen.insert(node.id) {
-                return 0;
+        self.0.iter().fold(0u64, |total, (&id, &bytes)| {
+            if seen.insert(id) {
+                total.saturating_add(bytes)
+            } else {
+                total
             }
-            node.children.iter().fold(node.bytes, |total, child| {
-                total.saturating_add(count(child, seen))
-            })
-        }
-        self.0.as_ref().map_or(0, |node| count(node, seen))
+        })
     }
 }
 

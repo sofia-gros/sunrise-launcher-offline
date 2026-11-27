@@ -155,15 +155,27 @@ impl Root {
             Err(error) => return Err(error.into()),
         };
         checked(root, true)?;
-        if root.exists() {
+        #[cfg(not(windows))]
+        let mut directory = directory;
+        if directory.is_some() {
             // Windows canonical paths gain a `\\?\` prefix and long names, so compare ancestors' reparse points instead.
             #[cfg(windows)]
             for ancestor in root.ancestors().filter(|path| path.parent().is_some()) {
                 checked(ancestor, true)?;
             }
             #[cfg(not(windows))]
-            if root.canonicalize()? != root {
-                return Err(Error::Unsafe(root.to_owned()));
+            {
+                #[cfg(test)]
+                CANONICALIZING.with(|hook| {
+                    if let Some(hook) = &*hook.borrow() {
+                        hook(root);
+                    }
+                });
+                match present(root.canonicalize())? {
+                    Some(path) if path == root => (),
+                    Some(_) => return Err(Error::Unsafe(root.to_owned())),
+                    None => directory = None,
+                }
             }
         }
         Ok(Self {
@@ -324,7 +336,15 @@ impl Entry {
 /// A folder's entries for a report that holds no build lease, so a folder or entry can vanish
 /// while it is read: that one is skipped, as the size walk skips one. Every other failure, and
 /// every link check on what is found, still stands.
+#[cfg(test)]
 fn children(folder: &Path) -> Result<Vec<fs::DirEntry>, Error> {
+    children_until(folder, &Cancel::default())
+}
+
+fn children_until(folder: &Path, cancel: &Cancel) -> Result<Vec<fs::DirEntry>, Error> {
+    if cancel.is_cancelled() {
+        return Ok(Vec::new());
+    }
     let entries = match fs::read_dir(folder) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -332,6 +352,9 @@ fn children(folder: &Path) -> Result<Vec<fs::DirEntry>, Error> {
     };
     let mut found = Vec::new();
     for entry in entries {
+        if cancel.is_cancelled() {
+            break;
+        }
         match entry {
             Ok(entry) => found.push(entry),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -352,6 +375,8 @@ fn children(folder: &Path) -> Result<Vec<fs::DirEntry>, Error> {
 type ListedHook = Box<dyn Fn(&Path)>;
 #[cfg(test)]
 thread_local! {
+    #[cfg(not(windows))]
+    static CANONICALIZING: std::cell::RefCell<Option<ListedHook>> = const { std::cell::RefCell::new(None) };
     static LISTED: std::cell::RefCell<Option<ListedHook>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -400,22 +425,33 @@ fn add(
 impl Storage {
     /// What a report or Clear works on, found once: the fixed build-home units, the spare game
     /// builds and each profile's caches, and detached trash beside any of them.
+    #[cfg(test)]
     fn entries(&self) -> Result<Vec<Entry>, Error> {
+        self.entries_until(&Cancel::default())
+    }
+
+    fn entries_until(&self, cancel: &Cancel) -> Result<Vec<Entry>, Error> {
         #[cfg(test)]
         ENTRIES.with(|calls| calls.set(calls.get() + 1));
         let mut entries = Vec::new();
-        self.build_entries(&mut entries, &Root::open(&self.root)?)?;
+        self.build_entries(&mut entries, &Root::open(&self.root)?, cancel)?;
+        if cancel.is_cancelled() {
+            return Ok(entries);
+        }
         let data = Root::open(&backend::data_dir())?;
         // One read-only snapshot of the profiles says both which builds they play and where
         // their folders are. An unreadable one proves neither, so it offers no spare build and
         // no profile cache.
         let profiles = instances::list_for_storage().ok();
         if let Some(profiles) = &profiles {
-            spare_builds(&mut entries, &data, profiles)?;
+            spare_builds(&mut entries, &data, profiles, cancel)?;
         }
         // Interrupted removal deliberately loses completion. Keep the remaining unit
         // visible for residual reporting and a safe retry, even though installed() omits it.
-        for child in children(&data.path.join("versions"))? {
+        for child in children_until(&data.path.join("versions"), cancel)? {
+            if cancel.is_cancelled() {
+                break;
+            }
             if present(child.file_type())?.is_some_and(|kind| kind.is_dir())
                 && !child.path().join(".installed").is_file()
                 && !child.file_name().to_string_lossy().starts_with(".trash-")
@@ -442,15 +478,28 @@ impl Storage {
             }
         }
         if let Some(profiles) = &profiles {
-            profile_caches(&mut entries, profiles)?;
+            profile_caches(&mut entries, profiles, cancel)?;
         }
-        self.detached_trash(&mut entries, &data, profiles.as_deref().unwrap_or(&[]))?;
+        self.detached_trash(
+            &mut entries,
+            &data,
+            profiles.as_deref().unwrap_or(&[]),
+            cancel,
+        )?;
         Ok(entries)
     }
 
-    fn build_entries(&self, entries: &mut Vec<Entry>, build_root: &Root) -> Result<(), Error> {
+    fn build_entries(
+        &self,
+        entries: &mut Vec<Entry>,
+        build_root: &Root,
+        cancel: &Cancel,
+    ) -> Result<(), Error> {
         let native = Entry::fixed(build_root, Path::new("native"), Category::BuildFiles)?;
         for cache in BUILD_CACHES {
+            if cancel.is_cancelled() {
+                break;
+            }
             if matches!(
                 cache,
                 BuildCache::Rust
@@ -463,7 +512,10 @@ impl Storage {
             ) {
                 let parent = self.root.join(cache.relative());
                 if checked(&parent, true)?.is_some() {
-                    for child in children(&parent)? {
+                    for child in children_until(&parent, cancel)? {
+                        if cancel.is_cancelled() {
+                            break;
+                        }
                         let name = child.file_name();
                         if usage_stamp(Path::new(&name))
                             || (matches!(cache, BuildCache::ModBuildCache)
@@ -483,7 +535,10 @@ impl Storage {
             }
         }
         let build_files = Category::BuildFiles;
-        for child in children(&native.path)? {
+        for child in children_until(&native.path, cancel)? {
+            if cancel.is_cancelled() {
+                break;
+            }
             if compiler_attempt(&child.file_name())
                 && present(child.file_type())?
                     .is_some_and(|kind| kind.is_dir() || kind.is_symlink())
@@ -507,7 +562,10 @@ impl Storage {
         // deletion goes through Cache, which also acquires Cargo's locks.
         let target = self.root.join("native/target");
         if checked(&target, true)?.is_some() {
-            for child in children(&target)? {
+            for child in children_until(&target, cancel)? {
+                if cancel.is_cancelled() {
+                    break;
+                }
                 if crate::cache_cleanup::reserved(Path::new(&child.file_name()))
                     || usage_stamp(Path::new(&child.file_name()))
                 {
@@ -520,7 +578,10 @@ impl Storage {
                 checked(&child.path(), kind.is_dir())?;
                 if kind.is_dir() && child.file_name().to_string_lossy().contains('-') {
                     // Cross-compilation target triples own independent profile units too.
-                    for profile in children(&child.path())? {
+                    for profile in children_until(&child.path(), cancel)? {
+                        if cancel.is_cancelled() {
+                            break;
+                        }
                         if crate::cache_cleanup::reserved(Path::new(&profile.file_name()))
                             || usage_stamp(Path::new(&profile.file_name()))
                         {
@@ -546,6 +607,7 @@ impl Storage {
         entries: &mut Vec<Entry>,
         data: &Root,
         profiles: &[instances::Instance],
+        cancel: &Cancel,
     ) -> Result<(), Error> {
         let parents: HashSet<_> = entries
             .iter()
@@ -564,6 +626,9 @@ impl Storage {
             .collect();
         let work = self.root.join(BuildCache::ModBuildCache.relative());
         for parent in parents {
+            if cancel.is_cancelled() {
+                break;
+            }
             // Detached slots inside `native/w` are already inventoried as Mod build cache.
             let plain = backend::plain(parent.clone());
             if parent == work
@@ -578,7 +643,10 @@ impl Storage {
             if root.directory.is_none() {
                 continue;
             }
-            for entry in children(&parent)? {
+            for entry in children_until(&parent, cancel)? {
+                if cancel.is_cancelled() {
+                    break;
+                }
                 let name = entry.file_name();
                 let Some(suffix) = name.to_str().and_then(|name| name.strip_prefix(".trash-"))
                 else {
@@ -624,7 +692,7 @@ impl Storage {
             Err(LeaseError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        let entries = self.entries()?;
+        let entries = self.entries_until(&Cancel::default())?;
         self.apply_retaining(entries, clear, all, true, Some(&lease))
     }
 
@@ -651,7 +719,7 @@ impl Storage {
         before_clear: impl FnMut(&Path),
     ) -> Result<Report, Error> {
         let lease = self.build_lease()?;
-        let entries = self.entries()?;
+        let entries = self.entries_until(&Cancel::default())?;
         self.apply_retaining_observed(entries, clear, all, true, Some(&lease), before_clear)
     }
 
@@ -784,6 +852,9 @@ fn refused(
     let mut sound = Vec::new();
     let mut trees = Vec::new();
     for entry in entries {
+        if cancel.is_cancelled() {
+            break;
+        }
         match entry.tree(cancel) {
             Ok(tree) => {
                 sound.push(entry);
@@ -815,12 +886,20 @@ fn spare_builds(
     entries: &mut Vec<Entry>,
     data: &Root,
     profiles: &[instances::Instance],
+    cancel: &Cancel,
 ) -> Result<(), Error> {
     let played: HashSet<_> = profiles
         .iter()
+        .take_while(|_| !cancel.is_cancelled())
         .filter_map(|instance| instance.resolve_version(None).ok())
         .collect();
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
     for version in backend::installed() {
+        if cancel.is_cancelled() {
+            break;
+        }
         if native_mods::is_native(&version)
             && !played.contains(&version)
             && native_mods::resource_dependent(&version).is_none()
@@ -838,8 +917,15 @@ fn spare_builds(
 }
 
 /// The caches, old logs and unused jars of every profile whose game is not running.
-fn profile_caches(entries: &mut Vec<Entry>, profiles: &[instances::Instance]) -> Result<(), Error> {
+fn profile_caches(
+    entries: &mut Vec<Entry>,
+    profiles: &[instances::Instance],
+    cancel: &Cancel,
+) -> Result<(), Error> {
     for instance in profiles {
+        if cancel.is_cancelled() {
+            break;
+        }
         // A missing version cannot prove that the instance is idle. Keep its caches.
         let Ok(version) = instance.resolve_version(None) else {
             continue;
@@ -849,8 +935,8 @@ fn profile_caches(entries: &mut Vec<Entry>, profiles: &[instances::Instance]) ->
         }
         let root = Root::open(&instance.home)?;
         let start = entries.len();
-        old_logs(entries, &root)?;
-        unused_jars(entries, &root)?;
+        old_logs(entries, &root, cancel)?;
+        unused_jars_until(entries, &root, cancel)?;
         profile_game_caches(entries, &root)?;
         let profile = Arc::new((instance.home.clone(), version));
         for entry in &mut entries[start..] {
@@ -867,14 +953,20 @@ fn profile_game_caches(entries: &mut Vec<Entry>, home: &Root) -> Result<(), Erro
     Ok(())
 }
 
-fn old_logs(entries: &mut Vec<Entry>, home: &Root) -> Result<(), Error> {
+fn old_logs(entries: &mut Vec<Entry>, home: &Root, cancel: &Cancel) -> Result<(), Error> {
     for directory in ["logs", "crash-reports"] {
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
         let folder = Entry::fixed(home, Path::new(directory), Category::OtherCaches)?.path;
         if checked(&folder, true)?.is_none() {
             continue;
         }
         let mut files = Vec::new();
-        for entry in children(&folder)? {
+        for entry in children_until(&folder, cancel)? {
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
             if crate::cache_cleanup::reserved(Path::new(&entry.file_name()))
                 || usage_stamp(Path::new(&entry.file_name()))
             {
@@ -888,6 +980,9 @@ fn old_logs(entries: &mut Vec<Entry>, home: &Root) -> Result<(), Error> {
         files.sort();
         files.pop(); // Always retain the latest report, even when it is older than fourteen days.
         for (modified, name) in files {
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
             if modified
                 .elapsed()
                 .is_ok_and(|age| age.as_secs() > 14 * 86400)
@@ -903,7 +998,12 @@ fn old_logs(entries: &mut Vec<Entry>, home: &Root) -> Result<(), Error> {
     Ok(())
 }
 
+#[cfg(test)]
 fn unused_jars(entries: &mut Vec<Entry>, home: &Root) -> Result<(), Error> {
+    unused_jars_until(entries, home, &Cancel::default())
+}
+
+fn unused_jars_until(entries: &mut Vec<Entry>, home: &Root, cancel: &Cancel) -> Result<(), Error> {
     use sunrise_launcher_smod::{
         mod_list::{DIR, NATIVE_DIR},
         Package,
@@ -914,8 +1014,14 @@ fn unused_jars(entries: &mut Vec<Entry>, home: &Root) -> Result<(), Error> {
     }
     let mut referenced = HashSet::new();
     for directory in [DIR, NATIVE_DIR] {
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
         let path = Entry::fixed(home, Path::new(directory), Category::OtherCaches)?.path;
         for package in sunrise_launcher_smod::find(&path) {
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
             // A malformed package cannot prove a jar is unused. Retain all jars in that case.
             let Ok(package) = Package::read(&package) else {
                 return Ok(());
@@ -929,7 +1035,10 @@ fn unused_jars(entries: &mut Vec<Entry>, home: &Root) -> Result<(), Error> {
             );
         }
     }
-    for entry in children(&folder)? {
+    for entry in children_until(&folder, cancel)? {
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
         if !crate::cache_cleanup::reserved(Path::new(&entry.file_name()))
             && !usage_stamp(Path::new(&entry.file_name()))
             && !referenced.contains(&entry.path())
@@ -970,7 +1079,9 @@ mod manual_tests {
         let launcher = crate::storage::tests::Home::new();
         let storage = Storage::at(&launcher.0).unwrap();
         let data = Root::open(&launcher.0).unwrap();
-        storage.detached_trash(&mut entries, &data, &[]).unwrap();
+        storage
+            .detached_trash(&mut entries, &data, &[], &Cancel::default())
+            .unwrap();
         assert_eq!(entries.len(), 5);
         for file in files {
             assert_eq!(

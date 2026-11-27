@@ -22,7 +22,11 @@ impl Storage {
             return Ok(None);
         }
         note_lease_registry()?;
-        let mut remaining = self.entries()?;
+        let discovery = self.entries_until(cancel);
+        if cancel.is_cancelled() {
+            return Ok(None);
+        }
+        let mut remaining = discovery?;
         let mut report = Report::new(Vec::new()).tagged(cancel);
         for category in Category::ALL {
             let (units, rest): (Vec<_>, Vec<_>) = remaining
@@ -30,7 +34,11 @@ impl Storage {
                 .partition(|entry| entry.category == category);
             remaining = rest;
             let mut row = Row::new(category);
-            let (units, trees) = refused(units, std::slice::from_mut(&mut row), cancel, |_| false)?;
+            let measured = refused(units, std::slice::from_mut(&mut row), cancel, |_| false);
+            if cancel.is_cancelled() {
+                return Ok(None);
+            }
+            let (units, trees) = measured?;
             row.bytes = allocated(&units, &trees, category);
             row.remaining_bytes = row.bytes;
             if cancel.is_cancelled() {

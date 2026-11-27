@@ -87,12 +87,59 @@ fn a_count_cancelled_before_it_starts_discovers_and_walks_nothing() {
 fn a_walk_cancelled_part_way_stops_descending() {
     let home = Home::new();
     home.seed("rust/a/b/c/payload");
+    let storage = Storage::at(&home.0).unwrap();
     let cancel = Cancel::default();
-    let whole = Tree::build_until(&home.0.join("rust"), &cancel).unwrap();
-    assert!(whole.size(&mut HashSet::new()) > 0);
-    cancel.cancel();
-    let stopped = Tree::build_until(&home.0.join("rust"), &cancel).unwrap();
-    assert_eq!(stopped.size(&mut HashSet::new()), 0);
+    let stop = cancel.clone();
+    STATTED.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |path| {
+            assert!(!path.ends_with("payload"));
+            if path.ends_with("rust/a/b") {
+                stop.cancel();
+            }
+        }));
+    });
+    let result = storage.count(&cancel, |report| {
+        assert!(report
+            .rows
+            .iter()
+            .all(|row| row.category != Category::RustCompiler));
+    });
+    STATTED.with(|hook| hook.borrow_mut().take());
+    assert!(cancel.is_cancelled());
+    assert!(result.unwrap().is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_and_a_root_vanishing_after_stat_are_absent() {
+    let home = Home::new();
+    let path = home.seed("rust/kept");
+    let folder = path.parent().unwrap();
+    let link = folder.join("vanishing-link");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    let vanished = link.clone();
+    STATTED.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |path| {
+            if path == vanished {
+                fs::remove_file(path).unwrap();
+            }
+        }));
+    });
+    let result = allocated_bytes(folder);
+    STATTED.with(|hook| hook.borrow_mut().take());
+    assert!(!link.exists());
+    assert_eq!(result.unwrap(), allocated_bytes(folder).unwrap());
+    let vanish = folder.to_owned();
+    CANONICALIZING.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |path| {
+            if path == vanish {
+                fs::remove_dir_all(path).unwrap();
+            }
+        }));
+    });
+    let result = Root::open(folder);
+    CANONICALIZING.with(|hook| hook.borrow_mut().take());
+    assert!(result.unwrap().directory.is_none());
 }
 
 #[test]

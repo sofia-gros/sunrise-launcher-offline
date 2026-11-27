@@ -81,12 +81,19 @@ pub enum InUse {
     ProfileReference,
 }
 
-/// An installed build. Listing one measures nothing: `bytes` stays `None`, "still counting",
-/// until [`measure`] reaches it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SizeUnavailable {
+    Vanished,
+    Unreadable,
+    Cancelled,
+}
+
+/// An installed build. Both measurement fields are `None` until counting reaches it.
 #[derive(Clone)]
 pub struct Build {
     pub tag: String,
     pub bytes: Option<u64>,
+    pub size_unavailable: Option<SizeUnavailable>,
     pub in_use: Option<InUse>,
     pub old_download: bool,
 }
@@ -114,78 +121,154 @@ fn profile_user<'a>(
 }
 
 pub fn inventory(releases: &[Release]) -> Vec<Build> {
+    inventory_until(releases, &Cancel::default()).expect("an uncancellable inventory finishes")
+}
+
+/// Cancels discovery at the next version or process-probe boundary.
+pub fn inventory_until(releases: &[Release], cancel: &Cancel) -> Option<Vec<Build>> {
+    if cancel.is_cancelled() {
+        return None;
+    }
     let settings = Settings::load();
     let selected = settings.selected.as_ref();
     let (installed, nightly) = play_installations(selected.map(String::as_str));
+    if cancel.is_cancelled() {
+        return None;
+    }
     let profiles = instances::list_for_storage();
-    let old: Vec<_> = old_downloads(&installed, settings.keep_newest(), downloaded).collect();
-    installed
-        .iter()
-        .map(|tag| {
-            let in_use = match &profiles {
-                Ok(profiles) => profile_user(
-                    profiles,
-                    &installed,
-                    selected,
-                    nightly.as_ref(),
-                    releases,
-                    tag,
-                )
-                .map(|profile| InUse::Profile(profile.name.clone())),
-                Err(_) => Some(InUse::ProfileReference),
+    let old: Vec<_> = old_downloads(&installed, settings.keep_newest(), |tag| {
+        !cancel.is_cancelled() && downloaded(tag)
+    })
+    .take_while(|_| !cancel.is_cancelled())
+    .collect();
+    let mut builds = Vec::new();
+    for tag in &installed {
+        if cancel.is_cancelled() {
+            return None;
+        }
+        let in_use = match &profiles {
+            Ok(profiles) => profile_user(
+                profiles,
+                &installed,
+                selected,
+                nightly.as_ref(),
+                releases,
+                tag,
+            )
+            .map(|profile| InUse::Profile(profile.name.clone())),
+            Err(_) => Some(InUse::ProfileReference),
+        }
+        .or_else(|| {
+            if cancel.is_cancelled() {
+                None
+            } else if selected.is_some_and(|v| v.eq_ignore_ascii_case(tag)) {
+                Some(InUse::Current)
+            } else if in_use(tag) {
+                Some(InUse::Running)
+            } else if cancel.is_cancelled() {
+                None
+            } else if native_mods::resource_dependent(tag).is_some() {
+                Some(InUse::NativeBuild)
+            } else if cancel.is_cancelled() {
+                None
+            } else if crate::managed_play::require_unreferenced_build(tag).is_err() {
+                Some(InUse::ProfileReference)
+            } else {
+                None
             }
-            .or_else(|| {
-                if selected.is_some_and(|v| v.eq_ignore_ascii_case(tag)) {
-                    Some(InUse::Current)
-                } else if in_use(tag) {
-                    Some(InUse::Running)
-                } else if native_mods::resource_dependent(tag).is_some() {
-                    Some(InUse::NativeBuild)
-                } else if crate::managed_play::require_unreferenced_build(tag).is_err() {
-                    Some(InUse::ProfileReference)
-                } else {
-                    None
-                }
-            });
-            Build {
-                tag: tag.clone(),
-                bytes: None,
-                in_use,
-                old_download: old.contains(&tag),
-            }
-        })
-        .collect()
+        });
+        builds.push(Build {
+            tag: tag.clone(),
+            bytes: None,
+            size_unavailable: None,
+            in_use,
+            old_download: old.contains(&tag),
+        });
+    }
+    (!cancel.is_cancelled()).then_some(builds)
 }
 
 /// Fills in the sizes of `builds` one at a time, handing the rows to `filled` after each, and
 /// stops at once when `cancel` is set. A build cut short keeps no size.
 pub fn measure(builds: &mut [Build], cancel: &Cancel, mut filled: impl FnMut(&[Build])) {
-    let tags: Vec<String> = builds.iter().map(|build| build.tag.clone()).collect();
-    for (index, tag) in tags.iter().enumerate() {
-        let Some(bytes) = disk_use(&version_dir(tag), cancel) else {
+    for index in 0..builds.len() {
+        if cancel.is_cancelled() {
             return;
-        };
-        builds[index].bytes = Some(bytes);
+        }
+        let row = &mut builds[index];
+        let size = disk_use(&version_dir(&row.tag), cancel, true);
+        if cancel.is_cancelled() || size == Err(SizeUnavailable::Cancelled) {
+            return;
+        }
+        row.bytes = size.ok();
+        row.size_unavailable = size.err();
         filled(builds);
     }
 }
 
-/// The bytes under `path`, or `None` when `cancel` was set before they were all added up.
-fn disk_use(path: &Path, cancel: &Cancel) -> Option<u64> {
-    if cancel.is_cancelled() {
-        return None;
+impl From<std::io::Error> for SizeUnavailable {
+    fn from(error: std::io::Error) -> Self {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Self::Vanished
+        } else {
+            Self::Unreadable
+        }
     }
-    match path.symlink_metadata() {
-        Ok(meta) if meta.is_dir() && !crate::native_cache::linked(&meta) => fs::read_dir(path)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .try_fold(0u64, |total, entry| {
-                Some(total.saturating_add(disk_use(&entry.path(), cancel)?))
-            }),
-        Ok(meta) if meta.is_file() && !crate::native_cache::linked(&meta) => Some(meta.len()),
-        // Prepared resources may be linked. Do not count files outside this build.
-        _ => Some(0),
+}
+
+#[cfg(test)]
+type ListingHook = Box<dyn Fn(&Path)>;
+#[cfg(test)]
+thread_local! {
+    static BEFORE_LISTING: std::cell::RefCell<Option<ListingHook>> = const { std::cell::RefCell::new(None) };
+}
+
+fn disk_use(path: &Path, cancel: &Cancel, root: bool) -> Result<u64, SizeUnavailable> {
+    if cancel.is_cancelled() {
+        return Err(SizeUnavailable::Cancelled);
+    }
+    let meta = path.symlink_metadata()?;
+    // Prepared resources may be linked. Do not count files outside this build.
+    if crate::native_cache::linked(&meta) {
+        return if root {
+            Err(SizeUnavailable::Unreadable)
+        } else {
+            Ok(0)
+        };
+    }
+    if meta.is_dir() {
+        let mut total = 0u64;
+        #[cfg(test)]
+        BEFORE_LISTING.with(|hook| {
+            if let Some(hook) = &*hook.borrow() {
+                hook(path);
+            }
+        });
+        for entry in fs::read_dir(path)? {
+            if cancel.is_cancelled() {
+                return Err(SizeUnavailable::Cancelled);
+            }
+            let child = entry
+                .map_err(SizeUnavailable::from)
+                .and_then(|entry| disk_use(&entry.path(), cancel, false));
+            match child {
+                Ok(bytes) => total = total.saturating_add(bytes),
+                Err(SizeUnavailable::Vanished) => (),
+                Err(error) => return Err(error),
+            }
+        }
+        // The directory iterator can finish successfully after the build is detached.
+        if root {
+            let current = path.symlink_metadata()?;
+            if !current.is_dir() || crate::native_cache::linked(&current) {
+                return Err(SizeUnavailable::Unreadable);
+            }
+        }
+        Ok(total)
+    } else if meta.is_file() && !root {
+        Ok(meta.len())
+    } else {
+        Err(SizeUnavailable::Unreadable)
     }
 }
 
@@ -288,7 +371,7 @@ fn delete(
         Error::IncompleteUnit | Error::Busy => {
             tr("This build is in use or could not be safely removed.").into()
         }
-        error => native_mods::cache_error(error),
+        error => crate::storage::error_message(error),
     })?;
     super::forget_prepared();
     Ok(())
@@ -469,6 +552,41 @@ mod tests {
                     .iter()
                     .all(|build| build.bytes.is_some_and(|bytes| bytes >= 7)));
             },
+        );
+    }
+
+    #[test]
+    fn missing_and_unreadable_builds_are_not_zero_byte_measurements() {
+        let scratch = tempfile::tempdir().unwrap();
+        let file = scratch.path().join("not-a-build");
+        fs::write(&file, []).unwrap();
+        let cancel = Cancel::default();
+        assert_eq!(
+            disk_use(&scratch.path().join("missing"), &cancel, true),
+            Err(SizeUnavailable::Vanished)
+        );
+        assert_eq!(
+            disk_use(&file, &cancel, true),
+            Err(SizeUnavailable::Unreadable)
+        );
+        let child = scratch.path().join("swapped");
+        fs::create_dir(&child).unwrap();
+        BEFORE_LISTING.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |path| {
+                if path == child {
+                    fs::remove_dir(path).unwrap();
+                    fs::write(path, []).unwrap();
+                }
+            }));
+        });
+        let result = disk_use(scratch.path(), &cancel, true);
+        BEFORE_LISTING.with(|hook| hook.borrow_mut().take());
+        assert_eq!(result, Err(SizeUnavailable::Unreadable));
+        cancel.cancel();
+        assert!(inventory_until(&[], &cancel).is_none());
+        assert_eq!(
+            disk_use(scratch.path(), &cancel, true),
+            Err(SizeUnavailable::Cancelled)
         );
     }
 
