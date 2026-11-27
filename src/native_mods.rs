@@ -3391,7 +3391,20 @@ mod tests {
         assert_eq!(backend::resources(native), backend::resources(old));
         // (b) An update: a newer release arrives, and a rebuild with `update` moves to it. The
         // build made before it still plays, on the base it was made from, which stays installed.
+        // The install callback also exercises Storage Clear. Hold the runtime claim a
+        // playing build carries so Clear cannot delete the input to the update check.
+        let tree = cap_std::fs::Dir::open_ambient_dir(
+            backend::version_dir(native),
+            cap_std::ambient_authority(),
+        )
+        .unwrap();
+        let playing = crate::run_leases::Registry::open()
+            .unwrap()
+            .lock(&tree, crate::native_cache::LockMode::Shared)
+            .unwrap();
+        drop(tree);
         install_release(new, InstallIntent::Exact).unwrap();
+        drop(playing);
         prepare(new);
         assert_eq!(
             base_for(Some(native), &backend::installed(), true).as_deref(),

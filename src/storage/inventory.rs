@@ -347,7 +347,7 @@ impl Entry {
             || self.relative.starts_with(BuildCache::KeptMods.relative())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn clear(&self) -> Result<(), Error> {
         self.remove(false)
     }

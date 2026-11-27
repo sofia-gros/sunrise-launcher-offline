@@ -109,6 +109,8 @@ fn storage_scopes_clear_and_redacts_cli_errors() {
             .args([
                 "--exact",
                 "cli::storage_tests::storage_scopes_clear_and_redacts_cli_errors",
+                // The child exits with the CLI status before libtest can emit captured stdout.
+                "--nocapture",
                 "--quiet",
             ])
             .env(ACTOR, mode)
