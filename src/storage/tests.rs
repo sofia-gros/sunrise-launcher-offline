@@ -492,3 +492,27 @@ fn rows_distinguish_zero_byte_candidates_from_wholly_refused_and_mixed_reasons()
     assert!(fs::symlink_metadata(slot).is_err());
     assert!(canary.is_file());
 }
+
+#[test]
+fn storage_io_error_message_stays_plain_while_log_detail_keeps_kind_and_code() {
+    let coded = Error::Io(std::io::Error::from_raw_os_error(13));
+    let detail = error_log_detail(&coded).expect("I/O detail");
+    assert!(detail.contains("(os error 13)"), "{detail}");
+    assert!(
+        detail.contains(&std::io::Error::from_raw_os_error(13).kind().to_string()),
+        "{detail}"
+    );
+    let plain = error_message(coded);
+    assert_eq!(
+        plain,
+        "Sunrise couldn't access a file or folder. Close any programs using it and try again."
+    );
+    assert!(!plain.contains("os error"));
+
+    let kind_only = Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    assert_eq!(
+        error_log_detail(&kind_only).as_deref(),
+        Some("permission denied")
+    );
+    assert_eq!(error_log_detail(&Error::Busy), None);
+}

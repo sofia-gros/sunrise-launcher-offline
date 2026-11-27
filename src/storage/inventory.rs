@@ -134,12 +134,19 @@ impl Row {
             Error::Unsafe(_) => KeptKind::Unsafe,
             Error::Io(_) => KeptKind::Unreadable,
         };
+        let detail = error_log_detail(&error);
         let reason = error_message(error);
         if log {
-            crate::launcher_log::line(format!(
-                "Storage Clear kept {:?} unit ({bytes} bytes): {reason}",
-                self.category
-            ));
+            match detail {
+                Some(detail) => crate::launcher_log::line(format!(
+                    "Storage Clear kept {:?} unit ({bytes} bytes): {reason} [{detail}]",
+                    self.category
+                )),
+                None => crate::launcher_log::line(format!(
+                    "Storage Clear kept {:?} unit ({bytes} bytes): {reason}",
+                    self.category
+                )),
+            }
         }
         self.kept.push(Kept {
             bytes,

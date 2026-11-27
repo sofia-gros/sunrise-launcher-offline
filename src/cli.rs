@@ -1254,9 +1254,15 @@ fn execute(command: Cmd, as_json: bool) -> Result<i32, String> {
             {
                 Ok(report) => report,
                 Err(error) => {
+                    let detail = sunrise_launcher::storage::error_log_detail(&error);
                     let message = error_message(error);
                     let _ = writeln!(io::stderr(), "{message}");
-                    sunrise_launcher::launcher_log::line(&message);
+                    match detail {
+                        Some(detail) => {
+                            sunrise_launcher::launcher_log::line(format!("{message} [{detail}]"))
+                        }
+                        None => sunrise_launcher::launcher_log::line(&message),
+                    }
                     return Ok(1);
                 }
             };

@@ -192,7 +192,16 @@ impl Launcher {
                 // Cancelled: the window has moved on and wants nothing from this worker.
                 Ok(None) => {}
                 Err(_) if cancel.is_cancelled() => {}
-                Err(error) => send(Err(storage::error_message(error))),
+                Err(error) => {
+                    let detail = storage::error_log_detail(&error);
+                    let message = storage::error_message(error);
+                    if let Some(detail) = detail {
+                        sunrise_launcher::launcher_log::line(format!(
+                            "Storage error: {message} [{detail}]"
+                        ));
+                    }
+                    send(Err(message));
+                }
             }
         });
     }

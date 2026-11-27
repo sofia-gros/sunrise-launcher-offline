@@ -29,6 +29,18 @@ pub fn error_message(error: Error) -> String {
     }
 }
 
+/// Path-free OS error detail for launcher logs so I/O failures retain their error kind and code
+/// while `error_message` stays plain player language.
+pub fn error_log_detail(error: &Error) -> Option<String> {
+    match error {
+        Error::Io(io) => Some(match io.raw_os_error() {
+            Some(code) => format!("{} (os error {code})", io.kind()),
+            None => io.kind().to_string(),
+        }),
+        _ => None,
+    }
+}
+
 // Do not let a caller accidentally disclose raw path data with a general cache formatter.
 fn redact_error(error: Error) -> Error {
     match error {
