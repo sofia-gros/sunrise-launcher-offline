@@ -478,10 +478,7 @@ fn delete_unit(
 ) -> Result<(), Error> {
     use sunrise_launcher_smod::{locks::Release, runtime_leases::Registry};
     let registry = Registry::with_release(&crate::backend::data_dir(), Release::Close)?;
-    let is_version_unit = path.parent().is_some_and(|parent| {
-        crate::backend::plain(parent.to_path_buf())
-            == crate::backend::plain(crate::backend::versions_dir())
-    });
+    let is_version_unit = path.parent() == Some(crate::backend::versions_dir().as_path());
     registry.remove_unit_with_contexts(
         path,
         options.contexts,

@@ -12,7 +12,7 @@ impl Home {
         ));
         fs::create_dir(&path).unwrap();
         // Canonical, as Storage::at stores it: Windows temp paths are 8.3 short names.
-        Self(path.canonicalize().unwrap())
+        Self(crate::backend::plain(path.canonicalize().unwrap()))
     }
     pub(super) fn seed(&self, path: &str) -> PathBuf {
         let path = self.0.join(path);

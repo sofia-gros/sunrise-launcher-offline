@@ -169,7 +169,7 @@ impl Storage {
         fs::create_dir_all(root)?;
         let directory = Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
         let storage = Self {
-            root: root.canonicalize()?,
+            root: crate::backend::plain(root.canonicalize()?),
             directory,
         };
         storage.validate_root()?;
@@ -184,7 +184,7 @@ impl Storage {
     fn path(&self, cache: BuildCache) -> Result<PathBuf, Error> {
         let mut path = self.root.clone();
         // Validate every ancestor, not only the final directory (Windows junctions included).
-        if path.canonicalize()? != path {
+        if crate::backend::plain(path.canonicalize()?) != path {
             return Err(Error::Unsafe(path));
         }
         for part in cache.relative().split('/') {

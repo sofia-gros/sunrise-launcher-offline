@@ -106,8 +106,9 @@ pub fn configured_roots() -> Result<Option<Roots>> {
     // A unit test never reaches the player's real folders: unless it points at a location file
     // of its own, its roots are this test process's, under the temporary folder.
     if cfg!(test) && !overridden("SUNRISE_LAUNCHER_LOCATION_FILE") {
-        let home =
-            std::env::temp_dir().join(format!("sunrise-launcher-test-{}", std::process::id()));
+        let temp = std::env::temp_dir();
+        let home = plain_drive(temp.canonicalize().unwrap_or(temp))
+            .join(format!("sunrise-launcher-test-{}", std::process::id()));
         return Ok(Some(Roots {
             launcher: home.join("launcher"),
             game: home.join("game"),

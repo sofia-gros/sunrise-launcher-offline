@@ -1138,10 +1138,14 @@ pub fn links() -> Links {
     .map_or_else(Links::default, |text| Links::parse(&text))
 }
 
+fn resolved_root(path: PathBuf) -> PathBuf {
+    crate::data_location::canonical_data_path(&path).unwrap_or(path)
+}
+
 /// The launcher's data folder; `SUNRISE_LAUNCHER_HOME` overrides it (for tests and scripts).
 pub fn data_dir() -> PathBuf {
     if let Some(home) = std::env::var_os("SUNRISE_LAUNCHER_HOME").filter(|h| !h.is_empty()) {
-        return PathBuf::from(home);
+        return resolved_root(PathBuf::from(home));
     }
     if cfg!(test) {
         return crate::data_location::test_home().join("launcher");
@@ -1151,7 +1155,9 @@ pub fn data_dir() -> PathBuf {
     if let Ok(Some(roots)) = crate::data_location::configured_roots() {
         return roots.launcher;
     }
-    crate::identity::launcher_folder_in(&dirs::data_dir().unwrap_or_else(std::env::temp_dir))
+    resolved_root(crate::identity::launcher_folder_in(
+        &dirs::data_dir().unwrap_or_else(std::env::temp_dir),
+    ))
 }
 
 /// A canonical path without Windows' verbatim prefix: `canonicalize` gives `\\?\C:\...` there,
@@ -3801,7 +3807,7 @@ pub(crate) fn sounds_staged(
 /// never inside a version folder, so installing, updating or removing a version keeps the saves.
 pub fn game_home() -> PathBuf {
     if let Some(home) = std::env::var_os("SUNRISE_HOME").filter(|h| !h.is_empty()) {
-        return PathBuf::from(home);
+        return resolved_root(PathBuf::from(home));
     }
     if cfg!(test) {
         return crate::data_location::test_home().join("game");
@@ -3811,7 +3817,9 @@ pub fn game_home() -> PathBuf {
     if let Ok(Some(roots)) = crate::data_location::configured_roots() {
         return roots.game;
     }
-    crate::identity::game_folder_in(&dirs::data_dir().unwrap_or_else(std::env::temp_dir))
+    resolved_root(crate::identity::game_folder_in(
+        &dirs::data_dir().unwrap_or_else(std::env::temp_dir),
+    ))
 }
 
 /// Whether No AI is on: every AI feature hidden and off (`no_ai`, kept in the

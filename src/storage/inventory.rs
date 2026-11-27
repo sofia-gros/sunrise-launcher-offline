@@ -216,39 +216,37 @@ struct Root {
 }
 impl Root {
     fn open(root: &Path) -> Result<Self, Error> {
-        let directory = match Dir::open_ambient_dir(root, cap_std::ambient_authority()) {
+        let mut directory = match Dir::open_ambient_dir(root, cap_std::ambient_authority()) {
             Ok(directory) => Some(Arc::new(directory)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error.into()),
         };
         checked(root, true)?;
-        #[cfg(not(windows))]
-        let mut directory = directory;
+        let mut path = root.to_owned();
         if directory.is_some() {
-            // Windows canonical paths gain a `\\?\` prefix and long names, so compare ancestors' reparse points instead.
             #[cfg(windows)]
             for ancestor in root.ancestors().filter(|path| path.parent().is_some()) {
                 checked(ancestor, true)?;
             }
-            #[cfg(not(windows))]
-            {
-                #[cfg(test)]
-                CANONICALIZING.with(|hook| {
-                    if let Some(hook) = &*hook.borrow() {
-                        hook(root);
-                    }
-                });
-                match present(root.canonicalize())? {
-                    Some(path) if path == root => (),
-                    Some(_) => return Err(Error::Unsafe(root.to_owned())),
-                    None => directory = None,
+            #[cfg(all(test, not(windows)))]
+            CANONICALIZING.with(|hook| {
+                if let Some(hook) = &*hook.borrow() {
+                    hook(root);
                 }
+            });
+            match present(root.canonicalize())? {
+                Some(canonical) => {
+                    let canonical = backend::plain(canonical);
+                    #[cfg(not(windows))]
+                    if canonical != root {
+                        return Err(Error::Unsafe(root.to_owned()));
+                    }
+                    path = canonical;
+                }
+                None => directory = None,
             }
         }
-        Ok(Self {
-            path: root.to_owned(),
-            directory,
-        })
+        Ok(Self { path, directory })
     }
 }
 
@@ -427,11 +425,30 @@ impl Entry {
     }
 
     #[cfg(all(test, unix))]
-    fn clear(&self) -> Result<(), Error> {
-        self.remove(false, None)
+    fn clear(&self, build_root: &Path) -> Result<(), Error> {
+        self.remove(build_root, false, None)
     }
 
-    fn remove(&self, explicit: bool, expected: Option<(u64, u64)>) -> Result<(), Error> {
+    fn within_authorized_root(&self, build_root: &Path) -> bool {
+        if let Some(profile) = &self.profile {
+            strict_descendant(&self.path, &profile.home)
+        } else if self.build_tool() {
+            strict_descendant(&self.path, build_root)
+        } else {
+            strict_descendant(&self.path, &backend::data_dir())
+                || strict_descendant(&self.path, build_root)
+        }
+    }
+
+    fn remove(
+        &self,
+        build_root: &Path,
+        explicit: bool,
+        expected: Option<(u64, u64)>,
+    ) -> Result<(), Error> {
+        if !self.within_authorized_root(build_root) {
+            return Err(Error::Unsafe(self.path.clone()));
+        }
         let owns_links =
             self.category == Category::ModBuildCache || is_compiler_attempt(&self.relative);
         if !owns_links && !self.path.try_exists()? {
@@ -472,19 +489,11 @@ impl Entry {
         } else if self.incomplete_target() {
             return Err(Error::IncompleteUnit);
         } else if !self.build_tool() {
-            let data = present(backend::data_dir().canonicalize())?;
-            if self.profile.is_some()
-                || data.as_ref().is_some_and(|data| {
-                    self.path.starts_with(data)
-                        || self.path.starts_with(backend::plain(data.clone()))
-                })
-            {
-                return crate::cache_cleanup::clear_claimed_unit_with_contexts(
-                    &self.path,
-                    &context_roots,
-                    expected,
-                );
-            }
+            return crate::cache_cleanup::clear_claimed_unit_with_contexts(
+                &self.path,
+                &context_roots,
+                expected,
+            );
         }
         let mut parent = root.try_clone()?;
         for part in self.relative.parent().unwrap_or(Path::new("")).components() {
@@ -849,14 +858,9 @@ impl Storage {
         ]
         .into_iter()
         .collect();
-        let game = backend::plain(backend::game_home());
-        let profile_home = |path: &Path| {
-            let path = backend::plain(path.to_owned());
-            path == game
-                || profiles
-                    .iter()
-                    .any(|profile| backend::plain(profile.home.clone()) == path)
-        };
+        let game = backend::game_home();
+        let profile_home =
+            |path: &Path| path == game || profiles.iter().any(|profile| profile.home == path);
         for parent in parents {
             if cancel.is_cancelled() {
                 break;
@@ -988,7 +992,7 @@ impl Storage {
                 let result = if blocked_build_tools && entry.build_tool() {
                     Err(Error::Busy)
                 } else {
-                    entry.remove(retain, entry.root_id)
+                    entry.remove(&self.root, retain, entry.root_id)
                 };
                 match result {
                     // Only a cleared folder is walked again, to see what is left of it.
@@ -1111,16 +1115,14 @@ fn measure_entry(
     }
 }
 
+fn strict_descendant(path: &Path, root: &Path) -> bool {
+    path.strip_prefix(root)
+        .is_ok_and(|relative| !relative.as_os_str().is_empty())
+}
+
 fn overlaps_profile(path: &Path, profiles: &[instances::Instance]) -> bool {
-    let path = backend::plain(path.to_owned());
-    let overlaps = |home: PathBuf| {
-        let home = backend::plain(home);
-        path.starts_with(&home) || home.starts_with(&path)
-    };
-    overlaps(backend::game_home())
-        || profiles
-            .iter()
-            .any(|profile| overlaps(profile.home.clone()))
+    let overlaps = |home: &Path| path.starts_with(home) || home.starts_with(path);
+    overlaps(&backend::game_home()) || profiles.iter().any(|profile| overlaps(&profile.home))
 }
 
 /// Native builds no profile plays and nothing is running or building from.

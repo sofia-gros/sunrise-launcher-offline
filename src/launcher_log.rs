@@ -427,6 +427,11 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub fn init(dir: &Path) {
     hide_path(&crate::backend::data_dir());
     hide_path(&crate::backend::game_home());
+    for var in ["SUNRISE_LAUNCHER_HOME", "SUNRISE_HOME"] {
+        if let Some(raw) = std::env::var_os(var).filter(|value| !value.is_empty()) {
+            hide_path(Path::new(&raw));
+        }
+    }
     if let Some(parent) = dir.parent() {
         hide_path(parent);
     }

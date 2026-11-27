@@ -55,7 +55,10 @@ fn actor_starting_after_the_last_process_observation_cannot_authorize_cleanup() 
         Category::OtherCaches,
     )
     .unwrap();
-    assert!(matches!(entry.clear(), Err(Error::UnprovenExclusion)));
+    assert!(matches!(
+        entry.clear(&home.0),
+        Err(Error::UnprovenExclusion)
+    ));
     assert!(cache.exists());
 }
 
@@ -441,7 +444,7 @@ fn incomplete_build_retry_and_clear_recheck_enforce_ordinary_profile_pins() {
     let late_id = late.id.clone();
     let report = storage
         .clear_observed(Some(Category::SpareGameBuilds), false, |path| {
-            if backend::plain(path.to_path_buf()) == backend::plain(raced.clone()) {
+            if path == raced {
                 instances::edit(&late_id, |meta| meta.version = Some("native-raced".into()))
                     .unwrap();
             }
@@ -546,16 +549,15 @@ fn clear_refuses_units_replaced_with_different_identity_after_selection() {
     let storage = Storage::at(&data).unwrap();
     let report = storage
         .clear_observed(None, true, |path| {
-            let plain = backend::plain(path.to_path_buf());
-            if plain == backend::plain(cache_dir.clone()) {
+            if path == cache_dir {
                 // Keep the original alive under `hold` so the filesystem cannot reuse its inode.
                 fs::rename(&cache_dir, hold.join("mod-content")).unwrap();
                 fs::create_dir_all(&cache_dir).unwrap();
                 fs::write(cache_dir.join("replacement"), b"new dir").unwrap();
-            } else if plain == backend::plain(cache_file.clone()) {
+            } else if path == cache_file {
                 fs::rename(&cache_file, hold.join("behaviours-v8.bin")).unwrap();
                 fs::write(&cache_file, b"new file").unwrap();
-            } else if plain == backend::plain(rust_unit.clone()) {
+            } else if path == rust_unit {
                 fs::rename(&rust_unit, hold.join("rust-old")).unwrap();
                 fs::create_dir_all(&rust_unit).unwrap();
                 fs::write(rust_unit.join("replacement"), b"new rust").unwrap();
@@ -658,7 +660,7 @@ fn explicit_storage_clear_keeps_version_started_after_discovery_as_busy() {
     let mut running = StopChild(None);
     let report = storage
         .clear_observed(Some(Category::SpareGameBuilds), false, |path| {
-            if backend::plain(path.to_path_buf()) == backend::plain(spare.clone()) {
+            if path == spare {
                 let marker = format!("{}/sunrise-server", spare.display());
                 let mut child = Command::new("sh")
                     .args(["-c", "printf ready; read -r stop", "late-version-actor"])
@@ -723,4 +725,188 @@ fn explicit_storage_clear_keeps_version_started_after_discovery_as_busy() {
             .collect::<Vec<_>>()
     );
     assert!(!spare.exists());
+}
+
+#[cfg(windows)]
+fn noncanonical_windows_path(path: PathBuf) -> PathBuf {
+    let plain = backend::plain(path);
+    let text = plain.to_string_lossy();
+    if text.contains('~') {
+        return plain;
+    }
+    let bytes = text.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_uppercase() && bytes[1] == b':' {
+        let mut lowered = String::with_capacity(text.len());
+        lowered.push(bytes[0].to_ascii_lowercase() as char);
+        lowered.push_str(&text[1..]);
+        return PathBuf::from(lowered);
+    }
+    plain
+}
+
+#[test]
+fn explicit_clear_under_noncanonical_short_path_keeps_leased_version() {
+    const TEST: &str = "storage::inventory::regressions::explicit_clear_under_noncanonical_short_path_keeps_leased_version";
+    const ACTOR: &str = "STORAGE_SHORT_PATH_LEASE_ACTOR";
+    if std::env::var_os(ACTOR).is_none() {
+        // Keep the raw temp dir (8.3 short path on Windows CI, e.g. C:\Users\RUNNER~1\...)
+        // rather than pre-canonicalizing it, so boundary normalization is exercised end-to-end.
+        let root = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let launcher_home = noncanonical_windows_path(root.path().join("launcher"));
+        #[cfg(not(windows))]
+        let launcher_home = root.path().join("launcher");
+        #[cfg(windows)]
+        let game_home = noncanonical_windows_path(root.path().join("game"));
+        #[cfg(not(windows))]
+        let game_home = root.path().join("game");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(ACTOR, "1")
+            .env("SUNRISE_LAUNCHER_HOME", launcher_home)
+            .env("SUNRISE_HOME", game_home)
+            .env(
+                "SUNRISE_LAUNCHER_LOCATION_FILE",
+                root.path().join("location"),
+            )
+            .env("XDG_DATA_HOME", root.path().join("xdg-data"))
+            .env("XDG_CONFIG_HOME", root.path().join("xdg-config"))
+            .env("SUNRISE_NO_KEYCHAIN", "1")
+            .env("SUNRISE_LAUNCHER_NO_SELF_UPDATE", "1")
+            .env("SUNRISE_NO_AUDIO", "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let data = backend::data_dir();
+    let selected = backend::version_dir("v0.0.1");
+    fs::create_dir_all(&selected).unwrap();
+    fs::write(selected.join(".installed"), b"").unwrap();
+    fs::write(data.join("settings.json"), br#"{"selected":"v0.0.1"}"#).unwrap();
+
+    let spare = backend::version_dir("native-short-leased");
+    fs::create_dir_all(&spare).unwrap();
+    fs::write(spare.join(".installed"), b"").unwrap();
+    fs::write(spare.join("native-mods.json"), b"{}").unwrap();
+    fs::write(spare.join(backend::CLIENT), b"native game").unwrap();
+
+    let tree = Dir::open_ambient_dir(&spare, cap_std::ambient_authority()).unwrap();
+    let playing = crate::run_leases::Registry::open()
+        .unwrap()
+        .lock(&tree, crate::native_cache::LockMode::Shared)
+        .unwrap();
+    drop(tree);
+
+    let storage = Storage::open().unwrap();
+    let blocked = storage
+        .report(Some(Category::SpareGameBuilds), false)
+        .unwrap();
+    let row = blocked
+        .rows
+        .iter()
+        .find(|row| row.category == Category::SpareGameBuilds)
+        .unwrap();
+    assert!(
+        row.kept.iter().any(|unit| unit.kind == KeptKind::Busy),
+        "expected Busy keep for leased version under short/non-canonical home, got {:?}",
+        row.kept
+            .iter()
+            .map(|u| (u.kind, u.reason.as_str()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(fs::read(spare.join("native-mods.json")).unwrap(), b"{}");
+    assert_eq!(
+        fs::read(spare.join(backend::CLIENT)).unwrap(),
+        b"native game"
+    );
+
+    drop(playing);
+    let cleared = storage
+        .report(Some(Category::SpareGameBuilds), false)
+        .unwrap();
+    let row = cleared
+        .rows
+        .iter()
+        .find(|row| row.category == Category::SpareGameBuilds)
+        .unwrap();
+    assert!(
+        row.kept.is_empty(),
+        "unexpected kept units after lease drop: {:?}",
+        row.kept
+            .iter()
+            .map(|u| (u.kind, u.reason.as_str()))
+            .collect::<Vec<_>>()
+    );
+    assert!(!spare.exists());
+}
+
+#[test]
+fn entry_remove_refuses_path_outside_storage_and_data_roots() {
+    let storage_home = Home::new();
+    let outside = Home::new();
+    let profile_home = Home::new();
+    let outside_version = outside.seed("versions/precious/game");
+    let outside_rust = outside.seed("rust/precious/bin");
+    let storage = Storage::at(&storage_home.0).unwrap();
+    let outside_root = Root::open(&outside.0).unwrap();
+
+    let spare = Entry::fixed(
+        &outside_root,
+        Path::new("versions/precious"),
+        Category::SpareGameBuilds,
+    )
+    .unwrap();
+    assert!(matches!(
+        spare.remove(&storage.root, true, spare.root_id),
+        Err(Error::Unsafe(_))
+    ));
+    assert_eq!(fs::read(&outside_version).unwrap(), vec![7; 8192]);
+
+    let compiler = Entry::fixed(
+        &outside_root,
+        Path::new("rust/precious"),
+        Category::RustCompiler,
+    )
+    .unwrap();
+    assert!(matches!(
+        compiler.remove(&storage.root, true, compiler.root_id),
+        Err(Error::Unsafe(_))
+    ));
+    assert_eq!(fs::read(&outside_rust).unwrap(), vec![7; 8192]);
+
+    let mut mismatched_profile = Entry::fixed(
+        &outside_root,
+        Path::new("versions/precious"),
+        Category::OtherCaches,
+    )
+    .unwrap();
+    mismatched_profile.profile = Some(Arc::new(ProfileContext {
+        home: profile_home.0.clone(),
+        work: profile_home.0.clone(),
+        version: "v0.0.1".into(),
+    }));
+    assert!(matches!(
+        mismatched_profile.remove(&storage.root, true, mismatched_profile.root_id),
+        Err(Error::Unsafe(_))
+    ));
+    assert_eq!(fs::read(&outside_version).unwrap(), vec![7; 8192]);
+
+    let mut at_root = Entry::fixed(
+        &Root::open(&storage_home.0).unwrap(),
+        Path::new("rust"),
+        Category::RustCompiler,
+    )
+    .unwrap();
+    at_root.path = storage.root.clone();
+    assert!(matches!(
+        at_root.remove(&storage.root, true, at_root.root_id),
+        Err(Error::Unsafe(_))
+    ));
 }
