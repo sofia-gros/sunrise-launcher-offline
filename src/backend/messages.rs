@@ -98,6 +98,9 @@ pub enum Msg {
         Result<(), crate::browser::installed::GameInstallProblem>,
     ),
     SwitchProgress(crate::browser::sunrise::InstallProgress),
+    /// A counted line from inside a switch's step ("Checking the game files: 120 of 4000"), from
+    /// the play-detail sink the switch worker holds while it runs.
+    SwitchDetail(String),
     SwitchQuestion(
         Box<crate::browser::sunrise::SwitchQuestion>,
         std::sync::mpsc::Sender<crate::browser::sunrise::SwitchDecision>,

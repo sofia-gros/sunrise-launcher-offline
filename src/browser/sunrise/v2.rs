@@ -37,8 +37,16 @@ const STATE_FILE: &str = "state.json";
 pub const PRODUCTION_KEY: &str = "RWTNJaFJ4AekHG/RgVrgmJpvy9B2EaeqbdSNuseKUx2XPxaOZkChLV0q";
 
 /// Built-in minisign public keys trusted to sign the v2 mod registry catalogue.
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "capture-registry-key")))]
 pub const REGISTRY_KEYS: &[&str] = &[PRODUCTION_KEY];
+
+/// A capture build (window screenshots against fixture data) trusts only the disposable key it
+/// was built with, never the production one, so it can't be mistaken for a player's launcher.
+#[cfg(all(not(test), feature = "capture-registry-key"))]
+pub const REGISTRY_KEYS: &[&str] = &[env!("SUNRISE_CAPTURE_REGISTRY_KEY")];
+
+#[cfg(all(feature = "capture-registry-key", not(debug_assertions)))]
+compile_error!("capture-registry-key is for debug capture builds only, never a release build");
 
 /// Disposable test-only minisign public key; never compiled into non-test builds.
 #[cfg(test)]
@@ -178,6 +186,16 @@ struct RefreshContext<'a> {
 }
 
 static LOADED: Mutex<Option<LoadedState>> = Mutex::new(None);
+
+/// The serial of the verified catalogue held in memory, if one is: what a cached answer drawn
+/// from the index (Home's build suggestion) keys on, with no file read or fetch.
+pub fn loaded_serial() -> Option<u64> {
+    LOADED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .map(|loaded| loaded.catalog.index.serial)
+}
 /// The verified snapshot on disk, read by [`read_saved_index`] while nothing is loaded yet.
 static SAVED: Mutex<Option<Catalog>> = Mutex::new(None);
 /// Serializes on-disk serial-floor checks and cache publication across stores.

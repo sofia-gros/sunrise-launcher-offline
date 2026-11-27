@@ -110,8 +110,12 @@ pub(crate) struct View {
     pub enabled: bool,
     /// One sentence beside Play: a problem, a held update, a newer build.
     pub said: Option<String>,
-    /// Live counted Play step detail shown in the reserved line above Play (never moves the Play row).
+    /// Live counted Play step detail, shown in the status line under the Play row while Play
+    /// downloads or prepares.
     pub play_detail: Option<String>,
+    /// "{build} is available", while Update game is the action: Home draws it with its button
+    /// in the played line's place, above the Play row.
+    pub offer: Option<String>,
     /// That sentence is a problem.
     pub failed: bool,
     pub act: Option<Act>,
@@ -293,6 +297,7 @@ impl Facts {
             Some(Step::Build) => self.build_gone.filter(|_| !busy).map(WayOut::Newest),
             _ => None,
         };
+        let offer = update.map(|build| trf("{build} is available", &[("build", build)]));
         let act = if self.building {
             Some(Act::StopBuild)
         } else if let Some((home, detail)) = recovery {
@@ -309,6 +314,7 @@ impl Facts {
         } else {
             update.map(|_| Act::Update)
         };
+        let offer = offer.filter(|_| matches!(act, Some(Act::Update)));
         // Mods the game was made without are no problem to raise: one quiet line, at most.
         let mods_off =
             (said.is_none() && !self.building && self.mods_off > 0).then_some(self.mods_off);
@@ -320,6 +326,7 @@ impl Facts {
             ) && main != Main::SignIn,
             said,
             play_detail,
+            offer,
             failed,
             act,
             mods_off,
@@ -392,6 +399,15 @@ impl Act {
             Act::Update => tr("Update game"),
         }
     }
+}
+
+/// What Update game saves with the switch: a profile kept on one build is kept on the new one;
+/// one that follows its channel goes on following it (nothing saved), so the channel's next
+/// build still reaches it.
+pub(crate) fn update_choice(
+    pinned: bool,
+) -> Option<sunrise_launcher::browser::sunrise::BuildChoice> {
+    pinned.then_some(sunrise_launcher::browser::sunrise::BuildChoice::Keep)
 }
 
 impl StripAct {
@@ -533,9 +549,15 @@ impl Launcher {
             Act::BuildResult => self.open_sheet(Sheet::ModBuild),
             Act::Notice { text, way_out } => self.open_notice(text.clone(), way_out.clone()),
             Act::Resolve => self.open_sheet(Sheet::Resolve),
+            // One press: download, prepare and switch to the channel's newest build, in the
+            // switch dialog, as the channel rows do. A following profile keeps following; one
+            // that stays on a build stays on the new one.
             Act::Update => {
                 if let Some(tag) = self.game_update().map(|release| release.tag.clone()) {
-                    self.open_update_picker(tag);
+                    let pinned = self
+                        .selected_instance()
+                        .is_some_and(|i| i.version.is_some());
+                    self.begin_switch(tag, update_choice(pinned));
                 }
             }
         }

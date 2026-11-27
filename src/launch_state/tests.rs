@@ -390,6 +390,8 @@ fn a_newer_build_is_offered_only_to_an_idle_installed_game_and_only_on_home() {
     let view = newer.view();
     assert_eq!(view.said.as_deref(), Some("Nov 18 is available"));
     assert_eq!(view.act, Some(Act::Update));
+    // Home draws the offer above the Play row, in the played line's place.
+    assert_eq!(view.offer.as_deref(), Some("Nov 18 is available"));
     assert_eq!(Act::Update.label(), "Update game");
     assert_eq!(view.strip(), None);
     for facts in [
@@ -407,8 +409,21 @@ fn a_newer_build_is_offered_only_to_an_idle_installed_game_and_only_on_home() {
         },
     ] {
         let view = facts.view();
+        assert_eq!(view.offer, None, "{facts:?}");
         assert_eq!((view.said, view.act), (None, None), "{facts:?}");
     }
+    // A problem's action wins the button, so the offer isn't drawn on its own.
+    let held = Facts {
+        held: Some("Nov 19".into()),
+        ..idle()
+    };
+    let view = Facts {
+        update: Some("Nov 18".into()),
+        ..held
+    }
+    .view();
+    assert_eq!(view.act, Some(Act::Resolve));
+    assert_eq!(view.offer, None);
 }
 
 #[test]
@@ -801,5 +816,15 @@ fn registry_install_shows_build_percent_and_offers_stop_until_publishing() {
     assert_eq!(
         publishing.strip(),
         Some(("Finishing…".into(), StripAct::Home))
+    );
+}
+
+#[test]
+fn update_game_keeps_a_pinned_profile_pinned_and_a_following_one_following() {
+    use sunrise_launcher::browser::sunrise::BuildChoice;
+    assert!(matches!(update_choice(true), Some(BuildChoice::Keep)));
+    assert!(
+        update_choice(false).is_none(),
+        "a following profile saves no pin"
     );
 }
