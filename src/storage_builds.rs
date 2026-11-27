@@ -83,6 +83,21 @@ fn build_size(build: &Build) -> String {
     }
 }
 
+/// Total bytes for the confirmed old-build tags only when every confirmed tag is present in
+/// `rows` and has a measured size. Missing or unmeasured tags return `None` so the confirmation
+/// never quotes a partial or zero total as complete.
+fn bulk_remove_bytes(tags: &[String], rows: &[Build]) -> Option<u64> {
+    if tags.is_empty() {
+        return None;
+    }
+    let mut total = 0u64;
+    for tag in tags {
+        let bytes = rows.iter().find(|row| &row.tag == tag)?.bytes?;
+        total = total.saturating_add(bytes);
+    }
+    Some(total)
+}
+
 impl Launcher {
     pub(super) fn refresh_storage_builds(&mut self) {
         let Some((generation, cancel)) = self.storage_builds.start_count(self.location_unavailable)
@@ -408,12 +423,9 @@ impl Launcher {
             )));
         }
         if let Some(Confirm::Old(tags)) = &self.storage_builds.confirm {
-            // The sizes are offered once every one of them is counted; Remove never waits for them.
-            let bytes: Option<u64> = rows
-                .iter()
-                .filter(|b| tags.contains(&b.tag))
-                .map(|b| b.bytes)
-                .sum();
+            // The sizes are offered once every confirmed tag is present and counted; Remove never
+            // waits for them.
+            let bytes = bulk_remove_bytes(tags, rows);
             card.push(self.storage_confirmation(
                 if tags.len() == 1 {
                     tr("Remove 1 old build?").to_string()
@@ -617,5 +629,61 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tag, "unreadable");
         assert_eq!(build_size(&rows[0]), "Not counted");
+    }
+
+    #[test]
+    fn bulk_remove_confirmation_requires_every_confirmed_tag_to_be_present_and_measured() {
+        let row = |tag: &str, bytes: Option<u64>, size_unavailable| Build {
+            tag: tag.into(),
+            bytes,
+            size_unavailable,
+            in_use: None,
+            old_download: true,
+        };
+        let tags = vec!["26.3-0.1.1".to_string(), "26.3-0.1.2".to_string()];
+        // Empty rows (for example while reloading) must not quote 0 bytes.
+        assert_eq!(bulk_remove_bytes(&tags, &[]), None);
+        assert_eq!(
+            bulk_remove_bytes(&[], &[row("26.3-0.1.1", Some(100), None)]),
+            None
+        );
+        // A missing confirmed tag must not quote only the remaining measured rows.
+        assert_eq!(
+            bulk_remove_bytes(&tags, &[row("26.3-0.1.1", Some(100), None)]),
+            None
+        );
+        // An unmeasured or unreadable confirmed tag omits the total.
+        assert_eq!(
+            bulk_remove_bytes(
+                &tags,
+                &[
+                    row("26.3-0.1.1", Some(100), None),
+                    row("26.3-0.1.2", None, None),
+                ]
+            ),
+            None
+        );
+        assert_eq!(
+            bulk_remove_bytes(
+                &tags,
+                &[
+                    row("26.3-0.1.1", Some(100), None),
+                    row("26.3-0.1.2", None, Some(SizeUnavailable::Unreadable)),
+                ]
+            ),
+            None
+        );
+        // Once every confirmed tag is present and measured, sum only those tags.
+        assert_eq!(
+            bulk_remove_bytes(
+                &tags,
+                &[
+                    row("26.3-0.1.1", Some(100), None),
+                    row("26.3-0.1.2", Some(250), None),
+                    row("26.3-0.1.3", None, None),
+                ]
+            ),
+            Some(350)
+        );
     }
 }
