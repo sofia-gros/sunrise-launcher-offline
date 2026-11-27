@@ -103,6 +103,7 @@ Start the client (needs a signed-in Microsoft account that owns Minecraft: Java 
 - `--server`: Join this server at once: an address, or a server of the list by name or position
 - `--arg`: An extra argument for the game, passed through as-is (repeatable), for example --server-thread
 - `--account`: Play this launch as this signed-in account (its name or UUID), without changing the one `account select` picked: several games can play as several accounts at once
+- `--trust-native-code`: If this play builds the profile's native mods, build the ones the registry did not review too, such as files copied in by hand (asked again on every run)
 
 MCP: `play`, then the `game_*` tools.
 

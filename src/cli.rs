@@ -658,6 +658,10 @@ enum Cmd {
         /// the one `account select` picked: several games can play as several accounts at once
         #[arg(long, value_name = "WHO")]
         account: Option<String>,
+        /// If this play builds the profile's native mods, build the ones the registry did not
+        /// review too, such as files copied in by hand (asked again on every run)
+        #[arg(long)]
+        trust_native_code: bool,
     },
     /// Switch a profile to an exact installed and prepared game build
     Switch {
@@ -1415,7 +1419,11 @@ fn execute(command: Cmd, as_json: bool) -> Result<i32, String> {
             server,
             arg,
             account,
+            trust_native_code,
         } => {
+            if trust_native_code {
+                trust_unreviewed_builds();
+            }
             let instance = instances::for_play(instance.as_deref())?;
             use sunrise_launcher::{jars, managed_play};
             let accounts = Accounts::load();
@@ -3608,6 +3616,19 @@ mod tests {
             Some(Cmd::Play { account, .. }) => assert_eq!(account.as_deref(), Some("Alex")),
             _ => panic!("not play"),
         }
+    }
+
+    /// Play's own build refuses unreviewed mods and names this flag (#472), so play takes it too.
+    #[test]
+    fn play_takes_trust_native_code_for_one_launch() {
+        let parse = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+            Some(Cmd::Play {
+                trust_native_code, ..
+            }) => trust_native_code,
+            _ => panic!("not play"),
+        };
+        assert!(parse(&["sunrise-launcher", "play", "--trust-native-code"]));
+        assert!(!parse(&["sunrise-launcher", "play"]));
     }
 
     #[test]
