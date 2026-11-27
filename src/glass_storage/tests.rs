@@ -32,15 +32,18 @@ fn the_question_asks_without_a_size_when_the_rows_are_not_counted() {
 
 #[cfg(unix)]
 #[test]
+#[ignore = "spawns an isolated process with scratch data roots"]
 fn storage_row_actions_and_advice_use_real_inventory_rows() {
     use std::{fs, os::unix::fs::symlink, path::PathBuf, process::Command};
 
     // Storage opens the process's data roots. Keep the test's roots in a fresh process.
     const CHILD: &str = "SUNRISE_TEST_STORAGE_ROW_CHILD";
+    const DONE: &str = "storage-row-fixture-passed";
     let Some(root) = std::env::var_os(CHILD).map(PathBuf::from) else {
         let home = tempfile::tempdir().unwrap();
-        let status = Command::new(std::env::current_exe().unwrap())
+        let output = Command::new(std::env::current_exe().unwrap())
             .args([
+                "--include-ignored",
                 "--exact",
                 "glass_storage::tests::storage_row_actions_and_advice_use_real_inventory_rows",
                 "--nocapture",
@@ -52,9 +55,16 @@ fn storage_row_actions_and_advice_use_real_inventory_rows() {
                 home.path().join("location.json"),
             )
             .env("SUNRISE_HOME", home.path().join("game"))
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success()
+                && stdout.contains("test result: ok. 1 passed;")
+                && stdout.contains(DONE),
+            "storage row child did not pass exactly one test:\n{stdout}{stderr}"
+        );
         return;
     };
     let launcher = root.join("launcher");
@@ -110,6 +120,7 @@ fn storage_row_actions_and_advice_use_real_inventory_rows() {
     assert!(kept_line(refused)
         .unwrap()
         .contains("Remove older game builds"));
+    println!("{DONE}");
 }
 
 #[test]
