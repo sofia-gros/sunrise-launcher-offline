@@ -1190,7 +1190,15 @@ fi
         pre_launch: "exit 23".into(),
         ..Default::default()
     };
-    let try_hook = || {
+    let succeeding_hook = crate::launch::Launch {
+        pre_launch: if cfg!(windows) {
+            "exit /b 0".into()
+        } else {
+            "true".into()
+        },
+        ..Default::default()
+    };
+    let try_hook = |launch: &crate::launch::Launch| {
         let mut command = Command::new(build.join(backend::CLIENT));
         command
             .current_dir(&home)
@@ -1199,16 +1207,18 @@ fi
             .arg(&home)
             .arg("--resources")
             .arg(active.resource_path());
-        profile.spawn_configured(&active, &cancellation, command, &failing_hook, true)
+        profile.spawn_configured(&active, &cancellation, command, launch, true)
     };
-    let error = try_hook().err().expect("damaged snapshot launched");
+    // With a damaged snapshot, the pre-launch hook runs first: a failing hook stops before
+    // verification, while a succeeding hook falls through to the single handoff verify.
+    assert!(matches!(try_hook(&failing_hook), Err(StartError::Hook(_))));
+    assert_eq!(FULL_VERIFICATIONS.take(), 0);
+    let error = try_hook(&succeeding_hook)
+        .err()
+        .expect("damaged snapshot launched");
     assert!(matches!(error, StartError::Snapshot(_)), "{error:?}");
     snapshot_error(&active, error.into());
     assert_eq!(FULL_VERIFICATIONS.take(), 1);
-    fs::write(&blob, BLOB).unwrap();
-    assert!(matches!(try_hook(), Err(StartError::Hook(_))));
-    assert_eq!(FULL_VERIFICATIONS.take(), 1);
-    fs::write(&blob, b"tampered bytes").unwrap();
 
     // Mod recovery still hashes the files itself, and refuses in its own words.
     let recovery = ModRecovery {
@@ -1589,8 +1599,9 @@ fn pre_launch_hook_runs_outside_the_manifest_lock_and_reacquires_before_spawn() 
     };
 
     // Exercise both First Play (which carries an owned `VerifiedSnapshot` holding its own
-    // `HomeLockGuard`) and repeat Play (`proof == None`).
-    for expected_verifies in [0_u32, 1_u32] {
+    // `HomeLockGuard`) and repeat Play (`proof == None`). Because the hook runs unlocked
+    // before verification, both paths perform one full verification after the hook returns.
+    for first_play in [true, false] {
         if marker.exists() {
             fs::remove_file(&marker).unwrap();
         }
@@ -1605,7 +1616,7 @@ fn pre_launch_hook_runs_outside_the_manifest_lock_and_reacquires_before_spawn() 
                 || None,
             )
             .unwrap();
-        assert_eq!(proof.is_some(), expected_verifies == 0);
+        assert_eq!(proof.is_some(), first_play);
         let result = profile.spawn_checked_account(
             &active,
             &cancellation,
@@ -1623,7 +1634,7 @@ fn pre_launch_hook_runs_outside_the_manifest_lock_and_reacquires_before_spawn() 
             Ok(_) => panic!("expected hook sentinel error"),
         }
         assert!(marker.is_file(), "hook did not acquire the manifest lock");
-        assert_eq!(FULL_VERIFICATIONS.take(), expected_verifies);
+        assert_eq!(FULL_VERIFICATIONS.take(), 1);
     }
 }
 
@@ -1677,6 +1688,12 @@ fn successful_mutating_pre_launch_hook_is_refused_before_spawn_with_one_verify()
             )
             .unwrap();
             fs::write(home.join("hook-mutated-binary"), b"ok").unwrap();
+            return;
+        }
+        "mutate-resource" => {
+            let blob = std::path::PathBuf::from(std::env::var_os("HOOK_RESOURCE_BLOB").unwrap());
+            fs::write(blob, b"tampered resource").unwrap();
+            fs::write(home.join("hook-mutated-resource"), b"ok").unwrap();
             return;
         }
         "scenario" => {}
@@ -1750,6 +1767,14 @@ touch "$SUNRISE_HOME/game-spawned"
         };
         launch.env.insert("HOOK_EXE".into(), exe.clone());
         launch.env.insert(ACTOR.into(), actor.into());
+        launch.env.insert(
+            "HOOK_RESOURCE_BLOB".into(),
+            active
+                .resource_path()
+                .join("fixture-blob.bin")
+                .to_string_lossy()
+                .into_owned(),
+        );
         launch
     };
     let command = || {
@@ -1764,8 +1789,8 @@ touch "$SUNRISE_HOME/game-spawned"
         command
     };
 
-    // Case 1: a hook that exits 0 after mutating profile inputs must be refused before spawn
-    // with exactly one full resource verification.
+    // Case 1: a hook that exits 0 after mutating profile inputs must be refused before spawn;
+    // inputs are checked before walking prepared resources, so no resource walk runs.
     FULL_VERIFICATIONS.take();
     let error = profile
         .spawn_checked_account(
@@ -1784,10 +1809,10 @@ touch "$SUNRISE_HOME/game-spawned"
     );
     assert!(home.join("hook-mutated-inputs").is_file());
     assert!(!home.join("game-spawned").exists());
-    assert_eq!(FULL_VERIFICATIONS.take(), 1);
+    assert_eq!(FULL_VERIFICATIONS.take(), 0);
 
     // Case 2: a hook that exits 0 after mutating the game binary must also be refused before
-    // spawn with exactly one full resource verification.
+    // spawn; binaries are checked before walking prepared resources.
     fs::write(home.join(mod_list::FILE), b"mod.lantern:true\n").unwrap();
     FULL_VERIFICATIONS.take();
     let error = profile
@@ -1806,6 +1831,35 @@ touch "$SUNRISE_HOME/game-spawned"
         "{error:?}"
     );
     assert!(home.join("hook-mutated-binary").is_file());
+    assert!(!home.join("game-spawned").exists());
+    assert_eq!(FULL_VERIFICATIONS.take(), 0);
+
+    // Case 3: a hook that exits 0 after mutating a file inside the active resource snapshot
+    // (leaving `sunrise-resources.json` intact) must be caught by the single handoff verify.
+    fs::write(build.join(backend::CLIENT), client_bytes).unwrap();
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            build.join(backend::CLIENT),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    FULL_VERIFICATIONS.take();
+    let error = profile
+        .spawn_checked_account(
+            &active,
+            &cancellation,
+            command(),
+            (&hook_for("mutate-resource"), true, &|_| {}, None),
+            |_| Ok(()),
+            |_| panic!("mutated resource reached spawn"),
+        )
+        .err()
+        .expect("resource-mutating hook launched the game");
+    assert!(matches!(error, StartError::Snapshot(_)), "{error:?}");
+    assert!(home.join("hook-mutated-resource").is_file());
     assert!(!home.join("game-spawned").exists());
     assert_eq!(FULL_VERIFICATIONS.take(), 1);
 }

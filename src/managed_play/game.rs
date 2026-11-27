@@ -115,22 +115,23 @@ impl Profile {
             hook,
             before_spawn,
         } = hooks;
-        let manifest = self.verify_handoff(active, proof, cancellation)?;
-        let selection = validate_selection(self.home(), &active.resource_path(), &command)?;
-        prepare_jars(&command)?;
-        let _manifest = if let Some((launch, hook_log)) =
+        let proof = if let Some((launch, hook_log)) =
             hook.filter(|(launch, _)| !launch.pre_launch.trim().is_empty())
         {
-            // Release the manifest lock while the synchronous hook runs so any helper or
-            // subcommand acquiring `.mod-browser.lock` cannot deadlock, then reacquire
-            // and recheck committed inputs and binaries before spawn.
-            drop(manifest);
+            // Run the synchronous pre-launch hook before acquiring the manifest lock
+            // (dropping any seal proof's lock guard first) so any helper or subcommand
+            // acquiring `.mod-browser.lock` cannot deadlock, then verify the committed
+            // profile, binaries, and prepared resources once before spawn.
+            drop(proof);
             crate::launch::managed_pre_launch(&command, launch, piped, hook_log)
                 .map_err(StartError::Hook)?;
-            self.recheck_after_hook(active, cancellation)?
+            None
         } else {
-            manifest
+            proof
         };
+        let _manifest = self.verify_handoff(active, proof, cancellation)?;
+        let selection = validate_selection(self.home(), &active.resource_path(), &command)?;
+        prepare_jars(&command)?;
         cancellation.check()?;
         let (mut command, runtime) = prepare(self.home(), active, command)?;
         let data = backend::data_dir();
