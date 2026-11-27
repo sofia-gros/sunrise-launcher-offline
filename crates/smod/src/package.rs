@@ -116,10 +116,10 @@ pub fn source_files(root: &Path) -> io::Result<Vec<String>> {
     let exclude = compile("exclude", &patterns("exclude")?)?;
     let mut ignored = GitignoreBuilder::new("");
     let ignore_path = root.join(".gitignore");
-    if ignore_path.is_file() {
-        if let Some(error) = ignored.add(ignore_path) {
-            return Err(invalid(format!(".gitignore: {error}")));
-        }
+    if ignore_path.is_file()
+        && let Some(error) = ignored.add(ignore_path)
+    {
+        return Err(invalid(format!(".gitignore: {error}")));
     }
     let ignored = ignored
         .build()

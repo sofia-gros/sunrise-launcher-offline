@@ -151,14 +151,14 @@ fn replace_tokens(
     let mut i = 0;
     let mut copied = 0;
     while i < bytes.len() {
-        if text.is_char_boundary(i) {
-            if let Some((len, label)) = matcher(bytes, i) {
-                out.push_str(&text[copied..i]);
-                out.push_str(label);
-                i += len;
-                copied = i;
-                continue;
-            }
+        if text.is_char_boundary(i)
+            && let Some((len, label)) = matcher(bytes, i)
+        {
+            out.push_str(&text[copied..i]);
+            out.push_str(label);
+            i += len;
+            copied = i;
+            continue;
         }
         i += 1;
     }
