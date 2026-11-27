@@ -1327,12 +1327,32 @@ pub fn installed() -> Vec<String> {
     installed_in(&versions_dir())
 }
 
+/// Like [`installed`], stopping early if `cancel` is set while enumerating `versions/`.
+pub(crate) fn installed_until(cancel: &crate::storage::Cancel) -> Option<Vec<String>> {
+    installed_in_until(&versions_dir(), || cancel.is_cancelled())
+}
+
 /// Installed versions and the newest installed Nightly known to be current, for Play.
 pub fn play_installations(selected: Option<&str>) -> (Vec<String>, Option<String>) {
+    play_installations_until(selected, &crate::storage::Cancel::default())
+        .expect("uncancellable play installations")
+}
+
+/// Like [`play_installations`], stopping early when `cancel` is set during version discovery.
+pub(crate) fn play_installations_until(
+    selected: Option<&str>,
+    cancel: &crate::storage::Cancel,
+) -> Option<(Vec<String>, Option<String>)> {
+    if cancel.is_cancelled() {
+        return None;
+    }
     let versions = versions_dir();
-    let installed = installed_in(&versions);
+    let installed = installed_in_until(&versions, || cancel.is_cancelled())?;
+    if cancel.is_cancelled() {
+        return None;
+    }
     let nightly = crate::nightly::known_install(&versions, &installed, selected).cloned();
-    (installed, nightly)
+    Some((installed, nightly))
 }
 
 /// Accept the current rolling Nightly as offline evidence when it is already installed on
@@ -1362,17 +1382,35 @@ pub fn note_play_catalogue(releases: &[Release]) -> Result<(), String> {
 }
 
 fn installed_in(versions: &Path) -> Vec<String> {
-    let mut tags: Vec<_> = fs::read_dir(versions)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| {
-            let marker = e.path().join(COMPLETE).metadata().ok()?;
-            let tag = e.file_name().into_string().ok()?;
+    installed_in_until(versions, || false).expect("uncancellable version listing")
+}
+
+fn installed_in_until(versions: &Path, cancelled: impl Fn() -> bool) -> Option<Vec<String>> {
+    if cancelled() {
+        return None;
+    }
+    let mut tags = Vec::new();
+    if let Ok(entries) = fs::read_dir(versions) {
+        for entry in entries {
+            if cancelled() {
+                return None;
+            }
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let Ok(marker) = entry.path().join(COMPLETE).metadata() else {
+                continue;
+            };
+            let Ok(tag) = entry.file_name().into_string() else {
+                continue;
+            };
             let dev_installed_at = dev_date(&tag).and_then(|_| marker.modified().ok());
-            Some((tag, dev_installed_at))
-        })
-        .collect();
+            tags.push((tag, dev_installed_at));
+        }
+    }
+    if cancelled() {
+        return None;
+    }
     // Without the catalogue, same-day Dev builds follow the last local install, not the largest
     // commit hash. Rolling Nightly Play uses its receipt independently of the display order.
     tags.sort_by(|(a, a_installed), (b, b_installed)| {
@@ -1380,7 +1418,7 @@ fn installed_in(versions: &Path) -> Vec<String> {
             .then_with(|| b_installed.cmp(a_installed))
             .then_with(|| b.cmp(a))
     });
-    tags.into_iter().map(|(tag, _)| tag).collect()
+    Some(tags.into_iter().map(|(tag, _)| tag).collect())
 }
 
 /// A small release file (its checksums or their signature), whole; None when it has none.

@@ -545,7 +545,11 @@ impl Storage {
         let data = Root::open(&backend::data_dir())?;
         // One read-only profile snapshot proves both which versions are played and where
         // their caches are. An unreadable snapshot proves neither.
-        let profiles = instances::list_for_storage().ok();
+        let profiles = match instances::list_for_storage_until(cancel) {
+            Ok(Some(profiles)) => Some(profiles),
+            Ok(None) => return Ok(entries),
+            Err(_) => None,
+        };
         if cancel.is_cancelled() {
             return Ok(entries);
         }
@@ -1020,7 +1024,10 @@ fn spare_builds(
     if cancel.is_cancelled() {
         return Ok(());
     }
-    for version in backend::installed() {
+    let Some(installed) = backend::installed_until(cancel) else {
+        return Ok(());
+    };
+    for version in installed {
         if cancel.is_cancelled() {
             break;
         }
@@ -1142,7 +1149,11 @@ fn unused_jars_until(entries: &mut Vec<Entry>, home: &Root, cancel: &Cancel) -> 
             return Ok(());
         }
         let path = Entry::fixed(home, Path::new(directory), Category::OtherCaches)?.path;
-        for package in sunrise_launcher_smod::find(&path) {
+        let Some(packages) = sunrise_launcher_smod::find_until(&path, || cancel.is_cancelled())
+        else {
+            return Ok(());
+        };
+        for package in packages {
             if cancel.is_cancelled() {
                 return Ok(());
             }

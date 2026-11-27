@@ -1,5 +1,8 @@
 //! Installed game builds, separate from the launcher's disposable downloads.
-use super::{in_use, installed, is_game_tag, play_installations, version_dir, Release, Settings};
+use super::{
+    in_use, installed, is_game_tag, play_installations, play_installations_until, version_dir,
+    Release, Settings,
+};
 use crate::cache_cleanup::{self, Error};
 use crate::i18n::{tr, trf};
 use crate::storage::Cancel;
@@ -131,11 +134,12 @@ pub fn inventory_until(releases: &[Release], cancel: &Cancel) -> Option<Vec<Buil
     }
     let settings = Settings::load();
     let selected = settings.selected.as_ref();
-    let (installed, nightly) = play_installations(selected.map(String::as_str));
-    if cancel.is_cancelled() {
-        return None;
-    }
-    let profiles = instances::list_for_storage();
+    let (installed, nightly) = play_installations_until(selected.map(String::as_str), cancel)?;
+    let profiles = match instances::list_for_storage_until(cancel) {
+        Ok(Some(profiles)) => Ok(profiles),
+        Ok(None) => return None,
+        Err(error) => Err(error),
+    };
     let old: Vec<_> = old_downloads(&installed, settings.keep_newest(), |tag| {
         !cancel.is_cancelled() && downloaded(tag)
     })
@@ -587,6 +591,29 @@ mod tests {
         assert_eq!(
             disk_use(scratch.path(), &cancel, true),
             Err(SizeUnavailable::Cancelled)
+        );
+    }
+
+    #[test]
+    fn installed_build_discovery_stops_when_cancelled() {
+        let scratch = tempfile::tempdir().unwrap();
+        let versions = scratch.path().join("versions");
+        for index in 0..8 {
+            let dir = versions.join(format!("26.3-0.1.{index}"));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(super::super::COMPLETE), "").unwrap();
+        }
+        let checks = std::cell::Cell::new(0usize);
+        let result = super::super::installed_in_until(&versions, || {
+            let count = checks.get();
+            checks.set(count + 1);
+            count >= 2
+        });
+        assert!(result.is_none());
+        assert_eq!(
+            checks.get(),
+            3,
+            "must stop inside the version discovery loop"
         );
     }
 

@@ -1641,3 +1641,25 @@ fn copy_home_preserves_chosen_versions_pins_and_skips_caches() {
     );
     assert!(!target.join("mod-browser/sunrise-index.json").exists());
 }
+
+#[test]
+fn storage_profile_snapshot_stops_when_cancelled_mid_discovery() {
+    let root = scratch("cancel-snapshot");
+    let (home, data) = (root.join("home"), root.join("data"));
+    for index in 0..8 {
+        fs::create_dir_all(home.join(OWN).join(format!("profile-{index}"))).unwrap();
+    }
+    let checks = std::cell::Cell::new(0usize);
+    let result = list_snapshot_until(&home, &data, Store::default(), true, false, &|| {
+        let count = checks.get();
+        checks.set(count + 1);
+        count >= 2
+    });
+    assert!(result.is_none());
+    assert_eq!(
+        checks.get(),
+        3,
+        "must stop inside the profile discovery loop"
+    );
+    fs::remove_dir_all(root).unwrap();
+}

@@ -1369,16 +1369,32 @@ fn check_folder_file(root: &Path, name: &str) -> Result<(), String> {
 
 /// The `.smod` files and mod folders in `dir`, by name.
 pub fn find(dir: &Path) -> Vec<PathBuf> {
+    find_until(dir, || false).unwrap_or_default()
+}
+
+/// The `.smod` files and mod folders in `dir`, by name, stopping early if `cancelled` returns true.
+pub fn find_until(dir: &Path, cancelled: impl Fn() -> bool) -> Option<Vec<PathBuf>> {
+    if cancelled() {
+        return None;
+    }
     let Ok(read) = std::fs::read_dir(dir) else {
-        return Vec::new();
+        return Some(Vec::new());
     };
-    let mut found: Vec<PathBuf> = read
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "smod") || p.join(MANIFEST).is_file())
-        .collect();
+    let mut found = Vec::new();
+    for entry in read {
+        if cancelled() {
+            return None;
+        }
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "smod") || path.join(MANIFEST).is_file() {
+            found.push(path);
+        }
+    }
     found.sort();
-    found
+    Some(found)
 }
 
 #[cfg(test)]
@@ -2456,5 +2472,23 @@ issues = \"http://example.org/issues\"
         std::fs::write(dir.path().join(USES_FILE), b"[]").unwrap();
         let error = Package::pack_directory(dir.path()).unwrap_err();
         assert!(error.contains(USES_FILE), "{error}");
+    }
+
+    #[test]
+    fn find_until_stops_when_cancelled_during_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..8 {
+            std::fs::write(dir.path().join(format!("mod-{index}.smod")), b"").unwrap();
+        }
+        assert_eq!(find_until(dir.path(), || false).unwrap().len(), 8);
+        assert_eq!(find_until(dir.path(), || true), None);
+        let checks = std::cell::Cell::new(0usize);
+        let result = find_until(dir.path(), || {
+            let count = checks.get();
+            checks.set(count + 1);
+            count >= 2
+        });
+        assert_eq!(result, None);
+        assert_eq!(checks.get(), 3, "must stop inside the directory loop");
     }
 }

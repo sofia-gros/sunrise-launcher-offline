@@ -646,14 +646,26 @@ pub fn list() -> Vec<Instance> {
 
 /// Read the atomic metadata snapshot without housekeeping or taking a profile gate.
 pub(crate) fn list_for_storage() -> Result<Vec<Instance>, String> {
+    Ok(list_for_storage_until(&crate::storage::Cancel::default())?
+        .expect("uncancellable storage profile snapshot"))
+}
+
+/// Like [`list_for_storage`], stopping early when `cancel` is set during profile or pack discovery.
+pub(crate) fn list_for_storage_until(
+    cancel: &crate::storage::Cancel,
+) -> Result<Option<Vec<Instance>>, String> {
+    if cancel.is_cancelled() {
+        return Ok(None);
+    }
     let data = backend::data_dir();
     let store = Store::read(&data)?;
-    Ok(list_snapshot(
+    Ok(list_snapshot_until(
         &backend::game_home(),
         &data,
         store,
         true,
         false,
+        &|| cancel.is_cancelled(),
     ))
 }
 
@@ -745,10 +757,25 @@ fn list_with_snapshot(
 fn list_snapshot(
     game_home: &Path,
     data: &Path,
-    mut store: Store,
+    store: Store,
     admitted: bool,
     housekeeping: bool,
 ) -> Vec<Instance> {
+    list_snapshot_until(game_home, data, store, admitted, housekeeping, &|| false)
+        .expect("uncancellable profile snapshot")
+}
+
+fn list_snapshot_until(
+    game_home: &Path,
+    data: &Path,
+    mut store: Store,
+    admitted: bool,
+    housekeeping: bool,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<Vec<Instance>> {
+    if cancelled() {
+        return None;
+    }
     let mut found = vec![(
         DEFAULT.to_string(),
         "Sunrise".to_string(),
@@ -756,13 +783,22 @@ fn list_snapshot(
         game_home.to_path_buf(),
         game_home.to_path_buf(),
     )];
-    let mut own: Vec<_> = fs::read_dir(game_home.join(OWN))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| e.path().is_dir())
-        .filter_map(|e| e.file_name().into_string().ok())
-        .collect();
+    let mut own = Vec::new();
+    if let Ok(entries) = fs::read_dir(game_home.join(OWN)) {
+        for entry in entries {
+            if cancelled() {
+                return None;
+            }
+            let Ok(entry) = entry else {
+                continue;
+            };
+            if entry.path().is_dir() {
+                if let Ok(name) = entry.file_name().into_string() {
+                    own.push(name);
+                }
+            }
+        }
+    }
     own.sort();
     // Directory renames and metadata snapshots share the lock. Play/Delete need the initial
     // choices even after an interrupted create, but a refused request must not save the store.
@@ -779,6 +815,9 @@ fn list_snapshot(
         }
         let retained = store.instances.len();
         for id in &own {
+            if cancelled() {
+                return None;
+            }
             if !store.instances.contains_key(id) {
                 if let Some(meta) = initial_choices(&parent.join(id)) {
                     store.instances.insert(id.clone(), meta);
@@ -798,12 +837,15 @@ fn list_snapshot(
         let dir = game_home.join(OWN).join(&slug);
         found.push((slug.clone(), slug, Kind::Own, dir.clone(), dir));
     }
-    for p in registry_pack::list_in(&game_home.join("sunrise-packs")) {
+    for p in registry_pack::list_in_until(&game_home.join("sunrise-packs"), cancelled)? {
         let home = registry_pack::home(&p.work);
         found.push((format!("pack:{}", p.id), p.name, Kind::Pack, p.work, home));
     }
     let mut recovered_choices = false;
     for (id, _, kind, _, home) in &found {
+        if cancelled() {
+            return None;
+        }
         if *kind == Kind::Pack {
             continue;
         }
@@ -830,37 +872,38 @@ fn list_snapshot(
             crate::elog!("Sunrise: instances.json is not saved: {error}");
         }
     }
-    let mut out: Vec<Instance> = found
-        .into_iter()
-        .map(|(id, name, kind, work, home)| {
-            let meta = store.instances.get(&id).cloned().unwrap_or_default();
-            Instance {
-                name: meta.name.unwrap_or(name),
-                icon: meta.icon,
-                group: meta.group,
-                version: meta.version,
-                channel: meta.channel.unwrap_or_default(),
-                native_profile: meta
-                    .native_profile
-                    .unwrap_or(crate::native_mods::Profile::Optimized),
-                played: Duration::from_secs(meta.played_secs),
-                last_played: meta
-                    .last_played
-                    .and_then(|s| calendar_time(Duration::from_secs(s))),
-                launch: meta.launch,
-                id,
-                kind,
-                incarnation: admitted
-                    .then(|| Incarnation::of(&work, &home).ok())
-                    .flatten(),
-                work,
-                home,
-            }
-        })
-        .collect();
+    let mut out = Vec::with_capacity(found.len());
+    for (id, name, kind, work, home) in found {
+        if cancelled() {
+            return None;
+        }
+        let meta = store.instances.get(&id).cloned().unwrap_or_default();
+        out.push(Instance {
+            name: meta.name.unwrap_or(name),
+            icon: meta.icon,
+            group: meta.group,
+            version: meta.version,
+            channel: meta.channel.unwrap_or_default(),
+            native_profile: meta
+                .native_profile
+                .unwrap_or(crate::native_mods::Profile::Optimized),
+            played: Duration::from_secs(meta.played_secs),
+            last_played: meta
+                .last_played
+                .and_then(|s| calendar_time(Duration::from_secs(s))),
+            launch: meta.launch,
+            id,
+            kind,
+            incarnation: admitted
+                .then(|| Incarnation::of(&work, &home).ok())
+                .flatten(),
+            work,
+            home,
+        });
+    }
     out[1..].sort_by_key(|i| (i.group.clone(), i.name.to_lowercase()));
     register_profile_names(&out);
-    out
+    Some(out)
 }
 
 /// The instance an id, a name (any case) or a pack's folder name names.
