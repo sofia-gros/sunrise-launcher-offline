@@ -8,9 +8,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub mod eviction;
 mod inventory;
-pub mod policy;
 pub use inventory::{Report, Row};
 
 /// Shared with the launcher's existing server storage display.
@@ -31,61 +29,6 @@ pub enum Category {
     SpareGameBuilds,
     RustCompiler,
     OtherCaches,
-}
-
-/// Stamp a used cache unit through no-follow capabilities, not a path-following write.
-pub(crate) fn mark_used(path: &Path) -> Result<(), Error> {
-    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
-    let Some(meta) = checked(path, path.is_dir())? else {
-        return Ok(());
-    };
-    #[cfg(not(windows))]
-    if path.canonicalize()? != path {
-        return Err(Error::Unsafe(path.to_owned()));
-    }
-    #[cfg(windows)]
-    for ancestor in path
-        .ancestors()
-        .skip(1)
-        .filter(|path| path.parent().is_some())
-    {
-        checked(ancestor, true)?;
-    }
-    let (folder, stamp) = if meta.is_dir() {
-        (path, std::ffi::OsString::from(".last-used"))
-    } else {
-        let name = path
-            .file_name()
-            .ok_or_else(|| Error::Unsafe(path.to_owned()))?;
-        let mut stamp = std::ffi::OsString::from(".");
-        stamp.push(name);
-        stamp.push(".last-used");
-        (
-            path.parent()
-                .ok_or_else(|| Error::Unsafe(path.to_owned()))?,
-            stamp,
-        )
-    };
-    let anchor = folder
-        .ancestors()
-        .last()
-        .ok_or_else(|| Error::Unsafe(path.to_owned()))?;
-    let mut directory = Dir::open_ambient_dir(anchor, cap_std::ambient_authority())?;
-    for part in folder
-        .strip_prefix(anchor)
-        .map_err(|_| Error::Unsafe(path.to_owned()))?
-        .components()
-    {
-        directory = directory.open_dir_nofollow(part.as_os_str())?;
-    }
-    let mut options = cap_std::fs::OpenOptions::new();
-    options
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .follow(FollowSymlinks::No);
-    directory.open_with(stamp, &options)?;
-    Ok(())
 }
 
 /// Fixed build-home caches. Instance and version inventory adds its protected entries separately.
@@ -138,10 +81,10 @@ impl BuildCache {
     }
 }
 
-/// A build-home inventory and cleanup operation holds the native build lease throughout.
+/// Disposable storage inventory and manual clear. Read-only reports never hold the native build
+/// lease; manual clears acquire it before touching build outputs.
 pub struct Storage {
     root: PathBuf,
-    lease: Cache,
     directory: Dir,
     /// The launcher's data folder and the game folder whose builds, profiles and caches the
     /// inventory also walks: `backend::data_dir()` and `backend::game_home()`, except in tests.
@@ -170,16 +113,19 @@ impl Storage {
         checked(root, true)?;
         fs::create_dir_all(root)?;
         let directory = Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
-        let lease = Cache::acquire(root)?;
         let storage = Self {
             root: root.canonicalize()?,
             directory,
-            lease,
             data,
             game,
         };
         storage.validate_root()?;
         Ok(storage)
+    }
+
+    fn build_lease(&self) -> Result<Cache, Error> {
+        self.validate_root()?;
+        Cache::acquire(&self.root)
     }
 
     fn path(&self, cache: BuildCache) -> Result<PathBuf, Error> {
@@ -199,15 +145,16 @@ impl Storage {
         allocated_bytes(&self.path(cache)?)
     }
 
-    /// Detach on the same volume before removal. Failed removals remain for the next sweep.
+    /// Detach on the same volume before removal. Failed removals remain for the next manual clear.
     pub fn clear(&self, cache: BuildCache) -> Result<u64, Error> {
+        let _lease = self.build_lease()?;
         let path = self.path(cache)?;
         self.trash(&path, cache.access(&path)?)
     }
 
     pub fn clear_targets(&self) -> Result<u64, Error> {
         // Retain Cargo lock inodes; never rename an entire locked target directory.
-        self.lease.clear()
+        self.build_lease()?.clear()
     }
 
     fn validate_root(&self) -> Result<(), Error> {
@@ -257,18 +204,6 @@ impl Storage {
         };
         plan.clear(trash)
     }
-
-    pub fn sweep(&self) -> Result<(), Error> {
-        self.validate_root()?;
-        for entry in self.directory.entries()? {
-            let entry = entry?;
-            if entry.file_name().to_string_lossy().starts_with(".trash-") {
-                // Detached leftovers still need capability proof and exclusive ownership.
-                crate::cache_cleanup::delete_game_unit(&self.root.join(entry.file_name()))?;
-            }
-        }
-        Ok(())
-    }
 }
 
 pub fn allocated_bytes(path: &Path) -> Result<u64, Error> {
@@ -279,11 +214,17 @@ pub fn allocated_bytes(path: &Path) -> Result<u64, Error> {
 // pass walks each folder once.
 #[cfg(test)]
 thread_local! {
+    static ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 #[cfg(test)]
 pub(crate) fn walks() -> usize {
     WALKS.with(|walks| walks.get())
+}
+
+#[cfg(test)]
+pub(crate) fn entries_calls() -> usize {
+    ENTRIES.with(|calls| calls.get())
 }
 
 /// One validated walk of a folder: every file and directory's allocated size and identity,
@@ -320,11 +261,27 @@ impl Tree {
         if !meta.is_file() && !meta.is_dir() {
             return Err(Error::Unsafe(path.to_owned()));
         }
-        let (id, bytes) = allocation(path, &meta)?;
+        let (id, bytes) = match allocation(path, &meta) {
+            Ok(allocated) => allocated,
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
         let mut children = Vec::new();
         if meta.is_dir() {
-            for entry in fs::read_dir(path)? {
-                children.extend(Self::node(&entry?.path())?);
+            let entries = match fs::read_dir(path) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                children.extend(Self::node(&entry.path())?);
             }
         }
         Ok(Some(Node {

@@ -3167,3 +3167,426 @@ fn cancelling_download_interrupts_stalled_read() {
     );
     assert!(!dest.exists());
 }
+
+#[test]
+fn reuse_prepared_skips_native_builds_without_creating_local_or_resealing_base() {
+    const CHILD: &str = "SUNRISE_REUSE_NATIVE_SKIP_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let home = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "backend::tests::reuse_prepared_skips_native_builds_without_creating_local_or_resealing_base",
+            ])
+            .env(CHILD, "1")
+            .env("SUNRISE_LAUNCHER_HOME", home.path().join("launcher"))
+            .env("SUNRISE_HOME", home.path().join("game"))
+            .env("XDG_DATA_HOME", home.path().join("xdg-data"))
+            .env("XDG_CONFIG_HOME", home.path().join("xdg-config"))
+            .env("SUNRISE_LAUNCHER_LOCATION_FILE", home.path().join("location"))
+            .env("SUNRISE_LAUNCHER_TRASH", home.path().join("trash"))
+            .env("SUNRISE_LAUNCHER_CLIPBOARD", home.path().join("clipboard"))
+            .env("SUNRISE_LAUNCHER_DESKTOP", home.path().join("desktop"))
+            .env("SUNRISE_LAUNCHER_NO_SELF_UPDATE", "1")
+            .env("SUNRISE_NO_AUDIO", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+
+    let versions = versions_dir();
+    let base = "dev-2026-11-26-ba1f24e";
+    let native = "native-aaaaaaaaaaaa-fixture";
+    let write = |tag: &str, path: &str, text: &str| {
+        let path = versions.join(tag).join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    };
+    let lock = r#"{"minecraft":{"version":"26.3","client_sha1":"c","server_sha1":"s"}}"#;
+    let seed_common = |tag: &str| {
+        write(tag, COMPLETE, "");
+        write(tag, "research-lock.json", lock);
+        write(tag, "crates/sunrise-prepare/Cargo.toml", "[package]");
+        write(tag, "crates/sunrise-prepare/build.rs", "fn main() {}");
+        write(
+            tag,
+            "crates/sunrise-prepare/src/lib.rs",
+            "pub const OUTPUT_VERSION: u32 = 1;\n",
+        );
+    };
+
+    seed_common(base);
+    write(
+        base,
+        &format!(".local/sunrise-client/26.3/{RESOURCES_MANIFEST}"),
+        "{}",
+    );
+    write(
+        base,
+        &format!(".local/sunrise-client/26.3/{PREPARATION_STAMP}"),
+        r#"{"output_version":1}"#,
+    );
+    for report in RUNTIME_REPORTS {
+        write(base, &format!(".local/sunrise-client/26.3/{report}"), "{}");
+    }
+    {
+        let preparation = prepare_lock(base).unwrap();
+        crate::managed_play::Resources::prepare(base, &preparation, None).unwrap();
+    }
+    let receipt = version_dir(base).join(".local/launcher-prepared/current.json");
+    let receipt_bytes = fs::read(&receipt).unwrap();
+    let old_mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&receipt)
+        .unwrap()
+        .set_modified(old_mtime)
+        .unwrap();
+    let stamped_mtime = fs::metadata(&receipt).unwrap().modified().unwrap();
+
+    // Native client build shares the base's resources (`copy_base` copies research-lock.json and
+    // sunrise-prepare sources but omits `.local`).
+    seed_common(native);
+    write(
+        native,
+        crate::native_mods::RECORD,
+        &serde_json::json!({
+            "base": base,
+            "sunrise": "a".repeat(40),
+            "target": "client",
+            "mods": [],
+        })
+        .to_string(),
+    );
+
+    let before = (crate::storage::walks(), crate::storage::entries_calls());
+    let reused = reuse_prepared_everywhere();
+    assert!(reused.is_empty(), "{reused:?}");
+    assert!(
+        !version_dir(native).join(".local").exists(),
+        "reuse_prepared_everywhere must not copy .local into a native build"
+    );
+    assert_eq!(fs::read(&receipt).unwrap(), receipt_bytes);
+    assert_eq!(
+        fs::metadata(&receipt).unwrap().modified().unwrap(),
+        stamped_mtime,
+        "sealed base must not be re-sealed"
+    );
+    assert_eq!(
+        (crate::storage::walks(), crate::storage::entries_calls()),
+        before,
+        "desktop startup must perform zero storage tree walks"
+    );
+
+    // A native build that still carries a leftover `.local` from an older launcher is never used
+    // as a donor for an unprepared base either.
+    let donor_root = tempfile::tempdir().unwrap();
+    let donor_versions = donor_root.path();
+    let write_at = |tag: &str, path: &str, text: &str| {
+        let path = donor_versions.join(tag).join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    };
+    for tag in [native, "dev-2026-11-27-target"] {
+        write_at(tag, COMPLETE, "");
+        write_at(tag, "research-lock.json", lock);
+        write_at(tag, "crates/sunrise-prepare/Cargo.toml", "[package]");
+        write_at(tag, "crates/sunrise-prepare/build.rs", "fn main() {}");
+        write_at(
+            tag,
+            "crates/sunrise-prepare/src/lib.rs",
+            "pub const OUTPUT_VERSION: u32 = 1;\n",
+        );
+    }
+    write_at(
+        native,
+        crate::native_mods::RECORD,
+        &serde_json::json!({
+            "base": base,
+            "sunrise": "a".repeat(40),
+            "target": "client",
+            "mods": [],
+        })
+        .to_string(),
+    );
+    write_at(
+        native,
+        &format!(".local/sunrise-client/26.3/{RESOURCES_MANIFEST}"),
+        "{}",
+    );
+    write_at(
+        native,
+        &format!(".local/sunrise-client/26.3/{PREPARATION_STAMP}"),
+        r#"{"output_version":1}"#,
+    );
+    assert_eq!(
+        reuse_prepared(donor_versions, "dev-2026-11-27-target"),
+        None
+    );
+    assert!(reuse_prepared_in(donor_versions).is_empty());
+
+    // Runtime-report repair also skips resource-borrowing native builds even if they carry
+    // leftover `.local` files or datagen reports.
+    let report_target = "dev-2026-11-27-report-target";
+    write_at(report_target, COMPLETE, "");
+    write_at(report_target, "research-lock.json", lock);
+    write_at(
+        report_target,
+        &format!(".local/sunrise-client/26.3/{RESOURCES_MANIFEST}"),
+        "{}",
+    );
+    write_at(
+        report_target,
+        ".local/sunrise-client/26.3/registries.json",
+        "{}",
+    );
+    write_at(
+        native,
+        ".local/sunrise-client/26.3/commands.json",
+        r#"{"from":"native"}"#,
+    );
+    write_at(
+        native,
+        ".local/datagen/out/reports/commands.json",
+        r#"{"from":"native-datagen"}"#,
+    );
+    assert!(!complete_reports(donor_versions, report_target));
+    assert!(
+        !donor_versions
+            .join(report_target)
+            .join(".local/sunrise-client/26.3/commands.json")
+            .exists(),
+        "complete_reports must not read reports from a resource-borrowing native build"
+    );
+}
+
+#[test]
+fn startup_does_not_lock_or_write_a_complete_base_even_while_preparing_lock_is_held() {
+    const CHILD: &str = "SUNRISE_STARTUP_LOCKED_BASE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let home = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "backend::tests::startup_does_not_lock_or_write_a_complete_base_even_while_preparing_lock_is_held",
+            ])
+            .env(CHILD, "1")
+            .env("SUNRISE_LAUNCHER_HOME", home.path().join("launcher"))
+            .env("SUNRISE_HOME", home.path().join("game"))
+            .env("XDG_DATA_HOME", home.path().join("xdg-data"))
+            .env("XDG_CONFIG_HOME", home.path().join("xdg-config"))
+            .env("SUNRISE_LAUNCHER_LOCATION_FILE", home.path().join("location"))
+            .env("SUNRISE_LAUNCHER_TRASH", home.path().join("trash"))
+            .env("SUNRISE_LAUNCHER_CLIPBOARD", home.path().join("clipboard"))
+            .env("SUNRISE_LAUNCHER_DESKTOP", home.path().join("desktop"))
+            .env("SUNRISE_LAUNCHER_NO_SELF_UPDATE", "1")
+            .env("SUNRISE_NO_AUDIO", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+
+    let base = "dev-2026-11-26-ba1f24e";
+    let dir = version_dir(base);
+    let write = |path: &str, text: &str| {
+        let path = dir.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    };
+    write(COMPLETE, "");
+    write(
+        "research-lock.json",
+        r#"{"minecraft":{"version":"26.3","client_sha1":"c","server_sha1":"s"}}"#,
+    );
+    write("crates/sunrise-prepare/Cargo.toml", "[package]");
+    write("crates/sunrise-prepare/build.rs", "fn main() {}");
+    write(
+        "crates/sunrise-prepare/src/lib.rs",
+        "pub const OUTPUT_VERSION: u32 = 1;\n",
+    );
+    write(
+        &format!(".local/sunrise-client/26.3/{RESOURCES_MANIFEST}"),
+        "{}",
+    );
+    write(
+        &format!(".local/sunrise-client/26.3/{PREPARATION_STAMP}"),
+        r#"{"output_version":1}"#,
+    );
+    for report in RUNTIME_REPORTS {
+        write(&format!(".local/sunrise-client/26.3/{report}"), "{}");
+    }
+    {
+        let preparation = prepare_lock(base).unwrap();
+        crate::managed_play::Resources::prepare(base, &preparation, None).unwrap();
+    }
+    let receipt = dir.join(".local/launcher-prepared/current.json");
+    let receipt_bytes = fs::read(&receipt).unwrap();
+    let old_mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&receipt)
+        .unwrap()
+        .set_modified(old_mtime)
+        .unwrap();
+    let stamped_mtime = fs::metadata(&receipt).unwrap().modified().unwrap();
+
+    #[cfg(unix)]
+    let (probe_log, mutated_marker) = {
+        use std::os::unix::fs::PermissionsExt;
+        let probe_log = data_dir().join("probe.log");
+        let mutated = data_dir().join("mutated");
+        let binary = dir.join(crate::preparer::BINARY);
+        fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\nset -eu\ncmd=$1\nprintf '%s\\n' \"$cmd\" >> \"{}\"\nif [ \"$cmd\" = missing-extras ]; then\n  printf '%s\\n' '{{\"format\":1,\"missing\":[]}}'\nelse\n  : > \"{}\"\n  exit 2\nfi\n",
+                probe_log.display(),
+                mutated.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        (probe_log, mutated)
+    };
+
+    let held = prepare_lock(base).unwrap();
+    let before = (crate::storage::walks(), crate::storage::entries_calls());
+    let reused = reuse_prepared_everywhere();
+    assert!(reused.is_empty(), "{reused:?}");
+    assert_eq!(fs::read(&receipt).unwrap(), receipt_bytes);
+    assert_eq!(
+        fs::metadata(&receipt).unwrap().modified().unwrap(),
+        stamped_mtime
+    );
+    assert_eq!(
+        (crate::storage::walks(), crate::storage::entries_calls()),
+        before
+    );
+    #[cfg(unix)]
+    {
+        assert!(
+            !mutated_marker.exists(),
+            "startup ran a mutating preparer step"
+        );
+        assert_eq!(
+            fs::read_to_string(&probe_log)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["missing-extras"],
+            "Pass 2 should probe missing-extras once, unlocked"
+        );
+    }
+    // need_prepared keeps its non-blocking probe while a real writer holds .preparing.lock.
+    let error = need_prepared(base).unwrap_err();
+    assert!(error.contains("already being prepared"), "{error}");
+    drop(held);
+    need_prepared(base).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_probes_missing_extras_once_even_when_repair_runs() {
+    use std::os::unix::fs::PermissionsExt;
+    const CHILD: &str = "SUNRISE_STARTUP_REPAIR_PROBE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let home = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "backend::tests::startup_probes_missing_extras_once_even_when_repair_runs",
+            ])
+            .env(CHILD, "1")
+            .env("SUNRISE_LAUNCHER_HOME", home.path().join("launcher"))
+            .env("SUNRISE_HOME", home.path().join("game"))
+            .env("XDG_DATA_HOME", home.path().join("xdg-data"))
+            .env("XDG_CONFIG_HOME", home.path().join("xdg-config"))
+            .env(
+                "SUNRISE_LAUNCHER_LOCATION_FILE",
+                home.path().join("location"),
+            )
+            .env("SUNRISE_LAUNCHER_TRASH", home.path().join("trash"))
+            .env("SUNRISE_LAUNCHER_CLIPBOARD", home.path().join("clipboard"))
+            .env("SUNRISE_LAUNCHER_DESKTOP", home.path().join("desktop"))
+            .env("SUNRISE_LAUNCHER_NO_SELF_UPDATE", "1")
+            .env("SUNRISE_NO_AUDIO", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+
+    let direct = "dev-2026-11-26-direct";
+    let reused_target = "dev-2026-11-27-reused";
+    let lock = r#"{"minecraft":{"version":"26.3","client_sha1":"c","server_sha1":"s"}}"#;
+    let write = |tag: &str, path: &str, text: &str| {
+        let path = version_dir(tag).join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    };
+    let install_preparer = |tag: &str, log_path: &Path| {
+        let binary = version_dir(tag).join(crate::preparer::BINARY);
+        fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\nset -eu\ncmd=$1\nprintf '%s\\n' \"$cmd\" >> \"{}\"\ncase \"$cmd\" in\n  missing-extras) printf '%s\\n' '{{\"format\":1,\"missing\":[{{\"kind\":\"sounds\",\"what\":\"sounds\"}}]}}';;\n  extras) printf '%s\\n' '{{\"format\":1,\"added\":[\"sounds\"]}}';;\n  data-file) printf '%s\\n' '{{\"format\":1,\"written\":false}}';;\n  *) exit 2;;\nesac\n",
+                log_path.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    for tag in [direct, reused_target] {
+        write(tag, COMPLETE, "");
+        write(tag, "research-lock.json", lock);
+        write(tag, "crates/sunrise-prepare/Cargo.toml", "[package]");
+        write(tag, "crates/sunrise-prepare/build.rs", "fn main() {}");
+        write(
+            tag,
+            "crates/sunrise-prepare/src/lib.rs",
+            "pub const OUTPUT_VERSION: u32 = 1;\n",
+        );
+    }
+    write(
+        direct,
+        &format!(".local/sunrise-client/26.3/{RESOURCES_MANIFEST}"),
+        "{}",
+    );
+    write(
+        direct,
+        &format!(".local/sunrise-client/26.3/{PREPARATION_STAMP}"),
+        r#"{"output_version":1}"#,
+    );
+    for report in RUNTIME_REPORTS {
+        write(
+            direct,
+            &format!(".local/sunrise-client/26.3/{report}"),
+            "{}",
+        );
+    }
+    let direct_log = data_dir().join("direct.log");
+    let reused_log = data_dir().join("reused.log");
+    install_preparer(direct, &direct_log);
+    install_preparer(reused_target, &reused_log);
+
+    let reused = reuse_prepared_everywhere();
+    assert_eq!(reused, [(reused_target.to_string(), direct.to_string())]);
+    assert_eq!(
+        fs::read_to_string(&direct_log)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        ["missing-extras", "extras"],
+        "direct repair must feed the unlocked missing-extras probe without probing again under lock"
+    );
+    assert_eq!(
+        fs::read_to_string(&reused_log)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        ["missing-extras", "extras", "data-file"],
+        "finish_preparation must feed the unlocked missing-extras probe without probing again under lock"
+    );
+}

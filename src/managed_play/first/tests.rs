@@ -769,7 +769,7 @@ while [ "$#" -ne 0 ]; do
   shift
 done
 root=${SUNRISE_HOME%/*}
-if [ "$PREPARE_CASE_ROLE" = startup ]; then : > "$root/startup-wrote"; exit 2; fi
+if [ "$PREPARE_CASE_ROLE" = startup ] && [ "$cmd" != missing-extras ]; then : > "$root/startup-wrote"; exit 2; fi
 # Write the accelerator before announcing the interruption, while it still has no evidence.
 if [ "$cmd" = data-file ]; then printf 'fixture data' > "$out/sunrise-data.bin"; fi
 if [ "$cmd" = "$PREPARE_CASE_PASS" ] && [ ! -f "$root/finish" ]; then

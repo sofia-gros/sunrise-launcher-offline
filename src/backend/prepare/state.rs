@@ -8,7 +8,14 @@ use std::sync::Mutex;
 /// The version whose folder holds `tag`'s prepared resources: a native build shares its base's
 /// (`copy_base` leaves `.local` out), any other version keeps its own.
 pub fn resources_owner(tag: &str) -> String {
-    crate::native_mods::about(tag).map_or_else(|| tag.to_owned(), |about| about.base)
+    resources_owner_in(&crate::backend::versions_dir(), tag)
+}
+
+pub(in crate::backend) fn resources_owner_in(versions: &Path, tag: &str) -> String {
+    crate::native_mods::is_native(tag)
+        .then(|| crate::native_mods::about_in(&versions.join(tag)))
+        .flatten()
+        .map_or_else(|| tag.to_owned(), |about| about.base)
 }
 
 pub fn resources(tag: &str) -> PathBuf {

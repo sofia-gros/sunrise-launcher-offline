@@ -117,7 +117,6 @@ impl Launcher {
         };
         self.ui.sheets.profile_action = match result {
             Ok(gone) => {
-                storage::eviction::request_cleanup();
                 let heading = trf("{name} is in the Trash.", &[("name", &gone.name)]);
                 if let Some(error) = failed_save {
                     Some(Action::Problem {

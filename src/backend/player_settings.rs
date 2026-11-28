@@ -207,9 +207,6 @@ pub struct Settings {
     pub language: Option<crate::i18n::Language>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_mod_grants: Vec<SourceModGrant>,
-    /// Managed cache limit in GiB (unset: 25; zero: no automatic cleanup). Player data isn't cache.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_limit_gib: Option<u64>,
     /// The accent picked under each launcher theme, by its id (`themes::TWILIGHT` for Twilight's
     /// own), so going back to a theme brings back its colour. A launcher older than this map
     /// drops it when it saves: the themes then only start from their own accents again.

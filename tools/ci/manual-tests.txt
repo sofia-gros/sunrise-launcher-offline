@@ -8,7 +8,6 @@ sunrise-launcher cull::desktop_tests::desktop_list_renders_the_viewport_after_sc
 sunrise-launcher hardware_probes_run_hidden_after_the_first_frame by-hand manual # requires an interactive Windows desktop and graphics adapter
 sunrise-launcher pictures::tests::a_32k_screenshot_is_read_in_little_memory by-hand manual # slow soak: 2 GiB of pixels; run with --ignored --nocapture
 sunrise-launcher rust_toolchain::tests::managed_arm64_toolchain_builds_the_game ci.yml manual # downloads the managed Windows ARM64 toolchain and builds Sunrise
-sunrise-launcher storage::inventory::eviction_tests::allocated_forty_gib_cleanup_proof by-hand manual # manual allocated 40 GiB proof; requires SUNRISE_EVICTION_PROOF_ROOT in checkout scratch
 sunrise-launcher downloads::tests::benchmark_download_pipeline by-hand manual # local download throughput benchmark; run explicitly in a fresh process per mode
 sunrise-launcher-smod holder::game_entry::tests::write_missing_registration_actor subprocess manual # fixture writer subprocess only
 sunrise-launcher-telemetry payload::tests::what_this_machine_sends by-hand manual # prints what this machine would send; run with --ignored --nocapture

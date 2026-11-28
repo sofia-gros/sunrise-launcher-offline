@@ -230,7 +230,8 @@ fn host_for(os: &str, arch: &str) -> Option<&'static Host> {
     HOSTS.iter().find(|h| h.target == target)
 }
 
-/// Every supported host, shared by cache-name parsing and cross-platform command tests.
+/// Every supported host, for cross-platform command tests.
+#[cfg(test)]
 pub(crate) fn hosts() -> &'static [Host] {
     HOSTS
 }

@@ -74,6 +74,8 @@ The opening, then Play ([clip](docs/opening.webm)):
   builds in **Settings › Storage** (removing builds, cleaning up automatic downloads, and
   **Import a game build…**, which installs a local `sunrise-client` or zip as
   `imported-<date>-<sha>`, listed apart as unsigned so updates never replace it).
+  Reclaim cached downloads and build files by hand in **Settings › Storage** or with
+  `sunrise-launcher storage --clear all`.
 - **Skins**: how the account that plays looks. A 3D preview of the player, turned by dragging,
   beside the choices: the skin (the one worn now, saved skins, the game's default skins, or a PNG
   added from a file or dropped on the page), wide or slim arms, and the cape (none, or one the

@@ -162,11 +162,12 @@ enum Cmd {
         #[arg(long)]
         accept_eula: bool,
     },
-    /// Show disposable storage by category as JSON. Builds must be idle
+    /// Show disposable storage by category as JSON, or clear a category by hand with `--clear`.
+    /// Read-only reports never block builds; `--clear` requires builds to be idle.
     ///
-    /// Rust/Cargo/temp build-tool caches remain clearable. Game-accessible caches, installed-version
-    /// removal and automatic runtime eviction retain files while any launch path lacks enforceable
-    /// lifetime exclusion; an empty process scan is not authorization. Read-only reports stay available.
+    /// Rust/Cargo/temp build-tool caches remain clearable. Game-accessible caches and installed-version
+    /// removal retain files while any launch path lacks enforceable lifetime exclusion; an empty
+    /// process scan is not authorization. Read-only reports stay available.
     /// Private launch records and raw captures are collected together only after all participating owners
     /// exit, under the exclusive permanent namespace gate. Published unit keys persist until exclusive
     /// unit removal. Registry entry counts are logged; lock entries are not age-collected.
@@ -185,7 +186,8 @@ enum Cmd {
     /// Native mods (docs/modding/src/how-to/native-mods.md): compile flat Rust mod projects against the profile's exact
     /// Sunrise source revision with the launcher's own Rust, as the version the profile then
     /// plays. Not sandboxed: the mods' code runs with your rights. If there are no native mods to build, it exits successfully; a
-    /// server export still fails, as no engine is made
+    /// server export still fails, as no engine is made. Reclaim disk by hand with `storage --clear all`
+    /// or Settings → Storage
     NativeBuild(native::NativeBuildArgs),
     /// Show a release's patch notes (default: the newest)
     Notes { tag: Option<String> },
@@ -211,8 +213,7 @@ enum Cmd {
     /// hue; "theme" goes back to the theme's own), background PATH (your picture behind every page;
     /// "default" goes back to the theme's), scenery on|off (whether anything is behind the
     /// pages), panel-opacity PERCENT|default (glass panels over the background),
-    /// reduced-graphics on|off (no glass blur or decorative motion), cache-limit-gib N (managed cache limit
-    /// in GiB: 10, 25 (default), 50, 100; 0 disables automatic cleanup)
+    /// reduced-graphics on|off (no glass blur or decorative motion)
     #[command(after_help = tr("worlds rows|tiles: how Home lists the worlds under Continue playing."))]
     Settings {
         #[arg(value_parser = SETTING_KEYS)]

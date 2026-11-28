@@ -2,7 +2,7 @@
 use super::*;
 
 /// The keys `settings` sets.
-pub(super) const SETTING_KEYS: [&str; 19] = [
+pub(super) const SETTING_KEYS: [&str; 18] = [
     "selected-version",
     "minecraft-dir",
     "server-dir",
@@ -21,7 +21,6 @@ pub(super) const SETTING_KEYS: [&str; 19] = [
     "scenery",
     "panel-opacity",
     "reduced-graphics",
-    "cache-limit-gib",
 ];
 
 pub(super) fn on_off(value: &str) -> Result<bool, String> {
@@ -110,20 +109,6 @@ pub(super) fn set_setting(s: &mut backend::Settings, key: &str, value: &str) -> 
                     format!("{value}: say system or one of {}", codes.join(", "))
                 })?),
             }
-        }
-        "cache-limit-gib" => {
-            s.cache_limit_gib = match value {
-                "default" => None,
-                n => Some(
-                    n.parse::<u64>()
-                        .ok()
-                        .filter(|n| matches!(n, 0 | 10 | 25 | 50 | 100))
-                        .ok_or_else(|| {
-                            tr("Enter a cache limit in GiB; 0 disables automatic cleanup.")
-                                .to_string()
-                        })?,
-                ),
-            };
         }
         "proxy" => {
             if value == "default" || value.is_empty() {

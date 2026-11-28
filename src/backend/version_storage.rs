@@ -272,7 +272,6 @@ fn delete(
         error => native_mods::cache_error(error),
     })?;
     super::forget_prepared();
-    crate::storage::eviction::request_cleanup();
     Ok(())
 }
 

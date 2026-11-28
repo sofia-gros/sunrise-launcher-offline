@@ -3,7 +3,7 @@ use super::*;
 
 pub(super) struct Root {
     path: PathBuf,
-    directory: Option<Arc<Dir>>,
+    pub(super) directory: Option<Arc<Dir>>,
 }
 impl Root {
     pub(super) fn open(root: &Path) -> Result<Self, Error> {
@@ -61,136 +61,7 @@ impl Entry {
         })
     }
 
-    /// Parse the exact revision-bearing names written by the cache constructors.
-    pub(super) fn revision(&self) -> Option<&str> {
-        let name = self.relative.file_name()?.to_str()?;
-        let parent = self.relative.parent()?;
-        let revision = if parent == Path::new("native/tools") {
-            (name.len() == 12).then_some(name)?
-        } else if parent == Path::new("native/prebuilt") {
-            let (revision, rest) = name.split_once('-')?;
-            // A build's SDK slices (`<build id>-<target>[-server]`, a developer install's with
-            // `.developer`), and the older single-archive caches (`<commit>-sunrise-prebuilt-v<n>-
-            // <target>`), which native builds no longer read but eviction must still recognize.
-            let rest = rest.strip_suffix(".developer").unwrap_or(rest);
-            let current = sunrise_launcher_smod::index::native::prebuilt_prefix();
-            let target = [
-                "sunrise-prebuilt-v3-",
-                "sunrise-prebuilt-v4-",
-                "sunrise-prebuilt-v5-",
-                current.as_str(),
-            ]
-            .into_iter()
-            .find_map(|prefix| rest.strip_prefix(prefix))
-            .unwrap_or(rest);
-            let target = target.strip_suffix("-server").unwrap_or(target);
-            crate::rust_toolchain::hosts()
-                .iter()
-                .any(|host| host.target == target)
-                .then_some(revision)?
-        } else if parent == Path::new("native/internals-sync") {
-            if let Some(catalog) = name.strip_prefix("catalog-") {
-                let (revision, host) = catalog.split_once('-')?;
-                crate::rust_toolchain::hosts()
-                    .iter()
-                    .any(|candidate| candidate.target == host)
-                    .then_some(revision)?
-            } else {
-                name
-            }
-        } else if parent == Path::new("native/source") {
-            name
-        } else {
-            return None;
-        };
-        let expected = if parent == Path::new("native/tools") {
-            12
-        } else {
-            40
-        };
-        (revision.len() == expected
-            && revision
-                .bytes()
-                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
-        .then_some(revision)
-    }
-
-    /// What an interrupted unpack or download left beside the units of `native/prebuilt`: a
-    /// `.partial` folder, a `.lock` file, a `.download` archive. Nothing uses one while the build
-    /// lease is held, and eviction holds it, so a lock file is removed only under that lease.
-    pub(super) fn leftover(&self) -> bool {
-        self.relative.parent() == Some(Path::new("native/prebuilt"))
-            && self
-                .relative
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    [".partial", ".lock", ".download"]
-                        .iter()
-                        .any(|suffix| name.ends_with(suffix))
-                })
-    }
-
-    fn unpublished_game(&self) -> bool {
-        self.relative.parent() == Some(Path::new("versions"))
-            && self
-                .relative
-                .file_name()
-                .is_some_and(crate::backend::installation::private_stage)
-    }
-
-    pub(super) fn last_used(&self) -> Result<Option<std::time::SystemTime>, Error> {
-        if self.unpublished_game() {
-            return Ok(None); // Inventory never stamps a private publisher's staged directory.
-        }
-        let Some(root) = &self.directory else {
-            return Ok(None);
-        };
-        let meta = match fs::symlink_metadata(&self.path) {
-            Ok(meta) => meta,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        if linked(&meta) {
-            return Err(Error::Unsafe(self.path.clone()));
-        }
-        let (relative, stamp) = if meta.is_dir() {
-            (
-                self.relative.as_path(),
-                std::ffi::OsString::from(".last-used"),
-            )
-        } else {
-            let Some(name) = self.relative.file_name() else {
-                return Ok(None);
-            };
-            let mut stamp = std::ffi::OsString::from(".");
-            stamp.push(name);
-            stamp.push(".last-used");
-            (self.relative.parent().unwrap_or(Path::new("")), stamp)
-        };
-        let mut directory = root.try_clone()?;
-        for part in relative.components() {
-            directory = directory.open_dir_nofollow(part.as_os_str())?;
-        }
-        use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
-        let mut options = cap_std::fs::OpenOptions::new();
-        options
-            .write(true)
-            .create_new(true)
-            .follow(FollowSymlinks::No);
-        match directory.open_with(&stamp, &options) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
-        }
-        let meta = directory.symlink_metadata(&stamp)?;
-        if !meta.is_file() || meta.file_type().is_symlink() {
-            return Err(Error::Unsafe(self.path.join(stamp)));
-        }
-        Ok(Some(meta.modified()?.into_std()))
-    }
-
-    /// The lease integration changes this classification, not policy or deletion code.
+    /// The lease integration changes this classification, not deletion code.
     pub(super) fn access(&self) -> Result<Access, Error> {
         match self.category {
             Category::RustCompiler => Ok(Access::BuildTools),
@@ -222,7 +93,7 @@ impl Entry {
     }
 }
 
-fn usage_stamp(name: &Path) -> bool {
+pub(super) fn usage_stamp(name: &Path) -> bool {
     let name = name.as_os_str().to_string_lossy();
     name == ".last-used" || (name.starts_with('.') && name.ends_with(".last-used"))
 }
@@ -239,6 +110,8 @@ fn add(
 
 impl Storage {
     pub(super) fn entries(&self) -> Result<Vec<Entry>, Error> {
+        #[cfg(test)]
+        ENTRIES.with(|calls| calls.set(calls.get() + 1));
         let mut entries = Vec::new();
         let build_root = Root::open(&self.root)?;
         for cache in BUILD_CACHES {

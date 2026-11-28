@@ -2,6 +2,29 @@
 use super::*;
 
 impl Storage {
+    /// Not deletion candidates: an unproved worker can still be writing to them.
+    fn retained_compiler_bytes(
+        &self,
+        counted: &mut HashSet<(u64, u64)>,
+    ) -> Result<Option<u64>, Error> {
+        let native = self.root.join("native");
+        let mut bytes = None;
+        if checked(&native, true)?.is_some() {
+            for entry in fs::read_dir(&native)? {
+                let entry = entry?;
+                if entry.file_name().to_str().is_some_and(|name| {
+                    name.starts_with(native_mods::ATTEMPT_PREFIX)
+                        || name.starts_with(native_mods::OLD_ATTEMPT_PREFIX)
+                }) {
+                    // A changing or unreadable tree is still protected; zero means its size is unknown.
+                    let size = Tree::build(&entry.path()).map_or(0, |tree| tree.size(counted));
+                    bytes = Some(bytes.unwrap_or(0u64).saturating_add(size));
+                }
+            }
+        }
+        Ok(bytes)
+    }
+
     pub fn report(&self, clear: Option<Category>, all: bool) -> Result<Report, Error> {
         let registry_entries = match fs::read_dir(self.data.join("run-leases")) {
             Ok(mut entries) => entries.try_fold(0usize, |count, entry| entry.map(|_| count + 1))?,
@@ -15,9 +38,12 @@ impl Storage {
                 &[("count", &registry_entries.to_string())]
             )
         );
-        // Also refuse an external Cargo holding a target lock before starting a cleanup.
-        self.lease.bytes()?;
-        if clear.is_some() || all {
+        let clearing = clear.is_some() || all;
+        // Only manual clear takes the native build lease; read-only reports never make Play wait.
+        let lease = if clearing {
+            let lease = self.build_lease()?;
+            // Also refuse an external Cargo holding a target lock before starting a cleanup.
+            lease.bytes()?;
             use sunrise_launcher_smod::runtime_leases::{cleanup::Cleanup, Error as LeaseError};
             match Cleanup::existing(&self.data) {
                 Ok(cleanup) => {
@@ -27,11 +53,14 @@ impl Storage {
                 Err(LeaseError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
-        }
+            Some(lease)
+        } else {
+            None
+        };
         let entries = self.entries()?;
-        let mut report = self.apply_retaining(entries, clear, all, true)?;
+        let mut report = self.apply_retaining(entries, clear, all, true, lease.as_ref())?;
         report.include_retained_compiler(self.retained_compiler_bytes(&mut HashSet::new())?);
-        if clear.is_none() && !all {
+        if !clearing {
             for entry in self.entries()? {
                 if let Err(error) = entry.access().and_then(|access| access.check()) {
                     // A refused unit already has its line.
@@ -64,7 +93,24 @@ impl Storage {
         clear: Option<Category>,
         all: bool,
     ) -> Result<Report, Error> {
-        self.apply_retaining(entries, clear, all, false)
+        let needs_target_lease = (clear.is_some() || all)
+            && entries
+                .iter()
+                .any(|entry| entry.path == self.root.join("native/target"));
+        let lease = needs_target_lease.then(|| self.build_lease()).transpose()?;
+        self.apply_retaining(entries, clear, all, false, lease.as_ref())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_observed(
+        &self,
+        clear: Option<Category>,
+        all: bool,
+        before_clear: impl FnMut(&Path),
+    ) -> Result<Report, Error> {
+        let lease = self.build_lease()?;
+        let entries = self.entries()?;
+        self.apply_retaining_observed(entries, clear, all, true, Some(&lease), before_clear)
     }
 
     pub(super) fn apply_retaining(
@@ -73,6 +119,19 @@ impl Storage {
         clear: Option<Category>,
         all: bool,
         retain: bool,
+        lease: Option<&Cache>,
+    ) -> Result<Report, Error> {
+        self.apply_retaining_observed(entries, clear, all, retain, lease, |_| {})
+    }
+
+    fn apply_retaining_observed(
+        &self,
+        entries: Vec<Entry>,
+        clear: Option<Category>,
+        all: bool,
+        retain: bool,
+        lease: Option<&Cache>,
+        mut before_clear: impl FnMut(&Path),
     ) -> Result<Report, Error> {
         // Validate every descendant before any deletion and deduplicate allocated blocks per row.
         let mut rows: Vec<_> = Category::ALL
@@ -103,8 +162,12 @@ impl Storage {
         }
         for (index, entry) in entries.iter().enumerate() {
             if all || clear == Some(entry.category) {
+                before_clear(&entry.path);
                 let result = if entry.path == self.root.join("native/target") {
-                    self.lease.clear().map(|_| ())
+                    lease
+                        .expect("manual clear holds the build lease")
+                        .clear()
+                        .map(|_| ())
                 } else {
                     entry.clear()
                 };

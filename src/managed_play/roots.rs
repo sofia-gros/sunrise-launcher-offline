@@ -230,10 +230,7 @@ mod tests {
         profile_txn::{Admission, Bootstrap, Intent},
         storage::{Category, Storage},
     };
-    use std::{
-        process::Command,
-        time::{Duration, SystemTime},
-    };
+    use std::process::Command;
     use sunrise_launcher_smod::{manifest, mod_list};
 
     #[test]
@@ -365,7 +362,6 @@ mod tests {
             )
             .unwrap();
             crate::run_leases::publish(&path).unwrap();
-            crate::storage::mark_used(&path).unwrap();
             path
         };
         let check_bytes = |path: &Path| {
@@ -434,20 +430,16 @@ mod tests {
         let mut selected = false;
         let report = Storage::open()
             .unwrap()
-            .evict_inventory_observed(
-                SystemTime::now() + Duration::from_secs(14 * 24 * 60 * 60),
-                Some(0),
-                |path| {
-                    if path == derived {
-                        assert!(!std::mem::replace(&mut selected, true));
-                        publish(DERIVED);
-                    }
-                },
-            )
+            .clear_observed(Some(Category::SpareGameBuilds), false, |path| {
+                if path == derived {
+                    assert!(!std::mem::replace(&mut selected, true));
+                    publish(DERIVED);
+                }
+            })
             .unwrap();
         assert!(
             selected,
-            "eviction must pass through the real selection boundary"
+            "manual clear must pass through the real selection boundary"
         );
         let row = report
             .rows

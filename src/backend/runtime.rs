@@ -48,23 +48,8 @@ impl RuntimeGuard {
 }
 
 pub fn prepare_command(cmd: Command) -> Result<(Command, RuntimeGuard), String> {
-    prepare_runtime(cmd, None)
-}
-
-pub(crate) fn prepare_managed_command(
-    cmd: Command,
-    resources: &Path,
-) -> Result<(Command, RuntimeGuard), String> {
-    prepare_runtime(cmd, Some(resources))
-}
-
-fn prepare_runtime(
-    cmd: Command,
-    read_only_resources: Option<&Path>,
-) -> Result<(Command, RuntimeGuard), String> {
     crate::developer_offline::validate(&cmd)?;
-    let leases = crate::run_leases::shared(&cmd, read_only_resources)
-        .map_err(crate::native_mods::cache_error)?;
+    let leases = crate::run_leases::shared(&cmd).map_err(crate::native_mods::cache_error)?;
     #[cfg(windows)]
     let cmd = crate::windows_runtime::redirect(cmd);
     #[cfg(windows)]

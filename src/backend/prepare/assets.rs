@@ -33,6 +33,21 @@ pub(crate) fn complete_assets_staged(tag: &str, handoff: &crate::preparer::Hando
     );
 }
 
+pub(crate) fn complete_assets_lacking_staged(
+    tag: &str,
+    handoff: &crate::preparer::Handoff<'_>,
+    lacking: crate::preparer::Extras,
+) {
+    complete_assets_with(
+        &versions_dir(),
+        tag,
+        Some(lacking),
+        minecraft_folders,
+        &|line| eprintln!("{line}"),
+        Some(handoff),
+    );
+}
+
 /// Whether Sunrise's own store is asked to download again: it has an asset index, the version
 /// lacks some extra (any kind: the download fetches the whole asset index, which holds the
 /// sounds, languages, fonts, panorama and built-in packs) and it was not asked this run yet.
@@ -46,28 +61,32 @@ pub(in crate::backend) fn refill_wanted(
         && !asked.swap(true, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Read-only check for missing extras, run without `.preparing.lock`. A stale "nothing missing"
+/// only postpones repair to the next start.
+pub(in crate::backend) fn probe_missing_extras(
+    versions: &Path,
+    tag: &str,
+) -> Option<crate::preparer::Extras> {
+    let root = versions.join(tag);
+    let resources = resources_at(&root);
+    if read_json(&resources.join(RESOURCES_MANIFEST)).is_none_or(|m| server_profile(&m)) {
+        return None;
+    }
+    crate::preparer::binary(&root).and_then(|binary| {
+        crate::preparer::missing_extras(&binary, &root, &resources, None)
+            .ok()
+            .flatten()
+    })
+}
+
 /// Sunrise's own download (an owner's) may have stopped before the sounds and the languages,
 /// and the copies of `complete_assets` read them from its store: asked again, once per run, through
 /// the same owner gate as any download from Mojang (`download_for_owner`), which keeps the files
 /// already whole. Called where a download is expected (`reuse_prepared_everywhere`), never on Play.
-pub(in crate::backend) fn refill_own_store(tag: &str, handoff: &crate::preparer::Handoff<'_>) {
+pub(in crate::backend) fn refill_own_store(tag: &str, missing: Option<&crate::preparer::Extras>) {
     static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let own = data_dir().join("minecraft");
-    let root = versions_dir().join(tag);
-    let resources = resources_at(&root);
-    if read_json(&resources.join(RESOURCES_MANIFEST)).is_none_or(|m| server_profile(&m)) {
-        return;
-    }
-    let missing = crate::preparer::binary(&root).and_then(|binary| {
-        crate::preparer::missing_extras(&binary, &root, &resources, Some(handoff))
-            .ok()
-            .flatten()
-    });
-    if !refill_wanted(
-        own.join("assets/indexes").is_dir(),
-        missing.as_ref(),
-        &ASKED,
-    ) {
+    if !refill_wanted(own.join("assets/indexes").is_dir(), missing, &ASKED) {
         return;
     }
     let Some(pins) = read_json(&version_dir(tag).join("research-lock.json"))
@@ -96,6 +115,17 @@ pub(in crate::backend) fn complete_assets_in(
     log: &dyn Fn(String),
     handoff: Option<&crate::preparer::Handoff<'_>>,
 ) {
+    complete_assets_with(versions, tag, None, folders, log, handoff);
+}
+
+fn complete_assets_with(
+    versions: &Path,
+    tag: &str,
+    probed: Option<crate::preparer::Extras>,
+    folders: impl Fn() -> Vec<PathBuf>,
+    log: &dyn Fn(String),
+    handoff: Option<&crate::preparer::Handoff<'_>>,
+) {
     let stopped = || {
         handoff
             .and_then(crate::preparer::Handoff::stop)
@@ -115,10 +145,14 @@ pub(in crate::backend) fn complete_assets_in(
     let Some(binary) = crate::preparer::binary(&root) else {
         return;
     };
-    let lacking = match crate::preparer::missing_extras(&binary, &root, &resources, handoff) {
-        Ok(Some(lacking)) if !lacking.is_empty() => lacking,
-        Ok(_) => return,
-        Err(e) => return log(format!("{tag}: {e}")),
+    let lacking = match probed {
+        Some(lacking) if !lacking.is_empty() => lacking,
+        Some(_) => return,
+        None => match crate::preparer::missing_extras(&binary, &root, &resources, handoff) {
+            Ok(Some(lacking)) if !lacking.is_empty() => lacking,
+            Ok(_) => return,
+            Err(e) => return log(format!("{tag}: {e}")),
+        },
     };
     if stopped() {
         return;

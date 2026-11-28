@@ -263,53 +263,12 @@ fn corner_px(value: f32) -> u8 {
     (value * f32::from(backend::MAX_CORNER_RADIUS)).round() as u8
 }
 
-/// A cache limit as its field shows it: a number of GB, or nothing for no limit.
-pub(crate) fn cache_limit_text(limit: Option<u64>) -> String {
-    match limit.unwrap_or(25) {
-        0 => String::new(),
-        gb => gb.to_string(),
-    }
-}
-
-impl Launcher {
-    /// Keep at most `gib` of downloads (0: no limit), and say so in its field.
-    fn set_cache_limit(&mut self, gib: u64) {
-        self.settings.cache_limit_gib = Some(gib);
-        self.cache_input
-            .set(cache_limit_text(self.settings.cache_limit_gib));
-        if let Err(error) = self.settings.save() {
-            self.storage_error = Some(error);
-        }
-    }
-
-    /// The limit as typed, once its field is left: a whole number of GB; empty or 0 is no
-    /// limit; anything else puts the limit back as it was.
-    fn apply_cache_limit(&mut self) {
-        let typed = self.cache_input.text().trim();
-        match if typed.is_empty() {
-            Ok(0)
-        } else {
-            typed.parse::<u64>()
-        } {
-            Ok(gib) => self.set_cache_limit(gib),
-            Err(_) => self
-                .cache_input
-                .set(cache_limit_text(self.settings.cache_limit_gib)),
-        }
-    }
-}
-
 impl Launcher {
     pub(super) fn settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         self.args_focused = self.args_focus.is_focused(window);
         self.proxy_focused = self.proxy_focus.is_focused(window);
         self.corners_focused = self.corners_focus.is_focused(window);
         self.offline_focused = self.offline_focus.is_focused(window);
-        let was_typing_limit = self.cache_focused;
-        self.cache_focused = self.cache_focus.is_focused(window);
-        if was_typing_limit && !self.cache_focused {
-            self.apply_cache_limit();
-        }
         let section = self.ui.settings.section;
         let scroll = crate::frame::scrolls("settings");
         let mut nav = div()

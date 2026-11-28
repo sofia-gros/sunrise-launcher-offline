@@ -273,3 +273,133 @@ fn capable_units_delete_only_after_the_last_game_lease_and_mixed_builds_stay_res
         "incomplete installs must stay visible for residual reporting and retry"
     );
 }
+
+#[test]
+fn refused_units_are_residual_with_bytes_and_reason() {
+    let home = Home::new();
+    let file = home.seed("game/output");
+    let storage = Storage::at(&home.0).unwrap();
+    let root = Root::open(&home.0).unwrap();
+    let entries = vec![Entry::fixed(&root, Path::new("game"), Category::BuildFiles).unwrap()];
+    let directory = file.parent().unwrap();
+    // Give inline-directory filesystems enough names to allocate directory blocks too.
+    for index in 0..32 {
+        fs::write(
+            directory.join(format!("padding-{index:02}-{}", "x".repeat(180))),
+            [],
+        )
+        .unwrap();
+    }
+    // Independent filesystem allocations, not the recursive production sum.
+    let own_bytes = |path: &Path| {
+        super::super::allocation(path, &fs::symlink_metadata(path).unwrap())
+            .unwrap()
+            .1
+    };
+    let bytes = own_bytes(directory)
+        + fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| own_bytes(&entry.unwrap().path()))
+            .sum::<u64>();
+    let lease = storage.build_lease().unwrap();
+    let report = storage
+        .apply_retaining(entries, None, true, true, Some(&lease))
+        .unwrap();
+    let row = report
+        .rows
+        .iter()
+        .find(|row| row.category == Category::BuildFiles)
+        .unwrap();
+    assert_eq!(row.bytes, bytes);
+    assert_eq!(row.freed_bytes, 0);
+    assert_eq!(row.remaining_bytes, bytes);
+    assert_eq!(row.kept.len(), 1);
+    assert_eq!(row.kept[0].bytes, bytes);
+    assert!(!row.kept[0].reason.is_empty());
+    assert!(file.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_unit_with_an_unexpected_link_is_refused_on_its_row_and_holds_up_no_other() {
+    let home = Home::new();
+    let good = home.seed("rust/old/payload");
+    let bad = home.seed("cache/payload");
+    home.seed("worlds/keep");
+    std::os::unix::fs::symlink(home.0.join("worlds"), home.0.join("cache/link")).unwrap();
+    let storage = Storage::at(&home.0).unwrap();
+    let root = Root::open(&home.0).unwrap();
+    let entries = vec![
+        Entry::fixed(&root, Path::new("cache"), Category::OtherCaches).unwrap(),
+        Entry::fixed(&root, Path::new("rust/old"), Category::RustCompiler).unwrap(),
+    ];
+    let lease = storage.build_lease().unwrap();
+    let report = storage
+        .apply_retaining(entries, None, true, true, Some(&lease))
+        .unwrap();
+    let row = |category| {
+        report
+            .rows
+            .iter()
+            .find(|row| row.category == category)
+            .unwrap()
+    };
+    let refused = row(Category::OtherCaches);
+    assert_eq!((refused.bytes, refused.freed_bytes), (0, 0));
+    assert_eq!(refused.kept.len(), 1);
+    assert!(refused.kept[0].reason.contains("link"));
+    assert!(bad.exists());
+    assert!(home.0.join("worlds/keep").exists());
+    assert!(row(Category::RustCompiler).freed_bytes > 0);
+    assert!(row(Category::RustCompiler).kept.is_empty());
+    assert!(!good.exists());
+}
+
+#[test]
+fn retained_compiler_bytes_report_and_cannot_be_cleared() {
+    let home = Home::new();
+    let old_worker = home.seed("native/.nb-old/compiler/w");
+    let older_launchers = home.seed("native/.native-attempt-older/compiler/work");
+    let storage = Storage::at(&home.0).unwrap();
+    let report = storage.report(None, false).unwrap();
+    let protected = &report.rows[0];
+    assert_eq!(protected.category, Category::BuildFiles);
+    assert!(protected.remaining_bytes > 0);
+    assert_eq!(protected.bytes, protected.remaining_bytes);
+    assert_eq!(protected.clearable_bytes(), 0);
+    assert_eq!(protected.kept[0].bytes, protected.remaining_bytes);
+    let manual = storage.report(Some(Category::BuildFiles), false).unwrap();
+    assert_eq!(manual.rows[0].clearable_bytes(), 0);
+    assert!(old_worker.is_file());
+    assert!(older_launchers.is_file());
+}
+
+#[test]
+fn a_refused_unit_is_walked_once_and_a_cleared_one_twice() {
+    let home = Home::new();
+    home.seed("rust/old/payload");
+    let storage = Storage::at(&home.0).unwrap();
+    let root = Root::open(&home.0).unwrap();
+    #[cfg(unix)]
+    {
+        home.seed("cache/payload");
+        std::os::unix::fs::symlink(home.0.join("rust"), home.0.join("cache/link")).unwrap();
+    }
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut entries =
+        vec![Entry::fixed(&root, Path::new("rust/old"), Category::RustCompiler).unwrap()];
+    #[cfg(unix)]
+    entries.push(Entry::fixed(&root, Path::new("cache"), Category::OtherCaches).unwrap());
+    let count = entries.len();
+    let walks = crate::storage::walks();
+    let lease = storage.build_lease().unwrap();
+    let report = storage
+        .apply_retaining(entries, None, true, true, Some(&lease))
+        .unwrap();
+    // The refused folder was walked once (and stopped there); the sound one once, then once
+    // more after it was cleared.
+    assert_eq!(crate::storage::walks() - walks, count + 1);
+    assert!(report.rows[3].freed_bytes > 0);
+    #[cfg(unix)]
+    assert_eq!(report.rows[4].kept.len(), 1);
+}

@@ -38,11 +38,7 @@ impl Registry {
 }
 
 /// Launcher-owned primitives-in-use; this is not a standalone cleanup safety guarantee.
-pub(crate) fn shared(
-    command: &Command,
-    read_only_resources: Option<&Path>,
-) -> Result<Vec<Claim>, Error> {
-    let read_only_resources = read_only_resources.map(Path::canonicalize).transpose()?;
+pub(crate) fn shared(command: &Command) -> Result<Vec<Claim>, Error> {
     let logs = override_value(command, "SUNRISE_HOME").map_or_else(
         || std::env::var_os("SUNRISE_HOME").map(std::path::PathBuf::from),
         |value| value.map(std::path::PathBuf::from),
@@ -94,23 +90,7 @@ pub(crate) fn shared(
         }
     }
     if let Some(home) = command.get_current_dir() {
-        let home = home.canonicalize()?;
-        for relative in [".sunrise-cache", "cache"] {
-            crate::storage::mark_used(&home.join(relative))?;
-        }
-        use sunrise_launcher_smod::{mod_list, Package};
-        for folder in [mod_list::DIR, mod_list::NATIVE_DIR] {
-            for path in sunrise_launcher_smod::find(&home.join(folder)) {
-                if let Ok(package) = Package::read(&path) {
-                    if crate::browser::mod_list::is_enabled(&home, &package.manifest.id) {
-                        for jar in package.manifest.jar {
-                            crate::storage::mark_used(&jar.cache_path(&home.join("jars")))?;
-                        }
-                    }
-                }
-            }
-        }
-        paths.push(home);
+        paths.push(home.canonicalize()?);
     }
     if let Some(logs) = logs.filter(|path| !path.as_os_str().is_empty()) {
         fs::create_dir_all(&logs)?;
@@ -162,13 +142,6 @@ pub(crate) fn shared(
     paths.dedup();
     if paths.is_empty() {
         return Ok(Vec::new());
-    }
-    for path in &paths {
-        // Managed resources are a sealed image. Keep the same lease without inserting
-        // the mutable cache's recency marker into the bytes the next Play must prove.
-        if read_only_resources.as_ref() != Some(path) {
-            crate::storage::mark_used(path)?;
-        }
     }
     paths
         .into_iter()

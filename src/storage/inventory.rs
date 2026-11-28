@@ -1,8 +1,5 @@
 //! The CLI and Storage page share one fixed-path inventory.
-mod cache_eviction;
 mod disk_walk;
-#[cfg(test)]
-mod eviction_tests;
 #[cfg(test)]
 mod regressions;
 mod report_clearing;
@@ -12,7 +9,6 @@ use serde::Serialize;
 use std::sync::Arc;
 
 use disk_walk::*;
-use report_clearing::*;
 
 const BUILD_CACHES: [BuildCache; 10] = [
     BuildCache::Source,

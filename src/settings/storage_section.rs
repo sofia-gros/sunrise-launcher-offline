@@ -1,4 +1,4 @@
-//! Settings › Storage: game builds, downloads, the cache limit and where files are kept.
+//! Settings › Storage: game builds, downloads and where files are kept.
 use super::*;
 
 impl Launcher {
@@ -120,36 +120,6 @@ impl Launcher {
                     ),
             );
         }
-        let typed = self
-            .settings_field(
-                "alt-storage-limit-gb",
-                self.cache_focus.clone(),
-                self.cache_focused,
-                &self.cache_input,
-                "No limit",
-                |this| &mut this.cache_input,
-                |_| {},
-                cx,
-            )
-            .w(px(96.));
-        // "GB" after a number, not after the empty field's "No limit".
-        let unit = (!self.cache_input.text().trim().is_empty()).then(|| {
-            div()
-                .text_size(px(tokens::LABEL))
-                .text_color(rgb(palette().muted))
-                .child(tr("GB"))
-        });
-        let field = div()
-            .flex()
-            .items_center()
-            .gap(px(6.))
-            .child(typed)
-            .children(unit);
-        cache.push(row(
-            tr("Keep at most"),
-            tr("Past this, the oldest downloads are cleared by themselves."),
-            field,
-        ));
         for (n, category) in Category::ALL.into_iter().enumerate() {
             let found = self
                 .storage_report
